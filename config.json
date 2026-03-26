@@ -1,0 +1,9 @@
+{
+  "url": "https://www.youtube.com/watch?v=gREuOZ9BxEw",
+  "proxy": "",
+  "api_key": "sk-pfqfreuxxzcepntkugohnqzqpsjcbvwbwihzeylcjafoiqgz",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model": "Qwen/Qwen3-VL-8B-Instruct",
+  "browser": "chrome",
+  "auto_summary": true
+}

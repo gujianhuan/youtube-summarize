@@ -1,0 +1,2237 @@
+
+import streamlit as st
+import threading
+import time
+import traceback
+import json
+import os
+import uuid
+import calendar
+from datetime import datetime, timedelta, time as dt_time
+from core_logic import (
+    get_effective_proxy,
+    check_network,
+    get_transcript_from_input,
+    build_api,
+    get_video_transcript,
+    list_available_transcripts,
+    format_error,
+    strip_ansi,
+    summarize_text,
+    fetch_available_models,
+    get_channel_info,
+    get_channel_recent_videos,
+    search_channels,
+)
+
+# --- 常量定义 ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SUBSCRIPTIONS_FILE = os.path.join(BASE_DIR, "subscriptions.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
+GUESTBOOK_FILE = os.path.join(BASE_DIR, "guestbook.json")
+
+@st.cache_resource
+def _get_shared_lock():
+    return threading.Lock()
+
+def load_json_file(filepath, default_value):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return default_value
+    return default_value
+
+def save_json_file(filepath, data):
+    with _get_shared_lock():
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_settings_safe():
+    with _get_shared_lock():
+        return load_json_file(SETTINGS_FILE, {})
+
+def save_settings_safe(settings):
+    with _get_shared_lock():
+        save_json_file(SETTINGS_FILE, settings)
+
+def load_history():
+    return load_json_file(HISTORY_FILE, [])
+
+def save_history(history):
+    save_json_file(HISTORY_FILE, history)
+
+def load_guestbook():
+    return load_json_file(GUESTBOOK_FILE, [])
+
+def save_guestbook(guestbook):
+    save_json_file(GUESTBOOK_FILE, guestbook)
+
+def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
+    history = load_history()
+    # 尝试解析摘要中的标题 (如果可能)
+    title = "未命名视频"
+    # 简单尝试从 summary 中提取标题 (假设 JSON 格式)
+    try:
+        if summary_text.strip().startswith("{"):
+            data = json.loads(summary_text)
+            # 尝试从 markdown 中提取第一行作为标题
+            md = data.get("summary_markdown", "")
+            lines = md.split("\n")
+            for line in lines:
+                if "核心主题" in line or "核心一句话" in line:
+                    continue
+                if line.strip() and not line.startswith("#"):
+                    title = line.strip()
+                    break
+    except:
+        pass
+    
+    entry = {
+        "id": str(uuid.uuid4()),
+        "timestamp": _iso(_now()),
+        "source_type": source_type, # 'single' or 'schedule'
+        "video_url": video_url,
+        "title": title,
+        "summary_text": summary_text,
+        # "transcript_text": transcript_text[:1000] + "..." if transcript_text else "" # 可选：为了省空间只存摘要
+    }
+    history.insert(0, entry) # 插入到开头
+    # 限制历史记录数量，例如保留最近 500 条
+    if len(history) > 500:
+        history = history[:500]
+    save_history(history)
+
+def update_settings_partial(patch):
+    with _get_shared_lock():
+        settings = load_settings()
+        if not isinstance(settings, dict):
+            settings = {}
+        settings.update(patch)
+        save_settings(settings)
+
+def _now():
+    return datetime.now()
+
+def _iso(dt_value):
+    if not dt_value:
+        return ""
+    return dt_value.isoformat()
+
+def _parse_iso(dt_str):
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
+
+def _parse_time_value(time_value):
+    if isinstance(time_value, datetime):
+        return time_value.time()
+    if hasattr(time_value, "hour") and hasattr(time_value, "minute"):
+        try:
+            return dt_time(hour=int(time_value.hour), minute=int(time_value.minute))
+        except Exception:
+            return None
+    if isinstance(time_value, str):
+        parts = time_value.strip().split(":")
+        if len(parts) >= 2:
+            try:
+                return dt_time(hour=int(parts[0]), minute=int(parts[1]))
+            except Exception:
+                return None
+    return None
+
+def _parse_cron_field(field, min_value, max_value):
+    if not field or field.strip() == "*":
+        return list(range(min_value, max_value + 1))
+    values = []
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.isdigit():
+            val = int(part)
+            if min_value <= val <= max_value:
+                values.append(val)
+    return sorted(set(values))
+
+def _next_cron_time(base_time, cron_expr):
+    parts = (cron_expr or "").split()
+    if len(parts) != 5:
+        return None
+    minutes = _parse_cron_field(parts[0], 0, 59)
+    hours = _parse_cron_field(parts[1], 0, 23)
+    days = _parse_cron_field(parts[2], 1, 31)
+    months = _parse_cron_field(parts[3], 1, 12)
+    weekdays = _parse_cron_field(parts[4], 0, 6)
+    if not minutes or not hours or not days or not months or not weekdays:
+        return None
+    cursor = base_time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    max_minutes = 60 * 24 * 180
+    for _ in range(max_minutes):
+        if (cursor.minute in minutes and cursor.hour in hours and cursor.day in days and cursor.month in months and cursor.weekday() in weekdays):
+            return cursor
+        cursor += timedelta(minutes=1)
+    return None
+
+def _compute_next_run(task, base_time):
+    schedule_type = (task.get("schedule_type") or "daily").lower()
+    if schedule_type == "interval":
+        interval_hours = int(task.get("interval_hours") or 0)
+        if interval_hours <= 0:
+            return None
+        base_anchor = _parse_iso(task.get("last_run_at")) or _parse_iso(task.get("created_at")) or base_time
+        if base_anchor > base_time:
+            return base_anchor
+        delta_seconds = (base_time - base_anchor).total_seconds()
+        interval_seconds = interval_hours * 3600
+        steps = int(delta_seconds // interval_seconds) + 1
+        return base_anchor + timedelta(seconds=steps * interval_seconds)
+    time_value = _parse_time_value(task.get("time"))
+    if schedule_type == "daily":
+        if not time_value:
+            return None
+        candidate = base_time.replace(hour=time_value.hour, minute=time_value.minute, second=0, microsecond=0)
+        if candidate <= base_time:
+            candidate += timedelta(days=1)
+        return candidate
+    if schedule_type == "weekly":
+        if not time_value:
+            return None
+        weekdays = task.get("weekdays") or []
+        if not weekdays:
+            return None
+        weekdays = sorted({int(x) for x in weekdays if str(x).isdigit()})
+        candidate = base_time.replace(hour=time_value.hour, minute=time_value.minute, second=0, microsecond=0)
+        for add_days in range(0, 8):
+            test_day = candidate + timedelta(days=add_days)
+            if test_day.weekday() in weekdays and test_day > base_time:
+                return test_day
+        return None
+    if schedule_type == "cron":
+        return _next_cron_time(base_time, task.get("cron") or "")
+    return None
+
+def _normalize_task(task):
+    now_iso = _iso(_now())
+    normalized = {
+        "id": task.get("id") or str(uuid.uuid4()),
+        "channel_id": task.get("channel_id") or "",
+        "channel_name": task.get("channel_name") or "",
+        "channel_url": task.get("channel_url") or "",
+        "platform": task.get("platform") or "",
+        "schedule_type": task.get("schedule_type") or "daily",
+        "time": task.get("time") or "09:00",
+        "weekdays": task.get("weekdays") or [],
+        "cron": task.get("cron") or "",
+        "interval_hours": task.get("interval_hours") or 0,
+        "enabled": bool(task.get("enabled", True)),
+        "created_at": task.get("created_at") or now_iso,
+        "last_run_at": task.get("last_run_at") or "",
+        "next_run_at": task.get("next_run_at") or "",
+        "retry_count": int(task.get("retry_count") or 0),
+        "next_retry_at": task.get("next_retry_at") or "",
+        "max_items": int(task.get("max_items") or 5),
+        "min_duration_seconds": int(task.get("min_duration_seconds") or 0),
+        "only_streams": bool(task.get("only_streams") or False),
+        "last_error": task.get("last_error") or "",
+    }
+    return normalized
+
+def _load_scheduled_state():
+    with _get_shared_lock():
+        settings = load_settings()
+    tasks = settings.get("scheduled_tasks") or []
+    tasks = [_normalize_task(t) for t in tasks if isinstance(t, dict)]
+    logs = settings.get("schedule_logs") or []
+    runs = settings.get("scheduled_runs") or []
+    run_items = settings.get("scheduled_run_items") or []
+    processed_ids = settings.get("scheduled_processed_ids") or []
+    if not isinstance(runs, list):
+        runs = []
+    if not isinstance(run_items, list):
+        run_items = []
+    if not isinstance(processed_ids, list):
+        processed_ids = []
+    return settings, tasks, logs, runs, run_items, processed_ids
+
+def _save_scheduled_state(settings_ignored, tasks, logs, runs, run_items, processed_ids):
+    # settings_ignored 参数被忽略，我们重新加载最新的 settings 以避免覆盖其他字段
+    with _get_shared_lock():
+        current = load_settings()
+        if not isinstance(current, dict):
+            current = {}
+        current["scheduled_tasks"] = tasks
+        current["schedule_logs"] = logs[-200:]
+        current["scheduled_runs"] = runs[-200:]
+        current["scheduled_run_items"] = run_items[-1000:]
+        if isinstance(processed_ids, set):
+            processed_list = list(processed_ids)
+        else:
+            processed_list = list(dict.fromkeys(processed_ids or []))
+        current["scheduled_processed_ids"] = processed_list
+        save_settings(current)
+
+
+def _append_log(logs, level, message, task_id=""):
+    logs.append({
+        "time": _iso(_now()),
+        "level": level,
+        "message": message,
+        "task_id": task_id,
+    })
+
+def _trim_schedule_records(runs, run_items, max_runs=200, max_items=1000):
+    runs_sorted = sorted(runs, key=lambda r: r.get("triggered_at") or "", reverse=True)
+    runs_sorted = runs_sorted[:max_runs]
+    run_ids = {r.get("id") for r in runs_sorted if r.get("id")}
+    items_filtered = [i for i in run_items if i.get("run_id") in run_ids]
+    items_filtered = items_filtered[:max_items]
+    return runs_sorted, items_filtered
+
+def _format_run_status(status):
+    status_map = {
+        "success": "成功",
+        "partial": "部分成功",
+        "failed": "失败",
+        "no_update": "无新增",
+        "running": "进行中",
+    }
+    return status_map.get(status or "", "未知")
+
+def _format_time_label(dt_value):
+    if not dt_value:
+        return "—"
+    return dt_value.strftime("%Y-%m-%d %H:%M")
+
+def _group_runs_by_day(runs, run_items):
+    day_map = {}
+    items_by_run = {}
+    for item in run_items:
+        run_id = item.get("run_id")
+        if run_id:
+            items_by_run.setdefault(run_id, []).append(item)
+    for run in runs:
+        triggered = _parse_iso(run.get("triggered_at"))
+        if not triggered:
+            continue
+        day_key = triggered.strftime("%Y-%m-%d")
+        day_entry = day_map.setdefault(day_key, {
+            "date": day_key,
+            "runs": [],
+            "new_items": 0,
+            "success_items": 0,
+            "failed_items": 0,
+        })
+        day_entry["runs"].append(run)
+        day_entry["new_items"] += int(run.get("new_items") or 0)
+        day_entry["success_items"] += int(run.get("success_items") or 0)
+        day_entry["failed_items"] += int(run.get("failed_items") or 0)
+    days = sorted(day_map.values(), key=lambda d: d.get("date") or "", reverse=True)
+    return days, items_by_run
+
+def _group_items_by_day(run_items):
+    day_map = {}
+    items_by_day = {}
+    for item in run_items:
+        created_at = _parse_iso(item.get("created_at"))
+        if not created_at:
+            continue
+        day_key = created_at.strftime("%Y-%m-%d")
+        items_by_day.setdefault(day_key, []).append(item)
+        day_entry = day_map.setdefault(day_key, {
+            "date": day_key,
+            "total_items": 0,
+            "success_items": 0,
+            "failed_items": 0,
+        })
+        day_entry["total_items"] += 1
+        if item.get("status") == "success":
+            day_entry["success_items"] += 1
+        elif item.get("status") == "failed":
+            day_entry["failed_items"] += 1
+    days = sorted(day_map.values(), key=lambda d: d.get("date") or "", reverse=True)
+    return days, items_by_day
+
+def _task_conflict(existing_tasks, new_task):
+    for t in existing_tasks:
+        if t.get("channel_id") != new_task.get("channel_id"):
+            continue
+        if t.get("schedule_type") == "weekly" and new_task.get("schedule_type") == "weekly":
+            if t.get("time") == new_task.get("time"):
+                overlap = set(t.get("weekdays") or []) & set(new_task.get("weekdays") or [])
+                if overlap:
+                    return True
+        if t.get("schedule_type") == "daily" and new_task.get("schedule_type") == "daily":
+            if t.get("time") == new_task.get("time"):
+                return True
+        if t.get("schedule_type") == "cron" and new_task.get("schedule_type") == "cron":
+            if (t.get("cron") or "").strip() == (new_task.get("cron") or "").strip():
+                return True
+        if t.get("schedule_type") == "interval" and new_task.get("schedule_type") == "interval":
+            if int(t.get("interval_hours") or 0) == int(new_task.get("interval_hours") or 0):
+                return True
+    return False
+
+def _run_task_once(task, settings):
+    logs = settings.get("schedule_logs") or []
+    runs = settings.get("scheduled_runs") or []
+    run_items = settings.get("scheduled_run_items") or []
+    processed_ids = settings.get("scheduled_processed_ids") or []
+    processed_set = set(processed_ids)
+    proxy_value = settings.get("proxy", "")
+    eff_proxy, _ = get_effective_proxy(proxy_value, True)
+    timeout_seconds = float(settings.get("timeout_seconds") or 20.0)
+    channel_url = task.get("channel_url")
+    model_name = settings.get("model") or "gpt-3.5-turbo"
+    if not channel_url:
+        _append_log(logs, "error", "任务缺少频道链接，已跳过", task.get("id"))
+        settings["schedule_logs"] = logs
+        return settings
+    max_items = int(task.get("max_items") or 5)
+    min_duration_seconds = int(task.get("min_duration_seconds") or 0)
+    only_streams = bool(task.get("only_streams") or False)
+    run_id = str(uuid.uuid4())
+    run_start = _now()
+    run_entry = {
+        "id": run_id,
+        "task_id": task.get("id"),
+        "channel_id": task.get("channel_id"),
+        "channel_name": task.get("channel_name"),
+        "schedule_label": _format_schedule_label(task),
+        "triggered_at": _iso(run_start),
+        "finished_at": "",
+        "status": "running",
+        "total_found": 0,
+        "new_items": 0,
+        "success_items": 0,
+        "failed_items": 0,
+        "duration_seconds": 0,
+        "model": model_name,
+        "error": "",
+    }
+    try:
+        videos = get_channel_recent_videos(
+            channel_url,
+            limit=max_items,
+            proxy_url=eff_proxy,
+            timeout_seconds=timeout_seconds,
+            filter_longest=True,
+            min_duration_seconds=min_duration_seconds,
+            only_streams=only_streams
+        )
+        run_entry["total_found"] = len(videos)
+        for v in videos:
+            vid = v.get("id")
+            if not vid or vid in processed_set:
+                continue
+            run_entry["new_items"] += 1
+            item_record = {
+                "run_id": run_id,
+                "video_id": vid,
+                "title": v.get("title"),
+                "url": v.get("url"),
+                "channel_name": task.get("channel_name") or "",
+                "platform": task.get("platform") or "",
+                "status": "running",
+                "summary": "",
+                "error": "",
+                "created_at": _iso(_now()),
+                "duration_seconds": 0,
+            }
+            item_start = _now()
+            text, err = internal_fetch_transcript(v.get("url"))
+            if err:
+                item_record["status"] = "failed"
+                item_record["error"] = err
+                item_record["duration_seconds"] = int((_now() - item_start).total_seconds())
+                run_entry["failed_items"] += 1
+                run_items.append(item_record)
+                continue
+            if not api_key:
+                item_record["status"] = "failed"
+                item_record["error"] = "缺少 API Key，无法生成总结"
+                item_record["duration_seconds"] = int((_now() - item_start).total_seconds())
+                run_entry["failed_items"] += 1
+                run_items.append(item_record)
+                continue
+            try:
+                summary = summarize_text(text, api_key, base_url, model_name, eff_proxy)
+                item_record["status"] = "success"
+                item_record["summary"] = summary
+                item_record["duration_seconds"] = int((_now() - item_start).total_seconds())
+                run_entry["success_items"] += 1
+                processed_set.add(vid)
+                
+                # 自动保存到历史记录
+                try:
+                    add_history_entry("schedule", v.get("url"), summary, text)
+                except Exception as e_hist:
+                    print(f"Failed to save history (schedule): {e_hist}")
+                    
+            except Exception as e:
+                item_record["status"] = "failed"
+                item_record["error"] = str(e)
+                item_record["duration_seconds"] = int((_now() - item_start).total_seconds())
+                run_entry["failed_items"] += 1
+            run_items.append(item_record)
+            time.sleep(0.3)
+        if run_entry["new_items"] == 0:
+            run_entry["status"] = "no_update"
+        elif run_entry["failed_items"] == 0:
+            run_entry["status"] = "success"
+        elif run_entry["success_items"] == 0:
+            run_entry["status"] = "failed"
+        else:
+            run_entry["status"] = "partial"
+        _append_log(logs, "info", f"任务执行完成，新增 {run_entry.get('new_items') or 0} 个视频", task.get("id"))
+        task["last_error"] = ""
+        task["retry_count"] = 0
+        task["next_retry_at"] = ""
+        task["last_run_at"] = _iso(_now())
+        task["next_run_at"] = _iso(_compute_next_run(task, _now()) or "")
+    except Exception as e:
+        task["last_error"] = str(e)
+        retry_count = int(task.get("retry_count") or 0) + 1
+        task["retry_count"] = retry_count
+        if retry_count <= 3:
+            next_retry = _now() + timedelta(minutes=5)
+            task["next_retry_at"] = _iso(next_retry)
+            _append_log(logs, "warning", f"任务失败，将在 5 分钟后重试({retry_count}/3)：{e}", task.get("id"))
+        else:
+            task["next_retry_at"] = ""
+            _append_log(logs, "error", f"任务失败并超过最大重试次数：{e}", task.get("id"))
+        run_entry["status"] = "failed"
+        run_entry["error"] = str(e)
+    run_entry["finished_at"] = _iso(_now())
+    run_entry["duration_seconds"] = int((_now() - run_start).total_seconds())
+    runs.append(run_entry)
+    runs, run_items = _trim_schedule_records(runs, run_items)
+    settings["schedule_logs"] = logs[-200:]
+    settings["scheduled_runs"] = runs
+    settings["scheduled_run_items"] = run_items
+    settings["scheduled_processed_ids"] = list(processed_set)
+    return settings
+
+# --- 辅助函数 ---
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+def load_subscriptions():
+    if os.path.exists(SUBSCRIPTIONS_FILE):
+        try:
+            with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_subscriptions(subs):
+    with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(subs, f, ensure_ascii=False, indent=2)
+
+@st.cache_resource
+def _start_scheduler_thread():
+    # 使用 cache_resource 确保全局只启动一个调度线程
+    def _loop():
+        while True:
+            try:
+                settings, tasks, logs, runs, run_items, processed_ids = _load_scheduled_state()
+                now = _now()
+                due_tasks = []
+                for t in tasks:
+                    if not t.get("enabled"):
+                        continue
+                    next_retry = _parse_iso(t.get("next_retry_at"))
+                    next_run = _parse_iso(t.get("next_run_at"))
+                    if next_retry and next_retry <= now:
+                        due_tasks.append(t)
+                        continue
+                    if not next_run:
+                        computed = _compute_next_run(t, now)
+                        t["next_run_at"] = _iso(computed) if computed else ""
+                        continue
+                    if next_run <= now:
+                        due_tasks.append(t)
+                if due_tasks:
+                    for t in due_tasks:
+                        settings = _run_task_once(t, settings)
+                runs = settings.get("scheduled_runs") or runs
+                run_items = settings.get("scheduled_run_items") or run_items
+                processed_ids = settings.get("scheduled_processed_ids") or processed_ids
+                _save_scheduled_state(settings, tasks, settings.get("schedule_logs") or [], runs, run_items, processed_ids)
+            except Exception as e:
+                # print(f"Scheduler error: {e}")
+                pass
+            time.sleep(15)
+    
+    worker = threading.Thread(target=_loop, daemon=True)
+    worker.start()
+    return worker
+
+def _start_scheduler_once():
+    # 只需要调用 cache_resource 装饰的函数
+    _start_scheduler_thread()
+
+def _format_countdown(target_time):
+    if not target_time:
+        return "—"
+    now = _now()
+    delta = target_time - now
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "即将执行"
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days}天")
+    if hours > 0:
+        parts.append(f"{hours}小时")
+    parts.append(f"{minutes}分")
+    return "".join(parts)
+
+def _format_schedule_label(task):
+    schedule_type = (task.get("schedule_type") or "").lower()
+    if schedule_type == "daily":
+        return f"每天 {task.get('time')}"
+    if schedule_type == "weekly":
+        weekdays = task.get("weekdays") or []
+        labels = ["周一","周二","周三","周四","周五","周六","周日"]
+        day_text = "、".join([labels[i] for i in weekdays if isinstance(i, int) and 0 <= i <= 6])
+        return f"{day_text} {task.get('time')}"
+    if schedule_type == "interval":
+        return f"每 {task.get('interval_hours')} 小时"
+    if schedule_type == "cron":
+        return f"Cron: {task.get('cron')}"
+    return "未设置"
+
+def _build_month_calendar(tasks):
+    now = _now()
+    year = now.year
+    month = now.month
+    cal = calendar.monthcalendar(year, month)
+    task_days = {}
+    for t in tasks:
+        next_time = _parse_iso(t.get("next_run_at")) or _parse_iso(t.get("next_retry_at"))
+        if next_time and next_time.year == year and next_time.month == month:
+            task_days.setdefault(next_time.day, 0)
+            task_days[next_time.day] += 1
+    rows = []
+    header = ["一", "二", "三", "四", "五", "六", "日"]
+    rows.append("|" + "|".join(header) + "|")
+    rows.append("|" + "|".join(["---"] * 7) + "|")
+    for week in cal:
+        cells = []
+        for day in week:
+            if day == 0:
+                cells.append(" ")
+            else:
+                count = task_days.get(day, 0)
+                if count > 0:
+                    cells.append(f"{day} 🔔{count}")
+                else:
+                    cells.append(str(day))
+        rows.append("|" + "|".join(cells) + "|")
+    return "\n".join(rows)
+
+# --- 页面配置 ---
+st.set_page_config(
+    page_title="YouTube Summarizer",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --- Session State 初始化 ---
+if "settings" not in st.session_state:
+    st.session_state.settings = load_settings()
+
+if "subscriptions" not in st.session_state:
+    st.session_state.subscriptions = load_subscriptions()
+if "updates" not in st.session_state:
+    st.session_state.updates = {} # {channel_id: [video_list]}
+
+if "remember_api_key" not in st.session_state:
+    st.session_state.remember_api_key = bool(st.session_state.settings.get("remember_api_key", True))
+if "api_key" not in st.session_state:
+    if st.session_state.remember_api_key:
+        st.session_state.api_key = st.session_state.settings.get("api_key", "")
+    else:
+        st.session_state.api_key = ""
+if "base_url" not in st.session_state:
+    st.session_state.base_url = st.session_state.settings.get("base_url", "https://api.openai.com/v1")
+if "model" not in st.session_state:
+    st.session_state.model = st.session_state.settings.get("model", "gpt-3.5-turbo")
+if "proxy" not in st.session_state:
+    st.session_state.proxy = st.session_state.settings.get("proxy", "")
+if "transcript_text" not in st.session_state:
+    st.session_state.transcript_text = ""
+if "summary_text" not in st.session_state:
+    st.session_state.summary_text = ""
+if "whisper_device_tag" not in st.session_state:
+    st.session_state.whisper_device_tag = ""
+if "asr_force_cpu" not in st.session_state:
+    st.session_state.asr_force_cpu = False
+if "available_models" not in st.session_state:
+    st.session_state.available_models = [
+        "gpt-3.5-turbo",
+        "gpt-4o",
+        "gpt-4-turbo",
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "qwen-plus",
+        "qwen-turbo",
+        "moonshot-v1-8k",
+    ]
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
+if "last_saved_settings" not in st.session_state:
+    remember_api_key_initial = bool(st.session_state.remember_api_key)
+    st.session_state.last_saved_settings = {
+        "api_key": st.session_state.settings.get("api_key", "") if remember_api_key_initial else "",
+        "base_url": st.session_state.settings.get("base_url", "https://api.openai.com/v1"),
+        "model": st.session_state.settings.get("model", "gpt-3.5-turbo"),
+        "proxy": st.session_state.settings.get("proxy", ""),
+        "remember_api_key": remember_api_key_initial,
+    }
+
+# --- 侧边栏配置 ---
+with st.sidebar:
+    st.header("⚙️ 设置")
+    
+    with st.expander("🌐 网络 & 代理", expanded=False):
+        def on_ai_settings_change():
+            st.session_state.proxy = st.session_state.proxy_input
+            st.session_state.api_key = st.session_state.api_key_input
+            st.session_state.base_url = st.session_state.base_url_input
+            remember_api_key = bool(st.session_state.remember_api_key)
+            persisted_api_key = st.session_state.api_key if remember_api_key else ""
+            update_settings_partial({
+                "api_key": persisted_api_key,
+                "base_url": st.session_state.base_url,
+                "model": st.session_state.model,
+                "proxy": st.session_state.proxy,
+                "remember_api_key": remember_api_key
+            })
+            if isinstance(st.session_state.settings, dict):
+                st.session_state.settings.update({
+                    "api_key": persisted_api_key,
+                    "base_url": st.session_state.base_url,
+                    "model": st.session_state.model,
+                    "proxy": st.session_state.proxy,
+                    "remember_api_key": remember_api_key
+                })
+            st.toast("设置已自动保存", icon="✅")
+
+        proxy_input = st.text_input(
+            "HTTP 代理 (可选)",
+            value=st.session_state.proxy,
+            placeholder="http://127.0.0.1:7890",
+            key="proxy_input",
+            on_change=on_ai_settings_change
+        )
+        use_system_proxy = st.checkbox("使用系统代理", value=True)
+    
+    with st.expander("🕸️ 抓取设置", expanded=False):
+        languages = st.text_input("语言优先级", value="zh-Hans,zh,en")
+        cookies_browser = st.selectbox(
+            "Cookies 来源浏览器", 
+            ["auto", "chrome", "edge", "firefox", "brave", "chromium"], 
+            index=0,
+            help="选择 'auto' 将按稳定性排序尝试浏览器 (推荐)。注意：新版 Edge/Chrome (127+) 已限制外部读取，建议在 Firefox 中登录并选择 firefox 或使用 auto 模式。"
+        )
+        auto_cookies = st.checkbox("自动读取浏览器 Cookies", value=True)
+        timeout = st.number_input("超时时间 (秒)", value=60, min_value=5, max_value=300)
+        retries = st.number_input("重试次数", value=2, min_value=0, max_value=10)
+    
+    with st.expander("🎙️ 音频转写 (Whisper)", expanded=False):
+        asr_enabled = st.checkbox("无字幕时启用转写", value=True)
+        asr_model = st.selectbox("Whisper 模型", ["tiny", "base", "small", "medium", "large"], index=0, help="tiny 最快但精度稍低；base 平衡；small/medium 精度更高但耗时更长")
+        asr_fast_mode = st.checkbox("极速模式", value=True, help="以速度优先：更大 chunk、更少解码开销，可能略降精度")
+        st.session_state.asr_force_cpu = False
+        
+        # 检测 faster-whisper 是否安装，给出提示
+        try:
+            import faster_whisper
+            # 尝试获取当前运行的设备信息
+            # 由于 app.py 无法直接访问 core_logic 的函数内部变量，我们只能静态提示
+            # 或者我们可以在 core_logic 暴露一个 get_device_info
+            
+            def _check_cuda_available():
+                try:
+                    import ctranslate2
+                    if hasattr(ctranslate2, "get_cuda_device_count"):
+                        count = ctranslate2.get_cuda_device_count()
+                        if count and count > 0:
+                            return True, ""
+                        return False, "ctranslate2 未检测到 CUDA 设备"
+                    return False, "当前 ctranslate2 版本不支持 CUDA 检测"
+                except Exception as e:
+                    return False, f"CUDA 检测失败: {e}"
+
+            cuda_ok, cuda_reason = _check_cuda_available()
+            st.caption("✅ 已检测到 faster-whisper 加速引擎")
+            if cuda_ok:
+                st.caption("✅ 已检测到可用 GPU (CUDA)，将自动启用加速")
+            else:
+                st.caption(f"⚠️ 未检测到可用 GPU (CUDA)：{cuda_reason}")
+            st.caption("🚀 性能提示：系统将自动尝试调用 GPU (CUDA)。如果失败，将回退到多核 CPU 模式 (已优化线程数)。")
+            
+        except ImportError:
+            st.caption("⚠️ 未检测到 faster-whisper。建议运行 `pip install faster-whisper` 以获得 4-10 倍提速。")
+
+    with st.expander("🤖 AI 总结设置", expanded=True):
+        remember_api_key = st.checkbox(
+            "记住 API Key",
+            key="remember_api_key",
+            on_change=on_ai_settings_change
+        )
+        api_key = st.text_input(
+            "API Key",
+            value=st.session_state.api_key,
+            type="password",
+            key="api_key_input",
+            on_change=on_ai_settings_change
+        )
+        base_url = st.text_input(
+            "Base URL",
+            value=st.session_state.base_url,
+            key="base_url_input",
+            on_change=on_ai_settings_change
+        )
+        
+        col_model, col_refresh = st.columns([3, 1])
+        with col_refresh:
+            # 下沉按钮，对齐下拉框
+            st.write("") 
+            st.write("")
+            if st.button("🔄", help="刷新模型列表"):
+                if not api_key:
+                    st.error("请先填 Key")
+                else:
+                    try:
+                        with st.spinner("..."):
+                            models = fetch_available_models(api_key, base_url, proxy_input)
+                            if models:
+                                st.session_state.available_models = models
+                                st.toast(f"成功获取 {len(models)} 个模型", icon="✅")
+                            else:
+                                st.warning("列表为空")
+                    except Exception as e:
+                        st.error(f"失败: {e}")
+
+        with col_model:
+            model_index = 0
+            if st.session_state.model in st.session_state.available_models:
+                model_index = st.session_state.available_models.index(st.session_state.model)
+            
+            # 优化：使用 st.selectbox 的 key 来避免每次渲染都重置
+            # 并且将 save_settings 移到回调中，或者只在值改变时触发
+            def on_model_change():
+                st.session_state.model = st.session_state.selectbox_model
+                remember_api_key = bool(st.session_state.remember_api_key)
+                persisted_api_key = st.session_state.api_key if remember_api_key else ""
+                update_settings_partial({
+                    "api_key": persisted_api_key,
+                    "base_url": st.session_state.base_url,
+                    "model": st.session_state.model,
+                    "proxy": st.session_state.proxy,
+                    "remember_api_key": remember_api_key
+                })
+
+            model_selected = st.selectbox(
+                "模型", 
+                st.session_state.available_models, 
+                index=model_index,
+                key="selectbox_model",
+                on_change=on_model_change
+            )
+    
+    # 移除复选框，默认就是自动总结
+    # auto_summary = st.checkbox("抓取后自动总结", value=True)
+
+    st.session_state.proxy = proxy_input
+    st.session_state.api_key = api_key
+    st.session_state.base_url = base_url
+
+    # 显式保存按钮，解决输入框失去焦点未触发 on_change 的问题
+    if st.button("💾 保存设置", use_container_width=True):
+        # 强制从组件状态同步最新值
+        if "api_key_input" in st.session_state:
+            st.session_state.api_key = st.session_state.api_key_input
+        if "base_url_input" in st.session_state:
+            st.session_state.base_url = st.session_state.base_url_input
+        if "proxy_input" in st.session_state:
+            st.session_state.proxy = st.session_state.proxy_input
+        
+        remember_api_key = bool(st.session_state.get("remember_api_key", True))
+        persisted_api_key = st.session_state.api_key if remember_api_key else ""
+        
+        try:
+            new_settings = {
+                "api_key": persisted_api_key,
+                "base_url": st.session_state.base_url,
+                "model": st.session_state.model,
+                "proxy": st.session_state.proxy,
+                "remember_api_key": remember_api_key
+            }
+            update_settings_partial(new_settings)
+            
+            # 同时更新内存中的 settings 对象
+            if isinstance(st.session_state.settings, dict):
+                st.session_state.settings.update(new_settings)
+                
+            st.toast("设置已保存！请刷新页面验证。", icon="✅")
+            time.sleep(0.5) # 给一点时间让 toast 显示
+            st.rerun() # 强制刷新以确保状态同步
+        except Exception as e:
+            st.error(f"保存失败: {e}")
+
+    # 自动兜底保存逻辑 (Keep this as fallback)
+    remember_api_key = bool(st.session_state.remember_api_key)
+    persisted_api_key = st.session_state.api_key if remember_api_key else ""
+    current_settings = {
+        "api_key": persisted_api_key,
+        "base_url": st.session_state.base_url,
+        "model": st.session_state.model,
+        "proxy": st.session_state.proxy,
+        "remember_api_key": remember_api_key,
+    }
+    if st.session_state.last_saved_settings != current_settings:
+        update_settings_partial(current_settings)
+        if isinstance(st.session_state.settings, dict):
+            st.session_state.settings.update(current_settings)
+        st.session_state.last_saved_settings = dict(current_settings)
+
+
+
+# --- 主界面 ---
+st.title("🎬 Video Summarizer")
+st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
+
+# 使用 Tabs 分割功能
+tab_single, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
+
+# --- 通用逻辑函数 (供两个 Tab 使用) ---
+def internal_fetch_transcript(video_url, progress_callback=None):
+    """
+    核心抓取逻辑，返回 (transcript_text, error_msg)
+    """
+    try:
+        def is_html_like_text(text: str) -> bool:
+            if not text:
+                return False
+            sample = text.strip().lower()
+            if sample.startswith("<!doctype") or sample.startswith("<html"):
+                return True
+            if "<html" in sample[:2000]:
+                return True
+            if "<head" in sample and "<body" in sample:
+                return True
+            return False
+
+        if progress_callback: progress_callback(10, "解析视频信息...")
+        video_id, v_url, languages_effective = get_transcript_from_input(video_url, languages)
+        
+        api = build_api(
+            proxy_url=proxy_input,
+            timeout_seconds=float(timeout),
+            use_system_proxy=use_system_proxy,
+            retries=int(retries),
+        )
+        # 注入私有属性
+        setattr(api, "_cookies_file", "")
+        setattr(api, "_cookies_from_browser", cookies_browser if auto_cookies else "")
+        setattr(api, "_asr_enabled", asr_enabled)
+        setattr(api, "_asr_model", asr_model) # 传递用户选择的 model
+        setattr(api, "_asr_language", "auto")
+        setattr(api, "_asr_fast_mode", asr_fast_mode)
+        setattr(api, "_asr_force_cpu", st.session_state.asr_force_cpu)
+        
+        # 定义一个内部回调，用于将底层状态透传给 UI
+        def status_relay(msg):
+            if progress_callback:
+                progress_callback(50, f"{msg}")
+
+        setattr(api, "_status_callback", status_relay)
+        
+        langs_list = [s.strip() for s in languages_effective.split(",") if s.strip()]
+        
+        if progress_callback:
+            fast_tag = " + 极速" if asr_fast_mode else ""
+            progress_callback(30, f"获取字幕/音频 (Whisper: {asr_model}{fast_tag})...")
+        # 记录开始时间
+        import time
+        t0 = time.time()
+        
+        text = get_video_transcript(api, video_id, video_url=v_url, languages=langs_list)
+        if is_html_like_text(text):
+            return None, "检测到返回内容为 HTML 页面源码，无法用于总结。请确认视频可访问，或更换网络/代理后重试。"
+        
+        t1 = time.time()
+        elapsed = t1 - t0
+        
+        if progress_callback: progress_callback(100, f"抓取完成！耗时: {elapsed:.1f}s")
+        return text, None
+    except Exception as e:
+        return None, format_error(e)
+
+def internal_summarize(text, model_name):
+    """
+    核心总结逻辑，返回 (summary_text, error_msg)
+    """
+    if not api_key:
+        return None, "请在侧边栏填写 API Key"
+    try:
+        summary = summarize_text(
+            text,
+            api_key,
+            base_url,
+            model_name,
+            proxy_input
+        )
+        return summary, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ==========================
+# Tab 1: 单视频处理
+# ==========================
+with tab_single:
+    # --- 界面布局 ---
+    st.info("💡 支持输入：\n- YouTube 视频链接 / ID\n- Bilibili 视频链接 / BV号")
+    url = st.text_input("视频链接或 ID", value=st.session_state.get("input_url", ""), placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...")
+    
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        fetch_btn = st.button("🚀 一键抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
+    with col2:
+        summary_btn = st.button("🤖 仅重新生成总结", use_container_width=True, key="btn_single_sum")
+    with col3:
+        check_btn = st.button("🔍 检测可用字幕", use_container_width=True, key="btn_single_check")
+
+    def do_fetch_single():
+        if not url:
+            st.warning("请输入视频链接")
+            return
+
+        status_container = st.empty()
+        status_container.info("正在初始化...")
+        
+        try:
+            # 网络预检
+            with st.status("🔍 网络预检中...", expanded=False) as status:
+                eff_proxy, pac_note = get_effective_proxy(proxy_input, use_system_proxy)
+                status.write(f"当前代理: {eff_proxy or '无 (直连)'}")
+                if pac_note: status.info(pac_note)
+                
+                net_err = check_network(eff_proxy, timeout=5.0)
+                if net_err:
+                    status.update(label="⚠️ 网络预检失败", state="error", expanded=True)
+                    st.warning(f"无法连接 Google/YouTube。\n错误信息：{net_err}")
+                else:
+                    status.update(label="✅ 网络预检通过", state="complete")
+            
+            # 抓取字幕
+            status_container.info("正在抓取字幕/转写音频...")
+            progress_bar = st.progress(0)
+            
+            # 计时开始
+            t_start_all = time.time()
+            
+            used_asr = False
+            asr_notice_shown = False
+            def update_progress(p, t):
+                nonlocal used_asr, asr_notice_shown
+                progress_bar.progress(p, text=t)
+                if (not asr_notice_shown) and ("Whisper" in str(t) or "whisper" in str(t)):
+                    status_container.warning("⚠️ 字幕未获取成功，已自动切换到音频转写，耗时可能较长...")
+                    asr_notice_shown = True
+                    used_asr = True
+                
+            text, err = internal_fetch_transcript(url, update_progress)
+            
+            # 抓取阶段耗时
+            t_fetch_end = time.time()
+            fetch_duration = t_fetch_end - t_start_all
+            
+            if err:
+                progress_bar.empty()
+                status_container.error("❌ 抓取失败")
+                st.error(err)
+                return
+
+            whisper_device_info = ""
+            if text and "<!-- FW_DEVICE" in text:
+                import re
+                m = re.search(r"<!-- FW_DEVICE: (.*?) -->", text)
+                if m:
+                    whisper_device_info = f"⚡ {m.group(1)}"
+                    st.session_state.whisper_device_tag = f"<!-- FW_DEVICE: {m.group(1)} -->"
+                text = re.sub(r"\n\n<!-- FW_DEVICE: .*? -->", "", text)
+
+            st.session_state.transcript_text = text
+
+            if used_asr:
+                msg = f"🎉 音频转写完成！(Whisper: {whisper_device_info or 'CPU'}) | 耗时: {fetch_duration:.1f}s"
+                status_container.success(msg)
+            else:
+                msg = f"🎉 成功获取字幕！ | 耗时: {fetch_duration:.1f}s"
+                status_container.success(msg)
+                
+            time.sleep(0.5)
+            progress_bar.empty()
+            
+            # 自动总结
+            do_summary_single(manual=False, fetch_duration=fetch_duration)
+                
+        except Exception as e:
+            status_container.error("❌ 执行异常")
+            st.error(f"{e}")
+            st.code(traceback.format_exc())
+
+    def do_summary_single(manual=True, fetch_duration=0.0):
+        if not st.session_state.transcript_text:
+            if manual: st.warning("请先抓取字幕")
+            return
+        
+        t_sum_start = time.time()
+        with st.spinner(f"正在请求 AI 总结 ({model_selected})..."):
+            summary, err = internal_summarize(st.session_state.transcript_text, model_selected)
+            
+            t_sum_end = time.time()
+            sum_duration = t_sum_end - t_sum_start
+            total_duration = fetch_duration + sum_duration
+            
+            # 保存耗时信息到 session_state
+            st.session_state.summary_duration = {
+                "fetch": fetch_duration,
+                "summary": sum_duration,
+                "total": total_duration
+            }
+            
+            if err:
+                st.error(f"总结失败: {err}")
+            else:
+                st.session_state.summary_text = summary
+                if manual: 
+                    st.success(f"总结完成 | AI生成耗时: {sum_duration:.1f}s")
+                
+                # 自动保存到历史记录
+                try:
+                    add_history_entry("single", url, summary, st.session_state.transcript_text)
+                except Exception as e_hist:
+                    print(f"Failed to save history: {e_hist}")
+
+    def do_check_single():
+        if not url: return
+        try:
+            with st.spinner("检测中..."):
+                video_id, _, _ = get_transcript_from_input(url, languages)
+                api = build_api(proxy_input, float(timeout), use_system_proxy, int(retries))
+                report = list_available_transcripts(api, video_id)
+                st.text(report)
+        except Exception as e:
+            st.error(format_error(e))
+
+    if fetch_btn:
+        do_fetch_single()
+    if summary_btn:
+        do_summary_single()
+    if check_btn:
+        do_check_single()
+
+    if st.session_state.summary_text:
+        st.markdown("### 📝 AI 总结")
+        
+        # 显示总结耗时统计（如果有）
+        if "summary_duration" in st.session_state and st.session_state.summary_duration:
+            dur = st.session_state.summary_duration
+            fetch_t = dur.get("fetch", 0)
+            sum_t = dur.get("summary", 0)
+            total_t = dur.get("total", 0)
+            
+            # 使用 metric 样式或自定义 badge
+            st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (抓取/转写: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
+            
+        # 尝试解析 JSON 总结并分栏显示
+        summary_content = st.session_state.summary_text
+        is_json_summary = False
+        summary_data = {}
+        
+        try:
+            # 简单启发式检查：如果是 { 开头 } 结尾，尝试解析
+            if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
+                summary_data = json.loads(summary_content)
+                if "summary_markdown" in summary_data:
+                    is_json_summary = True
+        except Exception:
+            pass
+            
+        if is_json_summary:
+            col_sum, col_check = st.columns([1.2, 1])
+            with col_sum:
+                st.markdown(summary_data.get("summary_markdown", ""))
+            with col_check:
+                st.info("🕵️ **新闻事实核查**")
+                st.markdown(summary_data.get("fact_check_markdown", ""))
+        else:
+            # 兼容旧的纯文本总结
+            st.markdown(summary_content)
+
+        st.divider()
+        
+        # 尝试提取 fetch/download 耗时
+        footer_info = ""
+        if st.session_state.whisper_device_tag:
+             footer_info = f"⚡ {st.session_state.whisper_device_tag}"
+        
+        try:
+            # 检查 transcript_text 是否包含 TIMING tag
+            raw_text = st.session_state.transcript_text or ""
+            if "<!-- TIMING:" in raw_text:
+                import re
+                m_timing = re.search(r"<!-- TIMING: download=([\d\.]+), transcribe=([\d\.]+) -->", raw_text)
+                if m_timing:
+                    dl_time = float(m_timing.group(1))
+                    tr_time = float(m_timing.group(2))
+                    if footer_info: footer_info += " | "
+                    footer_info += f"📥 下载: {dl_time:.1f}s | 🎙️ 转写: {tr_time:.1f}s"
+        except Exception:
+            pass
+            
+        if footer_info:
+            st.caption(footer_info)
+
+        if st.session_state.whisper_device_tag:
+            st.markdown("### ⚡ Whisper 设备标签 (可复制)")
+            st.code(st.session_state.whisper_device_tag, language="text")
+
+    if st.session_state.transcript_text:
+        with st.expander("查看字幕原文", expanded=False):
+            st.text_area("字幕内容", st.session_state.transcript_text, height=300)
+
+
+# ==========================
+# Tab 2: 频道订阅
+# ==========================
+with tab_sub:
+    # --- 订阅管理 (合并了添加和列表) ---
+    with st.expander("📺 订阅管理 (添加 / 查看 / 删除)", expanded=False):
+        # 1. 添加订阅区域
+        st.markdown("##### ➕ 添加新订阅")
+        new_channel_input = st.text_input("输入频道链接或关键词 (如 '李永乐')", key="sub_input")
+        
+        col_act_1, col_act_2 = st.columns([1, 3])
+        with col_act_1:
+            if st.button("🔍 搜索 / 添加", use_container_width=True):
+                if not new_channel_input:
+                    st.warning("请输入内容")
+                else:
+                    # 判断是否为 URL
+                    is_url = "http" in new_channel_input or "://" in new_channel_input or new_channel_input.startswith("@") or "www." in new_channel_input or new_channel_input.startswith("BV")
+                    
+                    if is_url:
+                        with st.spinner("正在获取频道信息..."):
+                            try:
+                                eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
+                                cid, cname, curl, cavatar, cplatform = get_channel_info(
+                                    new_channel_input, 
+                                    proxy_url=eff_proxy, 
+                                    timeout_seconds=float(timeout)
+                                )
+                                exists = any(s['id'] == cid for s in st.session_state.subscriptions)
+                                if exists:
+                                    st.warning(f"频道 '{cname}' 已在订阅列表中")
+                                else:
+                                    st.session_state.subscriptions.append({
+                                        "id": cid,
+                                        "name": cname,
+                                        "url": curl,
+                                        "avatar": cavatar,
+                                        "added_at": datetime.now().isoformat(),
+                                        "platform": cplatform
+                                    })
+                                    save_subscriptions(st.session_state.subscriptions)
+                                    st.success(f"已添加订阅: {cname} ({cplatform})")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"添加失败: {e}")
+                    else:
+                        st.session_state.search_results = None
+                        with st.spinner(f"正在搜索 '{new_channel_input}' ..."):
+                            eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
+                            results = search_channels(new_channel_input, limit=3, proxy_url=eff_proxy, timeout_seconds=float(timeout))
+                            st.session_state.search_results = results
+                            if not results.get("youtube") and not results.get("bilibili"):
+                                st.warning("未找到相关频道")
+                            else:
+                                st.rerun()
+
+        # 显示搜索结果
+        if st.session_state.get("search_results"):
+             st.divider()
+             st.markdown("### 🔍 搜索结果")
+             
+             res_yt = st.session_state.search_results.get("youtube", [])
+             res_b = st.session_state.search_results.get("bilibili", [])
+             
+             tab_res_yt, tab_res_b = st.tabs([f"YouTube ({len(res_yt)})", f"Bilibili ({len(res_b)})"])
+             
+             def render_search_item(item):
+                 with st.container(border=True):
+                     c_avatar, c_info, c_btn = st.columns([1, 4, 1.5])
+                     with c_avatar:
+                        avatar = item.get("avatar")
+                        if avatar:
+                            if avatar.startswith("//"):
+                                avatar = "https:" + avatar
+                            st.markdown(
+                                f'<div style="display: flex; justify-content: center;">'
+                                f'<img src="{avatar}" style="width: 100%; border-radius: 50%; aspect-ratio: 1/1; object-fit: cover;" referrerpolicy="no-referrer" />'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                        else:
+                             if item['platform'] == 'youtube':
+                                 st.markdown("<div style='height: 60px; display: flex; align-items: center; justify-content: center; font-size: 30px; background-color: #f0f0f0; border-radius: 50%;'>🟥</div>", unsafe_allow_html=True)
+                             else:
+                                 st.markdown("<div style='height: 60px; display: flex; align-items: center; justify-content: center; font-size: 30px; background-color: #f0f0f0; border-radius: 50%;'>🟦</div>", unsafe_allow_html=True)
+                     with c_info:
+                         name = item.get("name", "Unknown")
+                         desc = item.get("desc", "")
+                         url = item.get("url", "")
+                         st.markdown(f"**[{name}]({url})**")
+                         if desc:
+                             st.caption(desc)
+                         else:
+                             st.caption(f"{'YouTube' if item['platform'] == 'youtube' else 'Bilibili'} 频道")
+                     with c_btn:
+                         st.write("")
+                         if st.button("➕ 添加", key=f"add_res_{item['platform']}_{item['id']}", use_container_width=True):
+                             with st.spinner("正在添加..."):
+                                 try:
+                                     eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
+                                     cid, cname, curl, cavatar, cplatform = get_channel_info(
+                                         item['url'], 
+                                         proxy_url=eff_proxy, 
+                                         timeout_seconds=float(timeout)
+                                     )
+                                     exists = any(s['id'] == cid for s in st.session_state.subscriptions)
+                                     if exists:
+                                         st.warning(f"已存在: {cname}")
+                                     else:
+                                         st.session_state.subscriptions.append({
+                                             "id": cid,
+                                             "name": cname,
+                                             "url": curl,
+                                             "avatar": cavatar,
+                                             "added_at": datetime.now().isoformat(),
+                                             "platform": cplatform
+                                         })
+                                         save_subscriptions(st.session_state.subscriptions)
+                                         st.session_state.search_results = None
+                                         st.success(f"已添加: {cname}")
+                                         st.rerun()
+                                 except Exception as e:
+                                     st.error(f"添加失败: {e}")
+             with tab_res_yt:
+                 if not res_yt: st.info("无结果")
+                 else:
+                     for item in res_yt: render_search_item(item)
+             with tab_res_b:
+                 if not res_b: st.info("无结果")
+                 else:
+                     for item in res_b: render_search_item(item)
+             if st.button("✕ 关闭搜索", key="close_search"):
+                 st.session_state.search_results = None
+                 st.rerun()
+
+        st.divider()
+
+        # 2. 订阅列表区域
+        st.markdown("##### 📋 已订阅频道")
+        view_mode = st.radio("视图模式", ["列表", "网格"], horizontal=True, index=0, key="sub_view_mode", label_visibility="collapsed")
+        
+        if not st.session_state.subscriptions:
+            st.info("暂无订阅，请添加")
+        else:
+            yt_subs = []
+            b_subs = []
+            for sub in st.session_state.subscriptions:
+                platform = sub.get("platform")
+                if not platform:
+                    u = sub.get("url", "").lower()
+                    if "bilibili.com" in u: platform = "bilibili"
+                    else: platform = "youtube"
+                if platform == "bilibili": b_subs.append(sub)
+                else: yt_subs.append(sub)
+            
+            def render_sub_card(sub, index_key_suffix, mode="grid"):
+                real_index = st.session_state.subscriptions.index(sub)
+                if mode == "grid":
+                    with st.container(border=True):
+                        c_mid = st.columns([1, 2, 1])
+                        with c_mid[1]:
+                            avatar_url = sub.get("avatar")
+                            if avatar_url:
+                                if avatar_url.startswith("//"): avatar_url = "https:" + avatar_url
+                                st.markdown(f'<div style="display: flex; justify-content: center;"><img src="{avatar_url}" style="width: 100%; border-radius: 50%; aspect-ratio: 1/1; object-fit: cover;" referrerpolicy="no-referrer" /></div>', unsafe_allow_html=True)
+                            else:
+                                st.markdown("<div style='height: 80px; display: flex; align-items: center; justify-content: center; font-size: 40px;'>📺</div>", unsafe_allow_html=True)
+                        name = sub['name']
+                        if "马脸姐" in name: name = "马脸姐"
+                        if len(name) > 8: name = name[:7] + "..."
+                        st.markdown(f"<div style='text-align: center; font-weight: bold; margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;' title='{sub['name']}'><a href='{sub['url']}' target='_blank' style='text-decoration: none; color: inherit;'>{name}</a></div>", unsafe_allow_html=True)
+                        if st.button("🗑️", key=f"del_{real_index}_{index_key_suffix}", help=f"删除 {sub['name']}", use_container_width=True):
+                            st.session_state.subscriptions.pop(real_index)
+                            save_subscriptions(st.session_state.subscriptions)
+                            st.rerun()
+                else:
+                    c_av, c_nm, c_act = st.columns([1, 4, 1])
+                    with c_av:
+                        avatar_url = sub.get("avatar")
+                        if avatar_url:
+                            if avatar_url.startswith("//"): avatar_url = "https:" + avatar_url
+                            st.markdown(f'<div style="display: flex; align-items: center; height: 100%;"><img src="{avatar_url}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover;" referrerpolicy="no-referrer" /></div>', unsafe_allow_html=True)
+                        else: st.markdown("📺")
+                    with c_nm:
+                        st.markdown(f"<div style='line-height: 32px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;'><a href='{sub['url']}' target='_blank' style='text-decoration: none; color: inherit; font-weight: bold;'>{sub['name']}</a></div>", unsafe_allow_html=True)
+                    with c_act:
+                        if st.button("🗑️", key=f"del_list_{real_index}_{index_key_suffix}", help=f"删除 {sub['name']}"):
+                            st.session_state.subscriptions.pop(real_index)
+                            save_subscriptions(st.session_state.subscriptions)
+                            st.rerun()
+                    st.divider()
+
+            if yt_subs:
+                st.markdown("#### 🟥 YouTube")
+                if view_mode == "网格":
+                    cols_count = 4
+                    for i in range(0, len(yt_subs), cols_count):
+                        cols = st.columns(cols_count)
+                        for j in range(cols_count):
+                            if i + j < len(yt_subs):
+                                with cols[j]:
+                                    render_sub_card(yt_subs[i+j], "yt", mode="grid")
+                else:
+                    for sub in yt_subs: render_sub_card(sub, "yt", mode="list")
+            
+            if b_subs:
+                if yt_subs: st.markdown("---")
+                st.markdown("#### 🟦 Bilibili")
+                if view_mode == "网格":
+                    cols_count = 4
+                    for i in range(0, len(b_subs), cols_count):
+                        cols = st.columns(cols_count)
+                        for j in range(cols_count):
+                            if i + j < len(b_subs):
+                                with cols[j]:
+                                    render_sub_card(b_subs[i+j], "b", mode="grid")
+                else:
+                    for sub in b_subs: render_sub_card(sub, "b", mode="list")
+
+    # --- 最新动态 (全宽) ---
+    
+    # 使用一个容器来包裹，确保布局正确
+    with st.container():
+        st.subheader("🆕 最新动态")
+        
+        if st.button("🔄 检查所有订阅更新", type="primary", use_container_width=True):
+                # ... (原有逻辑)
+                st.session_state.is_updating_all = True
+                
+                # 清空之前的更新内容
+                st.session_state.updates = {}
+                # update_container 还没定义，不需要 clear，因为代码还没跑到那里
+                
+                with st.status("正在检查更新...", expanded=True) as status:
+                    # 添加进度条
+                    progress_text = "准备开始：正在检测网络代理..."
+                    progress_bar = st.progress(0, text=progress_text)
+                    
+                    eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
+                    
+                    progress_bar.progress(0, text="准备开始：正在初始化检查任务...")
+                    
+                    # 使用线程池并发检查更新
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    
+                # 定义单个检查任务
+                def check_single_sub(sub, proxy, timeout_val):
+                    try:
+                        # 针对"王剑每日观察"和"大康有话说"的特殊逻辑
+                        min_dur = 0
+                        only_streams = False
+                        
+                        # 根据 ID 或名称判断
+                        # 王剑: UC8UCbiPrm2zN9nZHKdTevZA
+                        # 大康: (名称匹配)
+                        if sub['id'] == "UC8UCbiPrm2zN9nZHKdTevZA" or "王剑" in sub['name'] or "大康" in sub['name']:
+                            min_dur = 1200 # 20 分钟 (适度放宽，配合 only_streams 使用)
+                            only_streams = True
+                            
+                        # 降低单次检查的超时时间，避免一个慢拖死全部
+                        # 并且这里已经在线程池里了，可以并行等待
+                        # 强制设置较短的超时时间 (20s)，因为检查 RSS/HTML 不需要太久
+                        eff_timeout = min(float(timeout_val), 20.0)
+                        return sub['id'], get_channel_recent_videos(
+                            sub['url'], 
+                            limit=5, 
+                            proxy_url=proxy,
+                            timeout_seconds=eff_timeout,
+                            filter_longest=True,
+                            min_duration_seconds=min_dur,
+                            only_streams=only_streams
+                        )
+                    except Exception as e:
+                        return sub['id'], e
+
+                # 限制最大并发数为 20，提高并发度
+                max_workers = min(len(st.session_state.subscriptions), 20)
+                
+                progress_bar.progress(0, text=f"正在启动 {max_workers} 个并发检查任务...")
+                
+                start_time = time.time()
+                
+                # 初始化状态显示
+                status.update(label=f"正在检查更新... (已耗时 0s)", state="running")
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_sub = {
+                        executor.submit(check_single_sub, sub, eff_proxy, timeout): sub 
+                        for sub in st.session_state.subscriptions
+                    }
+                    
+                    completed_count = 0
+                    total_subs = len(st.session_state.subscriptions)
+                    
+                    # 先展示 0%
+                    progress_bar.progress(0.01, text=f"(0/{total_subs}) 任务已提交，等待结果...")
+                    
+                    for future in as_completed(future_to_sub):
+                        sub = future_to_sub[future]
+                        completed_count += 1
+                        pct = completed_count / total_subs
+                        
+                        # 计算时间
+                        elapsed = time.time() - start_time
+                        avg_time = elapsed / completed_count
+                        remain_count = total_subs - completed_count
+                        remain_time = avg_time * remain_count
+                        
+                        progress_bar.progress(pct, text=f"({completed_count}/{total_subs}) 正在检查: {sub['name']}... | 预计剩余: {int(remain_time)}s")
+                        status.update(label=f"正在检查更新... (已耗时 {int(elapsed)}s)", state="running")
+                        
+                        try:
+                            sid, result = future.result()
+                            if isinstance(result, list):
+                                if result:
+                                    st.session_state.updates[sid] = result
+                                    status.write(f"✅ {sub['name']}: 发现 {len(result)} 个新视频")
+                                else:
+                                    # status.write(f"✓ {sub['name']}: 无更新")
+                                    pass
+                            else:
+                                # result is Exception
+                                status.write(f"⚠️ {sub['name']} 检查失败: {result}")
+                        except Exception as exc:
+                            status.write(f"⚠️ {sub['name']} 异常: {exc}")
+                
+                total_elapsed = time.time() - start_time
+                progress_bar.progress(1.0, text=f"检查完成！总耗时 {int(total_elapsed)}s")
+                time.sleep(0.5)
+                progress_bar.empty()
+                status.update(label=f"✅ 更新检查完成 (耗时 {int(total_elapsed)}s)", state="complete", expanded=False)
+                st.session_state.last_update_check = datetime.now().strftime("%H:%M")
+                st.session_state.is_updating_all = False
+                st.rerun()
+
+        # 显示更新内容
+        update_container = st.empty()
+        
+        # 如果正在更新，不显示下面的内容
+        if not st.session_state.get("is_updating_all", False):
+            with update_container.container():
+                if st.session_state.updates:
+                    for sub in st.session_state.subscriptions:
+                        sid = sub['id']
+                        if sid in st.session_state.updates:
+                            videos = st.session_state.updates[sid]
+                            if not videos: continue
+                            
+                            # 频道标题栏
+                            # 确定平台信息（用于标题栏）
+                            sub_platform = sub.get('platform', '')
+                            # 如果没有 platform 字段，尝试从 url 判断
+                            if not sub_platform:
+                                if "bilibili" in sub.get('url', '').lower():
+                                    sub_platform = "bilibili"
+                                else:
+                                    sub_platform = "youtube"
+                            
+                            if sub_platform == "bilibili":
+                                p_badge = "🟦 Bilibili"
+                                p_color = "blue"
+                            else:
+                                p_badge = "🟥 YouTube"
+                                p_color = "red"
+
+                            st.markdown(f"---")
+                            # 为频道名称添加链接
+                            st.markdown(f"#### [{sub['name']}]({sub['url']}) :{p_color}[{p_badge}]")
+                            
+                            for v in videos:
+                                with st.container(border=True):
+                                    c1, c2 = st.columns([5, 1])
+
+                                    with c1:
+                                        # 格式化日期和时长
+                                        info_parts = []
+                                        # 确保每个属性只处理一次
+                                        upload_date = v.get('upload_date')
+                                        duration = v.get('duration')
+                                        
+                                        if upload_date:
+                                            d = str(upload_date)
+                                            if len(d) == 8:
+                                                d_str = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                                                info_parts.append(f"{d_str}")
+                                            else:
+                                                info_parts.append(f"{d}")
+                                        
+                                        if duration:
+                                            dur = duration
+                                            if dur >= 3600:
+                                                dur_str = f"{int(dur//3600)}小时{int((dur%3600)//60)}分"
+                                            else:
+                                                dur_str = f"{int(dur//60)}分{int(dur%60)}秒"
+                                            info_parts.append(f"⏳ {dur_str}")
+                                        
+                                        # 调整标题行： 标题
+                                        st.markdown(f"##### [{v['title']}]({v['url']})")
+                                        st.caption(" | ".join(info_parts))
+        
+                                    with c2:
+                                        st.write("") # Spacer
+                                        # 修改：点击总结不跳转，而是在当前页面展开一个可关闭的容器
+                                        summary_key = f"sub_summary_{v['id']}"
+                                        
+                                        # 使用 session state 来控制显示状态
+                                        # 我们用一个专门的 dict 来存正在查看的总结
+                                        if "viewing_summaries" not in st.session_state:
+                                            st.session_state.viewing_summaries = {}
+                                        
+                                        if st.button("✨ 总结", key=f"btn_sum_{v['id']}", use_container_width=True):
+                                            st.session_state.viewing_summaries[v['id']] = True
+                                            st.rerun()
+        
+                                # 如果当前视频处于"查看总结"状态，在卡片下方显示 expander
+                                if st.session_state.get("viewing_summaries", {}).get(v['id']):
+                                    with st.container(border=True):
+                                        # 优化关闭按钮布局
+                                        c_head_1, c_head_2 = st.columns([15, 1])
+                                        with c_head_1:
+                                            st.markdown("### 📝 AI 总结")
+                                        with c_head_2:
+                                            # 使用更简洁的关闭图标
+                                            if st.button("✕", key=f"close_{v['id']}", help="关闭总结"):
+                                                st.session_state.viewing_summaries.pop(v['id'])
+                                                st.rerun()
+                                        
+                                        # 检查是否已经有缓存的总结内容
+                                        cache_key = f"cache_sum_{v['id']}"
+                                        if cache_key in st.session_state:
+                                            # 尝试解析缓存中的 JSON 内容
+                                            summary_content = st.session_state[cache_key]
+                                            is_json_summary = False
+                                            summary_data = {}
+                                            
+                                            try:
+                                                if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
+                                                    summary_data = json.loads(summary_content)
+                                                    if "summary_markdown" in summary_data:
+                                                        is_json_summary = True
+                                            except Exception:
+                                                pass
+                                                
+                                            if is_json_summary:
+                                                # 使用 Tabs 替代分栏，解决拥挤问题
+                                                tab_sum, tab_check = st.tabs(["📝 核心总结", "🕵️ 事实核查"])
+                                                with tab_sum:
+                                                    st.markdown(summary_data.get("summary_markdown", ""))
+                                                with tab_check:
+                                                    # st.info("🕵️ **新闻事实核查**") # Tab标题已有，不再重复
+                                                    st.markdown(summary_data.get("fact_check_markdown", ""))
+                                            else:
+                                                st.markdown(summary_content)
+                                                
+                                            # 显示 Footer (如果有缓存的 metadata)
+                                            meta_key = f"cache_meta_{v['id']}"
+                                            if meta_key in st.session_state:
+                                                st.divider()
+                                                st.caption(st.session_state[meta_key])
+                                        else:
+                                            # 执行总结
+                                            status_container = st.empty()
+                                            
+                                            # 进度条容器
+                                            progress_container = st.empty()
+                                            progress_bar = progress_container.progress(0, text="⏳ 正在初始化...")
+                                            
+                                            start_time = time.time()
+                                            
+                                            # 1. 抓取字幕
+                                            progress_bar.progress(10, text="⏳ 正在准备抓取字幕/转写音频 (可能需要下载音频)...")
+                                            
+                                            # 使用 try-finally 确保进度条清理
+                                            try:
+                                                def update_progress(p, t):
+                                                    progress_bar.progress(p, text=t)
+
+                                                text, err = internal_fetch_transcript(v['url'], update_progress)
+                                                
+                                                if err:
+                                                    progress_container.empty()
+                                                    status_container.error(f"❌ 字幕获取失败: {err}")
+                                                else:
+                                                    progress_bar.progress(40, text="🚀 字幕获取成功，正在请求 AI 生成总结...")
+                                                    status_container.info("🚀 正在请求 AI 生成总结 (流式输出)...")
+                                                    
+                                                    # 提取 Whisper 设备信息 (从 transcript text 中)
+                                                    whisper_device_info = ""
+                                                    device_tag_for_copy = ""
+                                                    if text and "<!-- FW_DEVICE" in text:
+                                                        import re
+                                                        m = re.search(r"<!-- FW_DEVICE: (.*?) -->", text)
+                                                        if m:
+                                                            whisper_device_info = f" | ⚡ Whisper引擎: {m.group(1)}"
+                                                            device_tag_for_copy = f"<!-- FW_DEVICE: {m.group(1)} -->"
+                                                        text = re.sub(r"\n\n<!-- FW_DEVICE: .*? -->", "", text)
+                                                    
+                                                    # 2. 流式总结
+                                                    if not api_key:
+                                                        progress_container.empty()
+                                                        status_container.error("请在侧边栏填写 API Key")
+                                                    else:
+                                                        try:
+                                                            from core_logic import summarize_text
+                                                            
+                                                            progress_bar.progress(50, text="🚀 正在连接大模型 API...")
+                                                            
+                                                            stream = summarize_text(
+                                                                text,
+                                                                api_key,
+                                                                base_url,
+                                                                model_selected,
+                                                                proxy_input,
+                                                                stream=True
+                                                            )
+                                                            
+                                                            progress_bar.progress(60, text="🚀 开始接收 AI 响应...")
+                                                            time.sleep(0.2)
+                                                            progress_container.empty() # 开始流式输出后隐藏进度条
+                                                            
+                                                            # 如果返回的是字符串（错误信息），直接显示
+                                                            if isinstance(stream, str):
+                                                                status_container.error(stream)
+                                                            else:
+                                                                # 流式显示
+                                                                def stream_generator():
+                                                                    full_response = ""
+                                                                    # 用于缓冲，尝试检测 JSON 结构
+                                                                    buffer = "" 
+                                                                    is_json_mode = False
+                                                                    
+                                                                    for chunk in stream:
+                                                                        # 处理 OpenAI 流式响应 chunk
+                                                                        if chunk.choices and len(chunk.choices) > 0:
+                                                                            delta = chunk.choices[0].delta
+                                                                            if delta.content:
+                                                                                content = delta.content
+                                                                                full_response += content
+                                                                                buffer += content
+                                                                                
+                                                                                # 简单的流式显示逻辑：
+                                                                                # 如果是 JSON 模式，我们其实很难流式渲染两个 markdown 块
+                                                                                # 所以流式阶段我们只显示 raw text 或者尝试提取 markdown
+                                                                                # 为了体验，流式阶段我们直接输出 content，等结束后再解析 JSON
+                                                                                yield content
+                                                                    
+                                                                    # 完成后追加 Footer (模型 + 耗时)
+                                                                    end_time = time.time()
+                                                                    duration = end_time - start_time
+                                                                    
+                                                                    # 构建 Footer 信息
+                                                                    footer_str = f"本总结由 {model_selected} 模型生成{whisper_device_info} | ⏳ 总耗时: {duration:.1f}s"
+                                                                    
+                                                                    # 尝试提取 fetch/download 耗时
+                                                                    try:
+                                                                        # 检查 transcript_text 是否包含 TIMING tag
+                                                                        raw_text = st.session_state.transcript_text or ""
+                                                                        if "<!-- TIMING:" in raw_text:
+                                                                            import re
+                                                                            m_timing = re.search(r"<!-- TIMING: download=([\d\.]+), transcribe=([\d\.]+) -->", raw_text)
+                                                                            if m_timing:
+                                                                                dl_time = float(m_timing.group(1))
+                                                                                tr_time = float(m_timing.group(2))
+                                                                                footer_str += f" (📥 下载: {dl_time:.1f}s | 🎙️ 转写: {tr_time:.1f}s | 🤖 AI: {duration:.1f}s)"
+                                                                    except Exception:
+                                                                        pass
+                                                                    
+                                                                    # 缓存 Footer 信息
+                                                                    st.session_state[f"cache_meta_{v['id']}"] = footer_str
+                                                                    
+                                                                    # 完成后存入缓存 (纯 JSON 文本，不带 footer，因为 footer 是显示层加的)
+                                                                    # Wait, if we append footer to full_response, then JSON parse will fail next time.
+                                                                    # So we should save pure JSON to cache if it is JSON.
+                                                                    
+                                                                    is_valid_json = False
+                                                                    try:
+                                                                        if full_response.strip().startswith("{") and full_response.strip().endswith("}"):
+                                                                            json.loads(full_response)
+                                                                            is_valid_json = True
+                                                                    except:
+                                                                        pass
+                                                                        
+                                                                    st.session_state[cache_key] = full_response
+                                                                    
+                                                                    # 只有非 JSON 才追加 Footer 到流式输出中 (JSON 模式下 Footer 会破坏结构)
+                                                                    # 或者我们在显示层处理 Footer
+                                                                    if not is_valid_json:
+                                                                        yield f"\n\n> {footer_str}"
+                                                                    
+                                                                st.write_stream(stream_generator())
+                                                                if device_tag_for_copy:
+                                                                    st.markdown("### ⚡ Whisper 设备标签 (可复制)")
+                                                                    st.code(device_tag_for_copy, language="text")
+                                                                status_container.empty() # 清除进度提示
+                                                                
+                                                                # 强制刷新以触发缓存读取逻辑 (从而正确渲染分栏)
+                                                                st.rerun()
+                                                                
+                                                        except Exception as e:
+                                                            progress_container.empty()
+                                                            status_container.error(f"总结过程出错: {e}")
+                                            except Exception as outer_e:
+                                                 progress_container.empty()
+                                                 status_container.error(f"处理出错: {outer_e}")
+                else:
+                    if "last_update_check" in st.session_state:
+                        st.info(f"检查完成 ({st.session_state.last_update_check})，暂无新内容")
+                    else:
+                        st.info("点击上方按钮检查更新")
+
+# ==========================
+# Tab 3: 定时任务
+# ==========================
+with tab_batch:
+    _start_scheduler_once()
+    settings, tasks, logs, runs, run_items, processed_ids = _load_scheduled_state()
+    settings["timeout_seconds"] = float(settings.get("timeout_seconds") or 20.0)
+
+    # 拆分为两个子Tab：每日简报（看结果） 和 任务管理（配任务）
+    sub_tab_report, sub_tab_manage = st.tabs(["📅 每日简报", "⚙️ 任务管理"])
+
+    # ==========================
+    # Sub Tab 1: 每日简报
+    # ==========================
+    with sub_tab_report:
+        daily_items, items_by_day = _group_items_by_day(run_items)
+        if not daily_items:
+            st.info("暂无更新记录，请先在“任务管理”中添加并执行任务")
+        else:
+            dates = [d.get("date") for d in daily_items if d.get("date")]
+            today_key = _now().strftime("%Y-%m-%d")
+            default_index = dates.index(today_key) if today_key in dates else 0
+            
+            # 顶部日期筛选区域
+            filter_c1, filter_c2, filter_c3 = st.columns([2, 1, 2])
+            with filter_c1:
+                selected_date = st.selectbox("选择日期", dates, index=default_index, label_visibility="collapsed")
+            with filter_c2:
+                status_filter = st.selectbox("状态筛选", ["全部", "成功", "失败"], index=0, label_visibility="collapsed")
+            with filter_c3:
+                keyword = st.text_input("搜索标题", value="", placeholder="🔍 搜索更新内容...", label_visibility="collapsed")
+
+            # 统计指标
+            day_info = next((d for d in daily_items if d.get("date") == selected_date), None)
+            if day_info:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("总计更新", day_info.get("total_items"))
+                m2.metric("成功", day_info.get("success_items"))
+                m3.metric("失败", day_info.get("failed_items"))
+
+            st.divider()
+
+            items = items_by_day.get(selected_date, [])
+            if not items:
+                st.caption("该日期暂无更新内容")
+            else:
+                items_sorted = sorted(items, key=lambda i: i.get("created_at") or "", reverse=True)
+                for item in items_sorted:
+                    status = item.get("status") or ""
+                    if status_filter == "成功" and status != "success":
+                        continue
+                    if status_filter == "失败" and status == "success":
+                        continue
+                    title = item.get("title") or "未命名内容"
+                    if keyword and keyword.strip().lower() not in title.lower():
+                        continue
+                    
+                    # 卡片式展示
+                    with st.container(border=True):
+                        # 头部信息：标题 + 状态
+                        head_c1, head_c2 = st.columns([4, 1])
+                        with head_c1:
+                            st.markdown(f"**{title}**")
+                            caption_parts = []
+                            if item.get("channel_name"):
+                                caption_parts.append(f"📺 {item.get('channel_name')}")
+                            if item.get("created_at"):
+                                time_str = _parse_iso(item.get("created_at")).strftime("%H:%M")
+                                caption_parts.append(f"🕒 {time_str}")
+                            st.caption(" | ".join(caption_parts))
+                        with head_c2:
+                            if status == "success":
+                                st.success("成功", icon="✅")
+                            else:
+                                st.error("失败", icon="❌")
+                        
+                        # 链接与耗时
+                        if item.get("url"):
+                            st.caption(f"🔗 [视频链接]({item.get('url')})")
+                        
+                        # 内容展示
+                        if status == "success":
+                            with st.expander("查看 AI 总结", expanded=False):
+                                # 尝试解析 JSON 总结并分栏显示
+                                summary_content = item.get("summary") or ""
+                                is_json_summary = False
+                                summary_data = {}
+                                
+                                try:
+                                    if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
+                                        summary_data = json.loads(summary_content)
+                                        if "summary_markdown" in summary_data:
+                                            is_json_summary = True
+                                except Exception:
+                                    pass
+                                    
+                                if is_json_summary:
+                                    col_sum, col_check = st.columns([1.2, 1])
+                                    with col_sum:
+                                        st.markdown(summary_data.get("summary_markdown", ""))
+                                    with col_check:
+                                        st.info("🕵️ **新闻事实核查**")
+                                        st.markdown(summary_data.get("fact_check_markdown", ""))
+                                else:
+                                    st.markdown(summary_content)
+                        else:
+                            err_text = item.get("error") or "未知错误"
+                            st.error(f"失败原因: {err_text}")
+
+    # ==========================
+    # Sub Tab 2: 任务管理
+    # ==========================
+    with sub_tab_manage:
+        # 1. 快捷操作
+        col_quick, col_create = st.columns([1, 2])
+        with col_quick:
+             st.markdown("##### 🚀 快捷操作")
+             if tasks:
+                 if st.button("立即执行全部", type="primary", use_container_width=True):
+                     with st.spinner("正在执行全部任务..."):
+                         for t in tasks:
+                             if not t.get("enabled"):
+                                 continue
+                             settings = _run_task_once(t, settings)
+                         runs = settings.get("scheduled_runs") or runs
+                         run_items = settings.get("scheduled_run_items") or run_items
+                         processed_ids = settings.get("scheduled_processed_ids") or processed_ids
+                         _save_scheduled_state(settings, tasks, settings.get("schedule_logs") or [], runs, run_items, processed_ids)
+                     st.toast("已执行全部启用任务", icon="✅")
+                     st.rerun()
+             else:
+                 st.caption("暂无可执行任务")
+
+        with col_create:
+             st.markdown("##### ➕ 新建任务")
+             with st.popover("添加新任务", use_container_width=True):
+                 if not st.session_state.subscriptions:
+                     st.warning("请先在“频道订阅”中添加频道")
+                 else:
+                     # 频道选择
+                    subs = st.session_state.subscriptions
+                    
+                    def _get_platform_icon(url):
+                        if not url: return "❓"
+                        if "youtube" in url or "youtu.be" in url: return "YouTube"
+                        if "bilibili" in url: return "Bilibili"
+                        return "❓"
+
+                    label_map = {}
+                    for s in subs:
+                        plat = s.get("platform")
+                        if not plat or plat == "?":
+                            plat = _get_platform_icon(s.get("url"))
+                        label = f"{s.get('name')} ({plat})"
+                        label_map[label] = s
+                    
+                    # 简化搜索
+                    keyword = st.text_input("搜索频道", placeholder="输入关键词...", label_visibility="collapsed")
+                    filtered_labels = [l for l in label_map.keys() if keyword.lower() in l.lower()] if keyword else list(label_map.keys())
+                    
+                    if st.button("全选", use_container_width=True):
+                         st.session_state.selected_channel_labels = filtered_labels
+                         st.rerun()
+
+                    if "selected_channel_labels" not in st.session_state:
+                        st.session_state.selected_channel_labels = []
+                    
+                    selected_labels = st.multiselect("选择频道", filtered_labels, default=st.session_state.selected_channel_labels)
+                    st.session_state.selected_channel_labels = selected_labels
+
+                    st.divider()
+                    
+                    # 简化时间设置：只展示最常用的
+                    st.caption("⏰ 时间设置")
+                    simple_mode = st.toggle("简单模式", value=True)
+                    
+                    interval_hours = 0
+                    cron_value = ""
+                    weekdays_value = []
+                    schedule_time = None
+
+                    if simple_mode:
+                        schedule_type = "每天"
+                        schedule_time = st.time_input("每天几点运行", value=dt_time(9, 0))
+                    else:
+                        schedule_type = st.selectbox("周期类型", ["每天", "每周", "间隔小时", "Cron"])
+                        if schedule_type == "每天":
+                            schedule_time = st.time_input("时间点", value=dt_time(9, 0))
+                        elif schedule_type == "每周":
+                            schedule_time = st.time_input("时间点", value=dt_time(9, 0))
+                            selected_days = st.multiselect("星期", ["一","二","三","四","五","六","日"], default=["一","二","三","四","五"])
+                            weekdays_value = [["一","二","三","四","五","六","日"].index(d) for d in selected_days]
+                        elif schedule_type == "间隔小时":
+                            interval_hours = st.number_input("每隔几小时", 1, 168, 6)
+                        else:
+                            cron_value = st.text_input("Cron表达式", "0 9 * * *")
+
+                    if st.button("创建任务", type="primary", use_container_width=True):
+                        if not selected_labels:
+                            st.error("请选择频道")
+                        else:
+                            added_count = 0
+                            for label in selected_labels:
+                                sub = label_map[label]
+                                new_task = _normalize_task({
+                                    "channel_id": sub.get("id"),
+                                    "channel_name": sub.get("name"),
+                                    "channel_url": sub.get("url"),
+                                    "platform": sub.get("platform"),
+                                    "schedule_type": "daily" if schedule_type == "每天" else "weekly" if schedule_type == "每周" else "interval" if schedule_type == "间隔小时" else "cron",
+                                    "time": schedule_time.strftime("%H:%M") if schedule_time else "09:00",
+                                    "weekdays": weekdays_value,
+                                    "interval_hours": interval_hours,
+                                    "cron": cron_value,
+                                    "enabled": True,
+                                    "max_items": 5, # 默认值
+                                    "min_duration_seconds": 0,
+                                    "only_streams": False,
+                                })
+                                if _task_conflict(tasks, new_task): continue
+                                next_run = _compute_next_run(new_task, _now())
+                                new_task["next_run_at"] = _iso(next_run) if next_run else ""
+                                tasks.append(new_task)
+                                added_count += 1
+                            _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
+                            if added_count > 0:
+                                st.success(f"已创建 {added_count} 个任务")
+                                st.rerun()
+                            else:
+                                st.warning("未创建任务（可能已存在）")
+
+        st.divider()
+
+        # 2. 任务列表
+        st.markdown("##### 📝 任务列表")
+        if not tasks:
+            st.info("暂无任务")
+        else:
+            # 更新逻辑
+            updated = False
+            for t in tasks:
+                if t.get("enabled") and not t.get("next_run_at"):
+                    computed = _compute_next_run(t, _now())
+                    t["next_run_at"] = _iso(computed) if computed else ""
+                    updated = True
+            if updated:
+                _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
+
+            for t in tasks:
+                next_run = _parse_iso(t.get("next_run_at"))
+                is_enabled = t.get("enabled")
+                
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 2, 2])
+                    with c1:
+                        st.markdown(f"**{t.get('channel_name')}**")
+                        st.caption(f"{_format_schedule_label(t)}")
+                    with c2:
+                        st.caption(f"下次: {next_run.strftime('%m-%d %H:%M') if next_run else '-'}")
+                        if t.get("last_error"):
+                            st.caption(f":red[{t.get('last_error')[:10]}...]")
+                    with c3:
+                        col_btn1, col_btn2 = st.columns(2)
+                        with col_btn1:
+                             if st.button("停用" if is_enabled else "启用", key=f"tg_{t['id']}"):
+                                 t["enabled"] = not t["enabled"]
+                                 _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
+                                 st.rerun()
+                        with col_btn2:
+                             if st.button("🗑️", key=f"del_{t['id']}", help="删除任务"):
+                                 tasks = [x for x in tasks if x["id"] != t["id"]]
+                                 _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
+                                 st.rerun()
+
+# ==========================
+# Tab 4: 历史记录
+# ==========================
+with tab_history:
+    st.markdown("### 📜 全局生成记录")
+    st.caption("记录所有单次和定时任务生成的总结内容")
+    
+    history = load_history() or []
+    filter_col1, filter_col2 = st.columns([3, 1])
+    with filter_col1:
+        hist_kw = st.text_input("搜索历史记录 (标题/URL/内容)", key="hist_kw")
+    with filter_col2:
+        search_body = st.checkbox("全文搜索", value=True)
+        if st.button("清空历史", use_container_width=True):
+            save_history([])
+            st.rerun()
+    
+    if not history:
+        st.info("暂无历史记录")
+    else:
+        
+        for entry in history:
+            if hist_kw:
+                kw = hist_kw.lower().strip()
+                title_hit = kw in (entry.get("title") or "").lower()
+                url_hit = kw in (entry.get("video_url") or "").lower()
+                body_hit = False
+                if search_body and not (title_hit or url_hit):
+                    raw = entry.get("summary_text") or ""
+                    body_text = ""
+                    try:
+                        if raw.strip().startswith("{") and raw.strip().endswith("}"):
+                            data = json.loads(raw)
+                            body_text = (data.get("summary_markdown") or "") + "\n" + (data.get("fact_check_markdown") or "")
+                        else:
+                            body_text = raw
+                    except Exception:
+                        body_text = raw
+                    body_hit = kw in body_text.lower()
+                if not (title_hit or url_hit or body_hit):
+                    continue
+            
+            with st.expander(f"{entry.get('timestamp')[:16].replace('T', ' ')} | {entry.get('title')}", expanded=False):
+                st.caption(f"来源: {'⏰ 定时任务' if entry.get('source_type') == 'schedule' else '🎬 单次任务'} | URL: {entry.get('video_url')}")
+                
+                summary_content = entry.get("summary_text") or ""
+                is_json_summary = False
+                summary_data = {}
+                
+                try:
+                    if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
+                        summary_data = json.loads(summary_content)
+                        if "summary_markdown" in summary_data:
+                            is_json_summary = True
+                except Exception:
+                    pass
+                    
+                if is_json_summary:
+                    h_col1, h_col2 = st.columns([1.2, 1])
+                    with h_col1:
+                        st.markdown(summary_data.get("summary_markdown", ""))
+                    with h_col2:
+                        st.info("🕵️ **新闻事实核查**")
+                        st.markdown(summary_data.get("fact_check_markdown", ""))
+                else:
+                    st.markdown(summary_content)
+
+# ==========================
+# Tab 5: 留言板
+# ==========================
+with tab_guestbook:
+    st.markdown("### 💬 留言互动")
+    st.caption("在这里记录你的想法、备忘或反馈")
+    
+    # 留言输入
+    with st.form("guestbook_form", clear_on_submit=True):
+        user_name = st.text_input("昵称", value="User", max_chars=20)
+        message = st.text_area("留言内容", height=100)
+        submitted = st.form_submit_button("发布留言")
+        
+        if submitted and message.strip():
+            guestbook = load_guestbook()
+            new_msg = {
+                "id": str(uuid.uuid4()),
+                "timestamp": _iso(_now()),
+                "user": user_name.strip() or "Anonymous",
+                "content": message.strip()
+            }
+            guestbook.insert(0, new_msg)
+            save_guestbook(guestbook)
+            st.success("留言已发布")
+            st.rerun()
+            
+    st.divider()
+    
+    # 留言列表
+    guestbook = load_guestbook()
+    if not guestbook:
+        st.info("暂无留言，快来抢沙发吧！")
+    else:
+        for msg in guestbook:
+            with st.chat_message("user" if msg.get("user") == "User" else "assistant", avatar="👤"):
+                st.markdown(f"**{msg.get('user')}** <span style='color:gray; font-size:0.8em'> {msg.get('timestamp')[:16].replace('T', ' ')}</span>", unsafe_allow_html=True)
+                st.markdown(msg.get("content"))
+
+
+        # 3. 折叠的日志
+        with st.expander("📜 运行日志 & 历史", expanded=False):
+             tab_log, tab_hist = st.tabs(["日志", "历史"])
+             with tab_log:
+                 if logs:
+                     st.dataframe(logs[-50:], use_container_width=True, hide_index=True)
+                 else:
+                     st.caption("无日志")
+             with tab_hist:
+                 # 简单的历史展示
+                 daily_runs, _ = _group_runs_by_day(runs, run_items)
+                 if not daily_runs:
+                     st.caption("无历史")
+                 else:
+                     for day in daily_runs[:5]:
+                         st.markdown(f"**{day.get('date')}**: 新增 {day.get('new_items')} | 成功 {day.get('success_items')}")

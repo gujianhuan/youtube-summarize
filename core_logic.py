@@ -1,0 +1,3633 @@
+import time
+import threading
+import queue
+import wave
+import re
+import os
+import json
+import sys
+import glob
+import tempfile
+import shutil
+import random
+import hashlib
+import requests
+import platform
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse, quote
+
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+
+# 自动配置 ffmpeg 环境 (从 imageio-ffmpeg 获取)
+ffmpeg_binary_path = None
+try:
+    import imageio_ffmpeg
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    if ffmpeg_path:
+        ffmpeg_dir = os.path.dirname(ffmpeg_path)
+        # imageio-ffmpeg 的可执行文件可能带版本号（如 ffmpeg-win-x86_64-v7.1.exe）
+        # whisper/yt-dlp 默认调用 'ffmpeg'，所以必须确保目录下有 ffmpeg.exe
+        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+        if not os.path.exists(target_ffmpeg):
+            try:
+                print(f"Copying ffmpeg to {target_ffmpeg}...")
+                shutil.copy2(ffmpeg_path, target_ffmpeg)
+            except Exception as e:
+                print(f"Failed to copy ffmpeg: {e}")
+        
+        if os.path.exists(target_ffmpeg):
+            ffmpeg_binary_path = ffmpeg_dir # yt-dlp needs the directory or executable? 
+            # yt-dlp "ffmpeg_location" accepts path to binary or directory.
+            # Let's use the directory if it contains ffmpeg.exe
+            ffmpeg_binary_path = ffmpeg_dir
+
+        if ffmpeg_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+            print(f"Added ffmpeg to PATH: {ffmpeg_dir}")
+except ImportError:
+    print("imageio-ffmpeg not found. Assuming ffmpeg is in PATH.")
+except Exception as e:
+    print(f"Failed to auto-configure ffmpeg: {e}")
+
+from requests.adapters import HTTPAdapter
+from urllib3 import Retry
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    AgeRestricted,
+    InvalidVideoId,
+    IpBlocked,
+    NoTranscriptFound,
+    PoTokenRequired,
+    RequestBlocked,
+    TranscriptsDisabled,
+    VideoUnavailable,
+    VideoUnplayable,
+)
+
+# 自动配置 ffmpeg 和 nodejs 环境
+try:
+    import imageio_ffmpeg
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    if ffmpeg_path:
+        ffmpeg_dir = os.path.dirname(ffmpeg_path)
+        # imageio-ffmpeg 的可执行文件可能带版本号（如 ffmpeg-win-x86_64-v7.1.exe）
+        # whisper 默认调用 'ffmpeg'，所以必须确保目录下有 ffmpeg.exe
+        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+        if not os.path.exists(target_ffmpeg):
+            print(f"正在创建 ffmpeg.exe 副本: {target_ffmpeg}")
+            shutil.copy2(ffmpeg_path, target_ffmpeg)
+        
+        if ffmpeg_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+            print(f"已自动添加 ffmpeg 到 PATH: {ffmpeg_dir}")
+
+    # 自动检测并添加 node.exe 到 PATH (用于 yt-dlp web 客户端解密)
+    possible_node_paths = [
+        r"d:\Program Files",
+        r"D:\Program Files",
+        r"C:\Program Files\nodejs",
+        r"C:\Program Files (x86)\nodejs",
+    ]
+    for p in possible_node_paths:
+        node_exe = os.path.join(p, "node.exe")
+        if os.path.exists(node_exe):
+            if p not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
+                print(f"已自动添加 nodejs 到 PATH: {p}")
+            break
+
+except ImportError:
+    print("未安装 imageio-ffmpeg，无法自动配置 ffmpeg 环境。")
+except Exception as e:
+    print(f"自动配置环境失败: {e}")
+
+
+class TimeoutSession(requests.Session):
+    def __init__(self, timeout_seconds: float):
+        super().__init__()
+        self.verify = False  # 全局禁用 SSL 验证，解决代理证书问题
+        self._timeout_seconds = timeout_seconds
+        self._exception_retries = 2
+        self._deadline_s: float | None = None
+        self.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Encoding": "identity",
+            }
+        )
+
+    def request(self, method, url, **kwargs):
+        if self._deadline_s is not None and time.monotonic() > self._deadline_s:
+            raise requests.exceptions.Timeout("已超过整体超时时间")
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = (min(10.0, self._timeout_seconds), self._timeout_seconds)
+        last_exc: Exception | None = None
+        retries = max(0, int(getattr(self, "_exception_retries", 0)))
+        for attempt in range(retries + 1):
+            try:
+                return super().request(method, url, **kwargs)
+            except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+                last_exc = e
+                if attempt >= retries:
+                    break
+                time.sleep(0.6 * (2**attempt))
+        assert last_exc is not None
+        raise last_exc
+
+
+def _strip_trailing_punct(text: str) -> str:
+    return re.sub(r"[!！。,.，?？;；:：\)\]）】]+$", "", text or "")
+
+
+def extract_video_id(url_or_id: str) -> str:
+    candidate = _strip_trailing_punct(url_or_id.strip())
+    
+    # Bilibili BV ID (BV1xxxxxxxxx) - 12 chars usually, starts with BV
+    if re.fullmatch(r"BV[a-zA-Z0-9]{10}", candidate):
+        return candidate
+        
+    # Bilibili URL
+    if "bilibili.com" in candidate:
+        # Match BV id in url
+        m = re.search(r"(BV[a-zA-Z0-9]{10})", candidate)
+        if m:
+            return m.group(1)
+            
+    # YouTube ID (11 chars)
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+        return candidate
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", candidate) and (
+        candidate.startswith("www.") or "youtube.com" in candidate or "youtu.be" in candidate
+    ):
+        candidate = "https://" + candidate
+
+    parsed = urlparse(candidate)
+    host = (parsed.netloc or "").lower()
+
+    if "youtu.be" in host:
+        video_id = _strip_trailing_punct(parsed.path.strip("/").split("/")[0])
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            return video_id
+
+    if "youtube.com" in host:
+        qs = parse_qs(parsed.query)
+        if "v" in qs and qs["v"]:
+            video_id = _strip_trailing_punct(qs["v"][0])
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                return video_id
+
+        m = re.search(r"/(shorts|embed)/([A-Za-z0-9_-]{11})", parsed.path)
+        if m:
+            return m.group(2)
+
+    raise ValueError("无法从输入解析出视频 ID（支持 YouTube 11位 ID / Bilibili BV号）")
+
+
+def normalize_video_url(url_or_id: str) -> str:
+    s = _strip_trailing_punct(url_or_id.strip())
+    
+    # Bilibili
+    if re.fullmatch(r"BV[a-zA-Z0-9]{10}", s) or "bilibili.com" in s:
+        if not s.startswith("http"):
+             if re.fullmatch(r"BV[a-zA-Z0-9]{10}", s):
+                 return f"https://www.bilibili.com/video/{s}"
+             return "https://" + s if s.startswith("www") else s
+        return s
+
+    # YouTube
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return f"https://www.youtube.com/watch?v={s}"
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s) and (
+        s.startswith("www.") or "youtube.com" in s or "youtu.be" in s
+    ):
+        s = "https://" + s
+    return s
+
+
+class CookieManager:
+    """集中管理 Cookie 的获取、验证与错误处理"""
+    
+    @staticmethod
+    def is_cookie_error(msg: str | Exception) -> bool:
+        """统一识别 yt-dlp 报告的 Cookie 相关错误"""
+        s = strip_ansi(str(msg or "")).lower()
+        # 使用正则进行更鲁棒的匹配
+        patterns = [
+            r"could not copy.*cookie", # 数据库被锁定
+            r"cookie database",
+            r"database is locked",
+            r"permission denied.*cookie",
+            r"access is denied",
+            r"used by another process",
+            r"winerror 32", # 文件占用
+            r"winerror 5",  # 拒绝访问
+            r"sqlite3.*locked",
+            r"dpapi.*decrypt",
+            r"dpapi.*failed",
+            r"unable to extract.*cookie",
+        ]
+        return any(re.search(p, s) for p in patterns)
+
+    @staticmethod
+    def get_fatal_msg(err_msg: str, browser: str) -> str:
+        """生成统一且带有具体指引的致命 Cookie 错误信息"""
+        browser_name = browser or "浏览器"
+        details_raw = strip_ansi(err_msg).replace("ERROR: ", "").strip()
+        detail_lines = [x.strip() for x in re.split(r"[\r\n]+", details_raw) if x and x.strip()]
+        detail_seen: set[str] = set()
+        detail_dedup: list[str] = []
+        for x in detail_lines:
+            k = x.lower()
+            if k in detail_seen:
+                continue
+            detail_seen.add(k)
+            detail_dedup.append(x)
+        details = " | ".join(detail_dedup) if detail_dedup else details_raw
+        d_lower = details.lower()
+        
+        # 1. 针对新版 Chromium 的解密限制 (DPAPI)
+        if "dpapi" in d_lower:
+            return (
+                f"❌ 浏览器 Cookie 解密失败 (DPAPI Error)。\n"
+                f"原因：{browser_name} (新版基于 Chromium 127+) 引入了增强加密，外部程序已无法直接解密 Cookie。\n\n"
+                f"💡 解决方法：\n"
+                f"1. **使用 Firefox**：Firefox 暂不受此限制影响，请在 Firefox 中登录 YouTube 后，在设置中将浏览器改为 firefox (或 auto)。\n"
+                f"2. **手动导出 Cookie**：安装浏览器插件（如 'Get cookies.txt LOCALLY'）导出 cookies.txt，并在设置中提供文件路径。\n\n"
+                f"原始细节: {details}"
+            )
+            
+        # 2. 针对数据库锁定/无法复制 (常见于浏览器未彻底关闭)
+        if any(x in d_lower for x in ["locked", "another process", "could not copy", "32"]):
+             return (
+                f"❌ 浏览器 Cookie 数据库被锁定或无法访问。\n"
+                f"原因：{browser_name} 正在运行或其数据库文件被占用。\n\n"
+                f"💡 解决方法：\n"
+                f"1. **彻底关闭浏览器**：请确保所有 {browser_name} 窗口已关闭（包括后台进程），然后重试。\n"
+                f"2. **使用 Firefox 或导出 Cookie**：参考上述方案。\n\n"
+                f"原始细节: {details}"
+            )
+        
+        return f"❌ 无法从 {browser_name} 获取 Cookie。\n细节: {details}"
+
+    @staticmethod
+    def get_sources(cookies_file: str, cookies_from_browser: str, force_browser_cookie: bool = False) -> list[tuple[str, str]]:
+        """返回 (cookiefile, browser) 元组列表，支持智能回退"""
+        file_path = (cookies_file or "").strip()
+        browser_name = (cookies_from_browser or "").strip().lower()
+        
+        if file_path and os.path.exists(file_path):
+            return [(file_path, ""), ("", "")]
+            
+        sources: list[tuple[str, str]] = []
+        
+        # 确定浏览器候选列表
+        candidates = []
+        if browser_name and browser_name != "auto":
+            candidates = [browser_name]
+            # 后备方案：如果显式指定了容易受限的 Chromium，则将 firefox 作为最后保单
+            if browser_name in ["chrome", "edge", "brave", "chromium"] and "firefox" not in candidates:
+                candidates.append("firefox")
+        else:
+            # 自动模式或默认：Firefox 优先级最高（最稳），其次是主流 Chromium
+            candidates = ["firefox", "edge", "chrome", "brave", "chromium"]
+
+        for b in candidates:
+            if CookieManager.is_browser_available(b):
+                sources.append(("", b))
+        
+        if not sources and force_browser_cookie:
+            sources.append(("", "chrome"))
+        if ("", "") not in sources:
+            sources.append(("", ""))
+            
+        return sources
+
+    @staticmethod
+    def is_browser_available(browser: str) -> bool:
+        """检测系统中是否安装了指定浏览器并存在 Cookie 数据库"""
+        b = (browser or "").strip().lower()
+        if not b: return False
+        if os.name != "nt": return True # 非 Windows 暂不严格检查路径
+        
+        local = os.environ.get("LOCALAPPDATA", "")
+        roaming = os.environ.get("APPDATA", "")
+        
+        def has_chromium_cookie(base_dir: str) -> bool:
+            if not base_dir or not os.path.isdir(base_dir): return False
+            try:
+                # 检查 Default 或 Profile x 目录
+                entries = os.listdir(base_dir)
+                profile_dirs = [d for d in entries if d == "Default" or d.startswith("Profile")]
+                if not profile_dirs: profile_dirs = ["Default"]
+                for d in profile_dirs:
+                    if os.path.exists(os.path.join(base_dir, d, "Cookies")): return True
+                    if os.path.exists(os.path.join(base_dir, d, "Network", "Cookies")): return True
+            except: pass
+            return False
+
+        if b == "chrome":
+            return has_chromium_cookie(os.path.join(local, "Google/Chrome/User Data"))
+        if b == "edge":
+            return has_chromium_cookie(os.path.join(local, "Microsoft/Edge/User Data"))
+        if b == "brave":
+            return has_chromium_cookie(os.path.join(local, "BraveSoftware/Brave-Browser/User Data"))
+        if b == "chromium":
+            return has_chromium_cookie(os.path.join(local, "Chromium/User Data"))
+        if b == "firefox":
+            # 检查 Roaming 下的 Profiles
+            base = os.path.join(roaming, "Mozilla/Firefox/Profiles")
+            if os.path.isdir(base):
+                try:
+                    for name in os.listdir(base):
+                        if os.path.exists(os.path.join(base, name, "cookies.sqlite")): return True
+                except: pass
+            return False
+        return False
+
+
+
+
+def expand_languages(languages: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(x: str) -> None:
+        x = x.strip()
+        if not x or x in seen:
+            return
+        seen.add(x)
+        out.append(x)
+
+    for lang in languages:
+        add(lang)
+        if lang == "zh-Hans":
+            add("zh-Hant")
+            add("zh")
+            add("zh-CN")
+            add("zh-TW")
+        elif lang == "zh-Hant":
+            add("zh-Hans")
+            add("zh")
+            add("zh-TW")
+            add("zh-CN")
+        elif lang == "zh":
+            add("zh-Hans")
+            add("zh-Hant")
+            add("zh-CN")
+            add("zh-TW")
+        elif lang.lower() == "en":
+            add("en-US")
+            add("en-GB")
+
+    return out
+
+
+def detect_windows_proxy() -> tuple[str, str]:
+    # 1. 尝试从注册表读取
+    try:
+        import winreg  # type: ignore
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            proxy_enable = int(winreg.QueryValueEx(key, "ProxyEnable")[0] or 0)
+            proxy_server = str(winreg.QueryValueEx(key, "ProxyServer")[0] or "")
+            auto_config_url = str(winreg.QueryValueEx(key, "AutoConfigURL")[0] or "")
+        
+        if auto_config_url:
+            return "", f"检测到 PAC: {auto_config_url}"
+
+        if proxy_enable == 1 and proxy_server:
+            server = proxy_server.strip()
+            if ";" in server or "=" in server:
+                parts = [p.strip() for p in server.split(";") if p.strip()]
+                mapping: dict[str, str] = {}
+                for p in parts:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        mapping[k.strip().lower()] = v.strip()
+                    else:
+                        mapping["http"] = p
+                        mapping["https"] = p
+                candidate = mapping.get("https") or mapping.get("http") or ""
+                if candidate:
+                    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", candidate):
+                        candidate = "http://" + candidate
+                    return candidate, ""
+            else:
+                if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", server):
+                    server = "http://" + server
+                return server, ""
+    except Exception:
+        pass
+
+    # 2. 尝试常见代理端口兜底检测
+    common_ports = [7890, 7897, 10809, 1080, 8080]
+    for port in common_ports:
+        candidate = f"http://127.0.0.1:{port}"
+        try:
+            # 快速检测端口是否开放
+            import socket
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return candidate, f"自动扫描到本地代理: {candidate}"
+        except Exception:
+            continue
+
+    return "", ""
+
+
+def strip_ansi(s: str) -> str:
+    return re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", s)
+
+def has_js_challenge_failure(lines: list[str]) -> bool:
+    tail = "\n".join(lines[-120:]).lower()
+    return (
+        "challenge solving failed" in tail
+        or "error solving n challenge" in tail
+        or "only images are available" in tail
+    )
+
+def has_po_token_required(lines: list[str]) -> bool:
+    tail = "\n".join(lines[-160:]).lower()
+    return (
+        ("po token" in tail and "required" in tail)
+        or ("po token" in tail and "not provided" in tail)
+        or ("po token" in tail and "skipped" in tail)
+        or ("gvs po token" in tail)
+    )
+
+def has_login_required(lines: list[str], msg: str = "") -> bool:
+    tail = "\n".join(lines[-160:]).lower()
+    m = (msg or "").lower()
+    return (
+        "login_required" in tail
+        or "sign in to confirm you’re not a bot" in tail
+        or "sign in to confirm you're not a bot" in tail
+        or "use --cookies-from-browser" in tail
+        or "use --cookies" in tail
+        or "login_required" in m
+        or "sign in to confirm you’re not a bot" in m
+        or "sign in to confirm you're not a bot" in m
+        or "use --cookies-from-browser" in m
+        or "use --cookies" in m
+    )
+
+def is_html_like_text(text: str | None) -> bool:
+    if not text:
+        return False
+    sample = text.strip().lower()
+    if sample.startswith("<!doctype") or sample.startswith("<html"):
+        return True
+    if "<html" in sample[:2000]:
+        return True
+    head_idx = sample.find("<head")
+    body_idx = sample.find("<body")
+    if head_idx != -1 and body_idx != -1 and abs(head_idx - body_idx) < 5000:
+        return True
+    return False
+
+def _audio_cache_root() -> Path | None:
+    try:
+        root = Path(__file__).resolve().parent / ".cache" / "audio"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except Exception:
+        return None
+
+def _audio_cache_key(video_url: str) -> str:
+    try:
+        vid = extract_video_id(video_url)
+        if vid:
+            return vid
+    except Exception:
+        pass
+    h = hashlib.sha1(video_url.encode("utf-8", errors="ignore")).hexdigest()
+    return h
+
+def _audio_cache_path(video_url: str) -> Path | None:
+    root = _audio_cache_root()
+    if not root:
+        return None
+    key = _audio_cache_key(video_url)
+    return root / f"{key}.wav"
+
+
+def get_effective_proxy(proxy_url: str, use_system_proxy: bool) -> tuple[str, str]:
+    proxy_url = (proxy_url or "").strip()
+    if proxy_url:
+        return proxy_url, ""
+    if use_system_proxy:
+        return detect_windows_proxy()
+    return "", ""
+
+
+def is_fatal_network_error(msg: str) -> bool:
+    """
+    检测是否为不可恢复的全局网络错误（代理失效、连接拒绝、DNS 解析失败等）。
+    出现此类错误时，继续轮换客户端/Cookie 策略毫无意义，应立即中断所有重试。
+    """
+    s = str(msg or "").lower()
+    return any([
+        "proxyerror" in s,
+        "proxy error" in s,
+        "cannot connect to proxy" in s,
+        "tunnel connection failed" in s,
+        "failed to establish a new connection" in s,
+        "name or service not known" in s,
+        "getaddrinfo failed" in s,
+        "nodename nor servname provided" in s,
+        "connection refused" in s,
+        "connection reset by peer" in s,
+        "network is unreachable" in s,
+        "no route to host" in s,
+        # 整体超时（不同于单次请求超时）
+        "已超过整体超时时间" in s,
+        "timed out" in s and ("connect" in s or "proxy" in s),
+    ])
+
+
+
+def build_api(proxy_url: str, timeout_seconds: float, use_system_proxy: bool, retries: int) -> YouTubeTranscriptApi:
+    session = TimeoutSession(timeout_seconds=max(1.0, float(timeout_seconds)))
+    session.trust_env = True
+    effective_proxy, pac_note = get_effective_proxy(proxy_url, use_system_proxy)
+    if effective_proxy:
+        session.trust_env = False
+        session.proxies = {"http": effective_proxy, "https": effective_proxy}
+    session._deadline_s = time.monotonic() + max(2.0, float(timeout_seconds))  # type: ignore[attr-defined]
+    retry_cfg = Retry(total=max(0, int(retries)), backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_cfg)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session._exception_retries = max(1, int(retries))
+    api = YouTubeTranscriptApi(http_client=session)
+    api._pac_note = pac_note  # type: ignore[attr-defined]
+    api._effective_proxy = effective_proxy  # type: ignore[attr-defined]
+    api._timeout_seconds = float(timeout_seconds)  # type: ignore[attr-defined]
+    api._retries = int(retries)  # type: ignore[attr-defined]
+    return api
+
+
+def vtt_to_text(vtt: str) -> str:
+    lines: list[str] = []
+    for raw in vtt.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("WEBVTT"):
+            continue
+        if "-->" in s:
+            continue
+        if s.isdigit():
+            continue
+        if s.startswith("NOTE"):
+            continue
+        lines.append(s)
+
+    out: list[str] = []
+    prev = None
+    for s in lines:
+        if s == prev:
+            continue
+        out.append(s)
+        prev = s
+    return "\n".join(out)
+
+
+def fetch_subtitles_with_ytdlp(
+    video_url: str,
+    preferred_langs: list[str],
+    proxy_url: str,
+    timeout_seconds: float,
+    retries: int,
+    cookies_file: str,
+    cookies_from_browser: str,
+) -> tuple[str, str]:
+    try:
+        from yt_dlp import YoutubeDL  # type: ignore
+        from yt_dlp.utils import DownloadError  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "未安装 yt-dlp，无法启用兜底抓取。可执行：python -m pip install yt-dlp -i https://pypi.tuna.tsinghua.edu.cn/simple"
+        ) from e
+
+    def detect_js_runtime() -> tuple[str, str | None]:
+        try:
+            import shutil
+            deno = shutil.which("deno")
+            node = shutil.which("node")
+            bun = shutil.which("bun")
+            qjs = shutil.which("qjs")
+            if deno:
+                return "deno", deno
+            if node:
+                return "node", node
+            if bun:
+                return "bun", bun
+            if qjs:
+                return "quickjs", qjs
+            return "", None
+        except Exception:
+            return "", None
+
+    runtime_name, runtime_path = detect_js_runtime()
+    has_js_runtime = bool(runtime_name)
+    allow_web_client = has_js_runtime and runtime_name in {"deno", "bun", "node"}
+    langs = preferred_langs[:] if preferred_langs else []
+    with tempfile.TemporaryDirectory() as tmp:
+        outtmpl = os.path.join(tmp, "%(id)s.%(ext)s")
+        last_err: Exception | None = None
+        last_cookie_error: RuntimeError | None = None
+        disabled_browsers: set[str] = set()
+        last_video_id = ""
+        disabled_web = False
+        force_browser_cookie = False
+
+        import random
+
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        ]
+
+        class YdlLogger:
+            def __init__(self) -> None:
+                self.lines: list[str] = []
+
+            def _add(self, level: str, msg: str) -> None:
+                s = strip_ansi(str(msg or "")).strip()
+                if not s:
+                    return
+                self.lines.append(f"[{level}] {s}")
+                if len(self.lines) > 400:
+                    self.lines = self.lines[-250:]
+
+            def debug(self, msg: str) -> None:
+                self._add("debug", msg)
+
+            def info(self, msg: str) -> None:
+                self._add("info", msg)
+
+            def warning(self, msg: str) -> None:
+                self._add("warning", msg)
+
+            def error(self, msg: str) -> None:
+                self._add("error", msg)
+
+        def extract_info_with_format_rotation(ydl_opts: dict) -> dict:
+            format_candidates = [None, "bestaudio/best", "worstaudio/worst"]
+            last_format_err: Exception | None = None
+            for fmt in format_candidates:
+                if fmt:
+                    ydl_opts["format"] = fmt
+                else:
+                    ydl_opts.pop("format", None)
+                try:
+                    with YoutubeDL(ydl_opts) as ydl:
+                        return ydl.extract_info(video_url, download=False)
+                except DownloadError as e:
+                    msg = strip_ansi(str(e))
+                    if "Requested format is not available" in msg:
+                        last_format_err = e
+                        continue
+                    raise
+            if last_format_err is not None:
+                raise last_format_err
+            return {}
+
+        # 移除此处的本地 is_cookie_error 定义，改用顶层的 _is_cookie_error
+
+        def build_download_session() -> requests.Session:
+            sess = TimeoutSession(timeout_seconds=max(1.0, float(timeout_seconds)))
+            sess.trust_env = True
+            if proxy_url:
+                sess.trust_env = False
+                sess.proxies = {"http": proxy_url, "https": proxy_url}
+            sess._deadline_s = time.monotonic() + max(2.0, float(timeout_seconds))  # type: ignore[attr-defined]
+            retry_cfg = Retry(
+                total=max(0, int(retries)),
+                backoff_factor=0.8,
+                status_forcelist=[500, 502, 503, 504],
+            )
+            adapter = HTTPAdapter(max_retries=retry_cfg)
+            sess.mount("http://", adapter)
+            sess.mount("https://", adapter)
+            sess._exception_retries = max(1, int(retries))
+            return sess
+
+        def maybe_force_vtt(url: str) -> str:
+            if "timedtext" not in url:
+                return url
+            if "fmt=" in url:
+                return url
+            return url + ("&" if "?" in url else "?") + "fmt=vtt"
+
+        def try_extract_and_download_by_url() -> tuple[str, str] | None:
+            nonlocal force_browser_cookie, last_cookie_error, disabled_browsers
+            sess = build_download_session()
+            if allow_web_client:
+                client_sets: list[list[str]] = [["android"], ["ios"], ["web_safari"], ["web"], ["tv"]]
+            else:
+                client_sets = [["android"], ["ios"], ["tv"]]
+            attempt_retries = max(1, int(retries))
+            
+            # 用于记录 "无 Cookie" 模式下的错误
+            no_cookie_error: Exception | None = None
+            
+            for client_set in client_sets:
+                if disabled_web and "web" in client_set:
+                    continue
+                for attempt in range(attempt_retries):
+                    ua = random.choice(user_agents)
+                    for cookiefile, cfb in CookieManager.get_sources(cookies_file, cookies_from_browser, force_browser_cookie):
+                        if cfb and cfb in disabled_browsers:
+                            continue
+                        info = None
+                        logger = YdlLogger()
+                        opts: dict = {
+                            "skip_download": True,
+                            "quiet": True,
+                            "no_warnings": True,
+                            "verbose": True,
+                            "nocheckcertificate": True,
+                            "socket_timeout": float(timeout_seconds),
+                            "geo_bypass": True,
+                            "ignoreerrors": False,
+                            "ignore_config": True,  # 忽略全局配置文件，避免意外读取 Cookie
+                            # "format": "bestaudio/best", # 移除强制格式，允许自动选择最佳可用格式（仅获取信息）
+                            "http_headers": {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
+                            "extractor_args": {"youtube": {"player_client": client_set}},
+                            "logger": logger,
+                        }
+                        if has_js_runtime:
+                            if runtime_path:
+                                opts["js_runtimes"] = {runtime_name: {"path": runtime_path}}
+                            else:
+                                opts["js_runtimes"] = {runtime_name: {}}
+                            if runtime_name in {"deno", "bun"}:
+                                opts["remote_components"] = {"ejs:npm"}
+                            else:
+                                opts["remote_components"] = {"ejs:github"}
+                        if proxy_url:
+                            opts["proxy"] = proxy_url
+                        if cookiefile:
+                            opts["cookiefile"] = cookiefile
+                        elif cfb:
+                            opts["cookiesfrombrowser"] = (cfb,)
+
+                        try:
+                            info = extract_info_with_format_rotation(opts)
+                        except DownloadError as e:
+                            last_msg = strip_ansi(str(e))
+                            has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
+                            
+                            # ⚡ 快速中断：致命网络错误（代理/DNS/连接拒绝）— 继续重试毫无意义
+                            if is_fatal_network_error(last_msg):
+                                raise RuntimeError(f"网络连接失败（代理/DNS 错误），已中断所有重试: {last_msg}") from e
+                            
+                            if CookieManager.is_cookie_error(last_msg) or has_cookie_in_log:
+                                custom_err = RuntimeError(CookieManager.get_fatal_msg(last_msg, cfb))
+                                if not cookiefile and not cfb:
+                                    no_cookie_error = custom_err
+                                    last_err = custom_err
+                                else:
+                                    last_cookie_error = custom_err
+                                    if cfb:
+                                        disabled_browsers.add(cfb)
+                                    last_err = no_cookie_error if no_cookie_error else custom_err
+                                continue
+                                
+                            if has_login_required([], last_msg) or "Sign in to confirm" in last_msg:
+                                force_browser_cookie = True
+                                last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启、提供 cookies 文件或改用 Firefox。")
+                                continue
+                            
+                            # 错误处理优化
+                            if not cookiefile and not cfb:
+                                no_cookie_error = e
+                                last_err = e
+                            else:
+                                last_err = no_cookie_error if no_cookie_error else e
+
+                            if "HTTP Error 429" in last_msg or "429" in last_msg:
+                                time.sleep(2.5 * (attempt + 1))
+                                continue
+                            if cfb and CookieManager.is_cookie_error(last_msg):
+                                if cfb:
+                                    disabled_browsers.add(cfb)
+                                continue
+                            continue
+                        except Exception as e:
+                            if not cookiefile and not cfb:
+                                no_cookie_error = e
+                                last_err = e
+                            else:
+                                if no_cookie_error:
+                                    last_err = no_cookie_error
+                                elif CookieManager.is_cookie_error(e):
+                                    if no_cookie_error:
+                                        last_err = no_cookie_error
+                                    else:
+                                        last_err = e
+                                else:
+                                    last_err = e
+                                    
+                            if cfb and CookieManager.is_cookie_error(e):
+                                if cfb:
+                                    disabled_browsers.add(cfb)
+                                continue
+                            continue
+                    
+                        if info is not None:
+                            if has_login_required(logger.lines):
+                                force_browser_cookie = True
+                                disabled_web = disabled_web or ("web" in client_set)
+                                last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
+                                continue
+                            if has_po_token_required(logger.lines) and any(c in {"android", "ios", "mweb"} for c in client_set):
+                                last_err = RuntimeError("该客户端需要 PO Token，已降级到其他客户端。")
+                                disabled_web = disabled_web or ("web" in client_set)
+                                continue
+                            if has_js_challenge_failure(logger.lines):
+                                disabled_web = True
+                                last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
+                                continue
+                            break
+
+                    if not isinstance(info, dict):
+                        continue
+
+                    video_id = str(info.get("id") or "")
+                    subtitles = info.get("subtitles") or {}
+                    auto = info.get("automatic_captions") or {}
+                    merged: dict = {}
+                    if isinstance(subtitles, dict):
+                        merged.update(subtitles)
+                    if isinstance(auto, dict):
+                        for k, v in auto.items():
+                            if k not in merged:
+                                merged[k] = v
+
+                    preferred = [l for l in langs if l and l != "all"]
+                    try_langs = preferred or [str(k) for k in merged.keys()]
+                    for lang in try_langs:
+                        tracks = merged.get(lang)
+                        if not isinstance(tracks, list) or not tracks:
+                            continue
+                        track = None
+                        for t in tracks:
+                            if isinstance(t, dict) and (t.get("ext") == "vtt" or str(t.get("ext") or "") == "vtt"):
+                                track = t
+                                break
+                        if track is None:
+                            for t in tracks:
+                                if isinstance(t, dict):
+                                    track = t
+                                    break
+                        if not isinstance(track, dict):
+                            continue
+                        url = str(track.get("url") or "")
+                        if not url:
+                            continue
+                        url = maybe_force_vtt(url)
+
+                        try:
+                            r = sess.get(url, headers={"User-Agent": ua, "Accept-Encoding": "identity"})
+                            if r.status_code == 429:
+                                retry_after = r.headers.get("Retry-After", "")
+                                try:
+                                    wait_s = int(retry_after)
+                                except Exception:
+                                    wait_s = 20
+                                last_err = RuntimeError(f"timedtext 触发 429（Retry-After={retry_after or 'n/a'}）")
+                                time.sleep(max(8, min(90, wait_s)))
+                                continue
+                            r.raise_for_status()
+                        except requests.exceptions.HTTPError as e:
+                            last_err = e
+                            continue
+                        except requests.exceptions.RequestException:
+                            last_err = None
+                            continue
+
+                        raw = r.text or ""
+                        text = vtt_to_text(raw) if raw else ""
+                        if text.strip():
+                            label = f"{video_id or ''}{' ' if video_id else ''}{lang}".strip()
+                            return label, text
+
+            return None
+
+        def download_with_lang(sub_langs: list[str]) -> tuple[str, list[Path]]:
+            nonlocal force_browser_cookie
+            nonlocal last_err, last_video_id
+            attempt_retries = max(1, int(retries))
+            
+            # 记录无 Cookie 时的错误
+            no_cookie_error: Exception | None = None
+            
+            client_strategies = [["android"], ["ios"]] + ([["web_safari"], ["web"]] if allow_web_client else []) + [["tv"]]
+
+            for attempt in range(attempt_retries + 1): # 多尝试一次以覆盖更多策略
+                # 轮换客户端策略
+                client_set = client_strategies[attempt % len(client_strategies)]
+                if disabled_web and "web" in client_set:
+                    continue
+                
+                # ua = random.choice(user_agents) # 不再手动指定 UA，让 yt-dlp 根据 client 自动匹配
+                
+                for cookiefile, cfb in CookieManager.get_sources(cookies_file, cookies_from_browser, force_browser_cookie):
+                    if cfb and cfb in disabled_browsers:
+                        continue
+                    logger = YdlLogger()
+                    opts: dict = {
+                        "skip_download": True,
+                        "writesubtitles": True,
+                        "writeautomaticsub": True,
+                        "subtitleslangs": sub_langs,
+                        "subtitlesformat": "vtt",
+                        "outtmpl": outtmpl,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "verbose": True,
+                        "nocheckcertificate": True,
+                        "sleep_interval": 2,
+                        "max_sleep_interval": 6,
+                        "retries": 1,
+                        "fragment_retries": 1,
+                        "extractor_retries": 1,
+                        "socket_timeout": float(timeout_seconds),
+                        "geo_bypass": True,
+                        "ignoreerrors": False,
+                        "ignore_config": True,
+                        "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+                        "extractor_args": {"youtube": {"player_client": client_set}},
+                        "logger": logger,
+                    }
+                    if has_js_runtime:
+                        if runtime_path:
+                            opts["js_runtimes"] = {runtime_name: {"path": runtime_path}}
+                        else:
+                            opts["js_runtimes"] = {runtime_name: {}}
+                        if runtime_name in {"deno", "bun"}:
+                            opts["remote_components"] = {"ejs:npm"}
+                        else:
+                            opts["remote_components"] = {"ejs:github"}
+                    if proxy_url:
+                        opts["proxy"] = proxy_url
+                    if cookiefile:
+                        opts["cookiefile"] = cookiefile
+                    elif cfb:
+                        opts["cookiesfrombrowser"] = (cfb,)
+
+                    try:
+                        info = extract_info_with_format_rotation(opts)
+                        if not isinstance(info, dict):
+                            continue
+                        if has_login_required(logger.lines):
+                            force_browser_cookie = True
+                            disabled_web = disabled_web or ("web" in client_set)
+                            last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
+                            continue
+                        if has_po_token_required(logger.lines) and any(c in {"android", "ios", "mweb"} for c in client_set):
+                            last_err = RuntimeError("该客户端需要 PO Token，已降级到其他客户端。")
+                            disabled_web = disabled_web or ("web" in client_set)
+                            continue
+                        if has_js_challenge_failure(logger.lines):
+                            disabled_web = True
+                            last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
+                            continue
+                        last_video_id = (info or {}).get("id") or last_video_id
+                        last_err = None
+                        subtitles = info.get("subtitles") or {}
+                        auto = info.get("automatic_captions") or {}
+                        merged: dict = {}
+                        if isinstance(subtitles, dict):
+                            merged.update(subtitles)
+                        if isinstance(auto, dict):
+                            for k, v in auto.items():
+                                if k not in merged:
+                                    merged[k] = v
+                        preferred = [l for l in sub_langs if l and l != "all"]
+                        try_langs = preferred or [str(k) for k in merged.keys()]
+                        sess = build_download_session()
+                        ua = random.choice(user_agents)
+                        for lang in try_langs:
+                            tracks = merged.get(lang)
+                            if not isinstance(tracks, list) or not tracks:
+                                continue
+                            track = None
+                            for t in tracks:
+                                if isinstance(t, dict) and (t.get("ext") == "vtt" or str(t.get("ext") or "") == "vtt"):
+                                    track = t
+                                    break
+                            if track is None:
+                                for t in tracks:
+                                    if isinstance(t, dict):
+                                        track = t
+                                        break
+                            if not isinstance(track, dict):
+                                continue
+                            url = str(track.get("url") or "")
+                            if not url:
+                                continue
+                            url = maybe_force_vtt(url)
+                            try:
+                                r = sess.get(url, headers={"User-Agent": ua, "Accept-Encoding": "identity"})
+                                if r.status_code == 429:
+                                    retry_after = r.headers.get("Retry-After", "")
+                                    try:
+                                        wait_s = int(retry_after)
+                                    except Exception:
+                                        wait_s = 20
+                                    last_err = RuntimeError(f"timedtext 触发 429（Retry-After={retry_after or 'n/a'}）")
+                                    time.sleep(max(8, min(90, wait_s)))
+                                    continue
+                                r.raise_for_status()
+                            except requests.exceptions.HTTPError as e:
+                                last_err = e
+                                continue
+                            except requests.exceptions.RequestException:
+                                last_err = None
+                                continue
+                            raw = r.text or ""
+                            if raw.strip():
+                                file_name = f"{last_video_id or 'video'}.{lang}.vtt"
+                                vtt_path = Path(tmp) / file_name
+                                vtt_path.write_text(raw, encoding="utf-8", errors="ignore")
+                                return last_video_id, [vtt_path]
+                        last_err = RuntimeError("yt-dlp 未下载到字幕文件（可能无字幕或被限制）。")
+                        return last_video_id, []
+                    except DownloadError as e:
+                        msg = strip_ansi(str(e))
+                        has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
+                        if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
+                            last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
+                            if cfb:
+                                disabled_browsers.add(cfb)
+                            continue
+                        else:
+                            last_err = RuntimeError(msg + "\n\n" + "\n".join(logger.lines[-80:]))
+                            if not cookiefile and not cfb:
+                                no_cookie_error = last_err
+                            elif no_cookie_error:
+                                last_err = no_cookie_error
+                        if "HTTP Error 429" in msg or "429" in msg:
+                            time.sleep(2.0 * (attempt + 1))
+                            continue
+                        if cfb and CookieManager.is_cookie_error(msg):
+                            continue
+                        continue
+                    except Exception as e:
+                        last_err = RuntimeError(repr(e) + "\n\n" + "\n".join(logger.lines[-80:]))
+                        if not cookiefile and not cfb:
+                            no_cookie_error = last_err
+                        else:
+                            if no_cookie_error:
+                                last_err = no_cookie_error
+                        if cfb and CookieManager.is_cookie_error(e):
+                            continue
+                        continue
+            return last_video_id, []
+
+        def try_timedtext_direct(video_id: str, langs_try: list[str]) -> tuple[str, str] | None:
+            if not video_id:
+                return None
+            sess = build_download_session()
+            ua = random.choice(user_agents)
+            for lang in langs_try:
+                for kind in ("", "asr"):
+                    params = {"v": video_id, "lang": lang, "fmt": "vtt"}
+                    if kind:
+                        params["kind"] = kind
+                    try:
+                        r = sess.get(
+                            "https://www.youtube.com/api/timedtext",
+                            params=params,
+                            headers={"User-Agent": ua, "Accept-Encoding": "identity"},
+                        )
+                        if r.status_code == 429:
+                            retry_after = r.headers.get("Retry-After", "")
+                            try:
+                                wait_s = int(retry_after)
+                            except Exception:
+                                wait_s = 20
+                            last_err = RuntimeError(f"timedtext 触发 429（Retry-After={retry_after or 'n/a'}）")
+                            time.sleep(max(8, min(90, wait_s)))
+                            continue
+                        r.raise_for_status()
+                    except requests.exceptions.RequestException as e:
+                        last_err = e
+                        continue
+                    raw = r.text or ""
+                    if is_html_like_text(raw):
+                        last_err = RuntimeError("timedtext 返回 HTML 源码")
+                        continue
+                    text = vtt_to_text(raw) if raw else ""
+                    if text.strip():
+                        label = f"{video_id} {lang}{' asr' if kind else ''}".strip()
+                        return label, text
+            return None
+
+        def choose_vtt(vtts: list[Path], lang: str | None) -> Path:
+            if lang:
+                for p in vtts:
+                    if f".{lang}." in p.name or p.name.endswith(f".{lang}.vtt"):
+                        return p
+            return vtts[0]
+
+        direct = try_extract_and_download_by_url()
+        if direct is not None:
+            return direct
+
+        preferred = [l for l in langs if l and l != "all"]
+        if preferred:
+            for lang in preferred:
+                last_video_id, vtts = download_with_lang([lang])
+                if vtts:
+                    chosen = choose_vtt(vtts, lang)
+                    raw = chosen.read_text(encoding="utf-8", errors="ignore")
+                    text = vtt_to_text(raw)
+                    label = f"{last_video_id or ''}{' ' if last_video_id else ''}{chosen.name}".strip()
+                    return label, text
+        last_video_id, vtts = download_with_lang(["all"])
+        if vtts:
+            chosen = choose_vtt(vtts, None)
+            raw = chosen.read_text(encoding="utf-8", errors="ignore")
+            text = vtt_to_text(raw)
+            label = f"{last_video_id or ''}{' ' if last_video_id else ''}{chosen.name}".strip()
+            return label, text
+
+        preferred = [l for l in langs if l and l != "all"]
+        try_video_id = last_video_id
+        if not try_video_id:
+            try:
+                try_video_id = extract_video_id(video_url)
+            except Exception:
+                try_video_id = ""
+        timedtext = try_timedtext_direct(try_video_id, preferred or ["en", "zh-Hans", "zh", "zh-Hant"])
+        if timedtext is not None:
+            return timedtext
+
+        if last_err is not None:
+            raise last_err
+        if last_cookie_error:
+            raise last_cookie_error
+        raise RuntimeError("yt-dlp 兜底抓取失败（未知原因）。")
+
+
+def transcribe_audio_with_whisper(audio_path: str, model_name: str, language: str, proxy_url: str = None, status_callback=None, fast_mode: bool = False, force_cpu: bool = False) -> str:
+    # 优先尝试使用 faster-whisper (速度快 4-10 倍)
+    # 记录 faster-whisper 的错误信息，以便 fallback 时展示
+    fw_error = None
+    
+    if status_callback: status_callback("Initializing Whisper engine...")
+
+    try:
+        from faster_whisper import WhisperModel
+        
+        # 设置临时环境变量以支持代理下载模型
+        original_http = os.environ.get("HTTP_PROXY")
+        original_https = os.environ.get("HTTPS_PROXY")
+        
+        if proxy_url:
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            print(f"Setting proxy for faster-whisper model download: {proxy_url}")
+        
+        def _safe_status(message: str) -> None:
+            try:
+                if status_callback:
+                    status_callback(message)
+            except Exception:
+                pass
+
+        def _get_wav_duration_seconds(path: str) -> float | None:
+            try:
+                with wave.open(path, "rb") as wf:
+                    frames = wf.getnframes()
+                    rate = wf.getframerate()
+                    if rate <= 0:
+                        return None
+                    return float(frames) / float(rate)
+            except Exception:
+                return None
+
+        def _transcribe_in_worker(q: "queue.Queue[object]", transcribe_kwargs: dict) -> None:
+            try:
+                q.put(("begin", time.time()))
+                segments_local, info_local = model.transcribe(audio_path, **transcribe_kwargs)
+
+                text_segments_local: list[str] = []
+                last_emit = time.time()
+                seg_count = 0
+                last_end_s: float | None = None
+                for seg in segments_local:
+                    seg_count += 1
+                    text_segments_local.append(seg.text)
+                    try:
+                        last_end_s = float(getattr(seg, "end", None))
+                    except Exception:
+                        last_end_s = None
+                    now = time.time()
+                    if now - last_emit >= 10:
+                        q.put(("progress", {"segments": seg_count, "end_s": last_end_s, "t": now}))
+                        last_emit = now
+                q.put(("done", {"text": "".join(text_segments_local).strip(), "info": info_local}))
+            except Exception as e:
+                q.put(("error", e))
+
+        try:
+            # 映射模型名称 (faster-whisper 使用同样的名称)
+            model_size = (model_name or "").strip() or "base"
+            
+            # 初始化模型 (使用 int8 量化，CPU 上极快)
+            # 缓存模型以避免重复加载
+            cache_key = f"faster_whisper_{model_size}"
+            cache = getattr(transcribe_audio_with_whisper, "_model_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(transcribe_audio_with_whisper, "_model_cache", cache)
+                
+            model = cache.get(cache_key)
+            cache_info = cache.get(f"{cache_key}_info", {}) if isinstance(cache, dict) else {}
+            cached_device = str(cache_info.get("device") or "").lower()
+            cached_compute = str(cache_info.get("compute_type") or "").lower()
+            gpu_failed_flag = bool(cache.get(f"{cache_key}_gpu_failed", False))
+            gpu_retry_once = bool(cache.get(f"{cache_key}_gpu_retry_once", False))
+            cuda_ready = False
+            cuda_reason = ""
+            ct2_version = ""
+            ct2_cuda_count = None
+            try:
+                import ctranslate2
+                ct2_version = str(getattr(ctranslate2, "__version__", "")) or "unknown"
+                if hasattr(ctranslate2, "get_cuda_device_count"):
+                    ct2_cuda_count = ctranslate2.get_cuda_device_count()
+                    cuda_ready = ct2_cuda_count > 0
+                    if not cuda_ready:
+                        cuda_reason = "ctranslate2 reports no CUDA devices"
+                        _safe_status("CUDA 不可用：ctranslate2 未检测到设备")
+            except Exception as e:
+                cuda_reason = f"ctranslate2 check failed: {e}"
+            if model is not None:
+                if status_callback:
+                    status_callback(f"Using cached Whisper model ({cached_device or 'cpu'} {cached_compute or 'int8'})")
+                if not force_cpu and cuda_ready and cached_device == "cpu":
+                    if not gpu_failed_flag:
+                        cache.pop(cache_key, None)
+                        cache.pop(f"{cache_key}_info", None)
+                        model = None
+                    elif not gpu_retry_once:
+                        cache[f"{cache_key}_gpu_retry_once"] = True
+                        if status_callback:
+                            status_callback("CUDA 可用，尝试重新加载 GPU 模型")
+                        cache.pop(cache_key, None)
+                        cache.pop(f"{cache_key}_info", None)
+                        model = None
+
+            if model is None:
+                # 自动检测最佳设备
+                # 1. 尝试 GPU (CUDA)
+                # 2. 回退到 CPU
+                
+                cpu_threads = os.cpu_count() or 4
+                
+                # 尝试加载 GPU
+                # 注意：ctranslate2 需要 CUDA 11.x 或 12.x 运行时库
+                device = "cpu"
+                compute_type = "int8"
+                
+                # 尝试自动配置 NVIDIA 库路径 (从 pip 包)
+                try:
+                    import nvidia.cublas
+                    import nvidia.cudnn
+                    
+                    # 尝试不同的子模块结构，适配不同版本的 nvidia 包
+                    cublas_path = None
+                    cudnn_path = None
+                    
+                    # Case 1: nvidia.cublas.lib
+                    try:
+                        import nvidia.cublas.lib
+                        cublas_path = os.path.dirname(nvidia.cublas.lib.__file__)
+                    except ImportError:
+                        pass
+                        
+                    # Case 2: nvidia.cublas.bin (some versions)
+                    if not cublas_path:
+                        try:
+                            import nvidia.cublas.bin
+                            cublas_path = os.path.dirname(nvidia.cublas.bin.__file__)
+                        except ImportError:
+                            pass
+                            
+                    # Case 3: 根目录 (如果 __init__.py 就在 lib 旁)
+                    if not cublas_path and hasattr(nvidia.cublas, '__file__') and nvidia.cublas.__file__:
+                        cublas_path = os.path.join(os.path.dirname(nvidia.cublas.__file__), "lib")
+                        if not os.path.exists(cublas_path):
+                            cublas_path = os.path.join(os.path.dirname(nvidia.cublas.__file__), "bin")
+
+                    # 同理 cuDNN
+                    try:
+                        import nvidia.cudnn.lib
+                        cudnn_path = os.path.dirname(nvidia.cudnn.lib.__file__)
+                    except ImportError:
+                        pass
+                        
+                    if not cudnn_path and hasattr(nvidia.cudnn, '__file__') and nvidia.cudnn.__file__:
+                         cudnn_path = os.path.join(os.path.dirname(nvidia.cudnn.__file__), "lib")
+                         if not os.path.exists(cudnn_path):
+                             cudnn_path = os.path.join(os.path.dirname(nvidia.cudnn.__file__), "bin")
+
+                    if cublas_path and os.path.exists(cublas_path) and cublas_path not in os.environ["PATH"]:
+                        os.environ["PATH"] = cublas_path + os.pathsep + os.environ["PATH"]
+                        if hasattr(os, "add_dll_directory"):
+                            try:
+                                os.add_dll_directory(cublas_path)
+                            except Exception:
+                                pass
+                        print(f"Added NVIDIA cuBLAS to PATH: {cublas_path}")
+                    
+                    if cudnn_path and os.path.exists(cudnn_path) and cudnn_path not in os.environ["PATH"]:
+                        os.environ["PATH"] = cudnn_path + os.pathsep + os.environ["PATH"]
+                        if hasattr(os, "add_dll_directory"):
+                            try:
+                                os.add_dll_directory(cudnn_path)
+                            except Exception:
+                                pass
+                        print(f"Added NVIDIA cuDNN to PATH: {cudnn_path}")
+                        
+                except Exception as e_nvidia:
+                    print(f"Failed to auto-configure NVIDIA libraries from pip packages: {e_nvidia}")
+
+                diag_lines = []
+                try:
+                    diag_lines.append(f"Python {platform.python_version()} {platform.architecture()[0]}")
+                    diag_lines.append(f"OS {platform.system()} {platform.release()}")
+                    if ct2_version:
+                        diag_lines.append(f"ctranslate2 {ct2_version}")
+                    if ct2_cuda_count is not None:
+                        diag_lines.append(f"ctranslate2 CUDA devices {ct2_cuda_count}")
+                    if status_callback and diag_lines:
+                        status_callback(" | ".join(diag_lines))
+                except Exception:
+                    pass
+
+                try:
+                    dll_dirs = []
+                    env_paths = []
+                    env_cuda_vars = []
+                    for k, v in os.environ.items():
+                        if k.startswith("CUDA_PATH") and v:
+                            env_paths.append(v)
+                            env_cuda_vars.append(f"{k}={v}")
+                    for base in env_paths:
+                        cand = os.path.join(base, "bin")
+                        if os.path.isdir(cand):
+                            dll_dirs.append(cand)
+                    cuda_root = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+                    if os.path.isdir(cuda_root):
+                        for name in os.listdir(cuda_root):
+                            cand = os.path.join(cuda_root, name, "bin")
+                            if os.path.isdir(cand):
+                                dll_dirs.append(cand)
+                    site_paths = [p for p in sys.path if p and "site-packages" in p.lower()]
+                    for sp in site_paths:
+                        pattern = os.path.join(sp, "nvidia", "cublas", "**", "cublas64_*.dll")
+                        for dll in glob.glob(pattern, recursive=True):
+                            dll_dirs.append(os.path.dirname(dll))
+                    seen = set()
+                    added_dirs = []
+                    for d in dll_dirs:
+                        if d in seen:
+                            continue
+                        seen.add(d)
+                        if d not in os.environ["PATH"]:
+                            os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
+                            added_dirs.append(d)
+                        if hasattr(os, "add_dll_directory"):
+                            try:
+                                os.add_dll_directory(d)
+                            except Exception:
+                                pass
+                    if added_dirs:
+                        print(f"Added CUDA DLL dirs: {len(added_dirs)}")
+                        if status_callback:
+                            status_callback(f"CUDA DLL dirs added: {len(added_dirs)}")
+                    if status_callback:
+                        preview_dirs = dll_dirs[:3]
+                        status_callback(f"CUDA 搜索目录: {len(dll_dirs)} | 预览: {', '.join(preview_dirs) if preview_dirs else 'none'}")
+                        if env_cuda_vars:
+                            status_callback(f"CUDA 环境变量: {', '.join(env_cuda_vars[:3])}{'...' if len(env_cuda_vars) > 3 else ''}")
+                except Exception as e_cuda_dirs:
+                    print(f"Failed to auto-configure CUDA DLL dirs: {e_cuda_dirs}")
+
+                # 显式打印正在加载模型，这在日志中可见
+                print(f"Initializing faster-whisper model '{model_size}'...")
+                
+                import ctypes
+                dll_candidates = [
+                    "cublas64_12.dll",
+                    "cublas64_11.dll",
+                    "cublas64_10.dll",
+                    "cublas64_10_2.dll",
+                    "cudart64_12.dll",
+                    "cudart64_11.dll",
+                    "cudart64_10.dll",
+                    "cudart64_10_2.dll",
+                    "cudnn64_9.dll",
+                    "cudnn64_8.dll",
+                ]
+                found_dlls = []
+                failed_dlls = []
+                found_paths = {}
+                search_dirs = []
+                try:
+                    search_dirs.extend([p for p in os.environ.get("PATH", "").split(os.pathsep) if p])
+                except Exception:
+                    pass
+                extra_dirs = locals().get("dll_dirs", [])
+                if isinstance(extra_dirs, list):
+                    search_dirs.extend(extra_dirs)
+                seen_dirs = set()
+                search_dirs = [d for d in search_dirs if d and not (d in seen_dirs or seen_dirs.add(d))]
+                for name in dll_candidates:
+                    loaded = False
+                    try:
+                        ctypes.CDLL(name)
+                        loaded = True
+                        found_paths[name] = name
+                    except Exception:
+                        pass
+                    if not loaded:
+                        for d in search_dirs:
+                            dll_path = os.path.join(d, name)
+                            if os.path.isfile(dll_path):
+                                try:
+                                    ctypes.CDLL(dll_path)
+                                    loaded = True
+                                    found_paths[name] = dll_path
+                                    break
+                                except Exception:
+                                    pass
+                    if loaded:
+                        found_dlls.append(name)
+                    else:
+                        failed_dlls.append(name)
+
+                has_cuda_libs = len(found_dlls) > 0
+                if status_callback:
+                    status_callback(f"CUDA DLL 探测: 命中 {len(found_dlls)} / 候选 {len(dll_candidates)}")
+                    if found_paths:
+                        preview_paths = list(found_paths.values())[:3]
+                        status_callback(f"CUDA DLL 路径预览: {', '.join(preview_paths)}")
+                    has_cublas = any(n.startswith("cublas") for n in found_dlls)
+                    has_cudart = any(n.startswith("cudart") for n in found_dlls)
+                    has_cudnn = any(n.startswith("cudnn") for n in found_dlls)
+                    status_callback(f"CUDA DLL 族: cublas={has_cublas} cudart={has_cudart} cudnn={has_cudnn}")
+                    if search_dirs:
+                        for i in range(0, len(search_dirs), 8):
+                            status_callback("CUDA 搜索目录清单: " + "; ".join(search_dirs[i:i+8]))
+                    if found_paths:
+                        items = [f"{k} -> {found_paths[k]}" for k in sorted(found_paths.keys())]
+                        for i in range(0, len(items), 10):
+                            status_callback("CUDA DLL 命中清单: " + "; ".join(items[i:i+10]))
+                    if failed_dlls:
+                        for i in range(0, len(failed_dlls), 10):
+                            status_callback("CUDA DLL 未命中清单: " + ", ".join(failed_dlls[i:i+10]))
+                if not has_cuda_libs:
+                    msg = "⚠️ CUDA DLL 未找到，跳过 GPU，强制 CPU。"
+                    print(msg)
+                    if status_callback:
+                        status_callback(msg)
+                if not cuda_ready:
+                    cuda_ready = has_cuda_libs
+                    if not cuda_ready and not cuda_reason:
+                        cuda_reason = "CUDA DLL 未找到"
+                if status_callback and found_dlls:
+                    status_callback(f"CUDA DLL 就绪: {', '.join(found_dlls[:3])}{'...' if len(found_dlls) > 3 else ''}")
+
+                try:
+                    if force_cpu:
+                        raise RuntimeError("Forced CPU mode")
+                    if not cuda_ready:
+                        raise RuntimeError(f"CUDA not ready (Skipping): {cuda_reason}")
+
+                    # 静默尝试 GPU (float16)
+                    # 增加 download_root 参数，确保模型下载到项目目录下，方便管理且避免权限问题
+                    # 使用 os.getcwd() 可能会变，建议用固定相对路径 "models"
+                    model_dir = os.path.join(os.getcwd(), "models")
+                    os.makedirs(model_dir, exist_ok=True)
+                    
+                    print(f"Attempting to load on GPU (cuda)... Download root: {model_dir}")
+                    if status_callback: status_callback(f"Attempting to load Whisper on GPU (CUDA)...")
+                    
+                    # 1. 尝试 GPU float16 (最佳性能，但显存要求高)
+                    try:
+                        model = WhisperModel(model_size, device="cuda", compute_type="float16", download_root=model_dir)
+                        device = "cuda"
+                        compute_type = "float16"
+                        print(f"✅ faster-whisper loaded on GPU (cuda) with float16. Threads: {cpu_threads}")
+                        if status_callback: status_callback(f"✅ Whisper loaded on GPU (CUDA float16)")
+                    except Exception as e_f16:
+                        print(f"⚠️ GPU float16 load failed: {e_f16}")
+                        
+                        # 2. 尝试 GPU int8 (节省显存，适合 4GB 显存如 1050 Ti 跑 large 模型)
+                        try:
+                            print(f"Attempting to load on GPU (cuda) int8...")
+                            if status_callback: status_callback(f"GPU float16 failed. Trying GPU int8...")
+                            model = WhisperModel(model_size, device="cuda", compute_type="int8", download_root=model_dir)
+                            device = "cuda"
+                            compute_type = "int8"
+                            print(f"✅ faster-whisper loaded on GPU (cuda) with int8. Threads: {cpu_threads}")
+                            if status_callback: status_callback(f"✅ Whisper loaded on GPU (CUDA int8)")
+                        except Exception as e_int8:
+                            print(f"❌ GPU int8 load failed: {e_int8}")
+                            import traceback
+                            traceback.print_exc()
+                            raise e_int8 # 抛出异常以触发外层的 CPU fallback
+    
+                except Exception as e:
+                    print(f"GPU load failed completely ({e}), fallback to CPU int8")
+                    if status_callback: status_callback(f"❌ GPU failed ({str(e)[:50]}...). Falling back to CPU.")
+                    cache[f"{cache_key}_gpu_failed_reason"] = str(e)
+                    # 3. 回退到 CPU int8
+                    model_dir = os.path.join(os.getcwd(), "models")
+                    model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=model_dir)
+                    device = "cpu"
+                    compute_type = "int8"
+                    cache[f"{cache_key}_gpu_failed"] = True
+                    print(f"✅ faster-whisper loaded on CPU with int8. Threads: {cpu_threads}")
+                    if status_callback: status_callback(f"✅ Whisper loaded on CPU (int8)")
+                
+                # 记录 device 信息到 model 对象，方便外部读取（虽然 model 是 C++ 包装对象可能不支持随意 setattr）
+                # 我们可以存到 cache 的 metadata 里
+                cache[cache_key] = model
+                cache[f"{cache_key}_info"] = {"device": device, "compute_type": compute_type}
+                if device == "cuda":
+                    cache[f"{cache_key}_gpu_failed"] = False
+                    cache.pop(f"{cache_key}_gpu_failed_reason", None)
+                
+            # 开始转写
+            lang = None if (not language or language == "auto") else language
+            
+            device_for_status = cache.get(f"{cache_key}_info", {}).get("device", "cpu")
+            _safe_status(f"Transcribing audio with Whisper ({device_for_status})...")
+
+            try:
+                wav_seconds = _get_wav_duration_seconds(audio_path)
+                if wav_seconds is not None:
+                    _safe_status(f"Audio duration: {wav_seconds:.1f}s")
+
+                used_device_now = str(cache.get(f"{cache_key}_info", {}).get("device", "cpu")).lower()
+                used_compute_now = str(cache.get(f"{cache_key}_info", {}).get("compute_type", "int8")).lower()
+                cpu_count = os.cpu_count() or 4
+                audio_minutes = (float(wav_seconds) / 60.0) if wav_seconds is not None else None
+                batch_size = 8
+                if used_device_now == "cuda":
+                    # 针对 int8 和不同模型大小优化 batch_size
+                    base_batch = 8
+                    if model_size in {"tiny", "base"}:
+                        base_batch = 24
+                    elif model_size in {"small"}:
+                        base_batch = 16
+                    elif model_size in {"medium"}:
+                        base_batch = 12
+                    else: # large
+                        base_batch = 6
+                    
+                    if used_compute_now == "int8":
+                        # int8 显存占用更小，可以增加 batch_size 以提高吞吐量
+                        base_batch = int(base_batch * 1.5)
+                    
+                    batch_size = base_batch
+                    
+                    if audio_minutes is not None and audio_minutes >= 90:
+                        # 长音频适当保守一点，避免显存碎片化
+                        batch_size = max(4, min(batch_size, 16))
+                else:
+                    base_cpu_batch = 20 if cpu_count >= 16 else (16 if cpu_count >= 8 else 8)
+                    if model_size in {"tiny", "base", "small"}:
+                        batch_size = base_cpu_batch
+                    else:
+                        batch_size = min(10, base_cpu_batch)
+                    if audio_minutes is not None and audio_minutes >= 60:
+                        batch_size = max(8, min(batch_size, 12))
+
+                auto_fast_mode = False
+                if not fast_mode and wav_seconds is not None:
+                    if used_device_now == "cpu" and wav_seconds >= 20 * 60:
+                        auto_fast_mode = True
+                        _safe_status("Auto fast mode: long audio on CPU")
+                    elif used_device_now == "cuda" and wav_seconds >= 60 * 60:
+                        auto_fast_mode = True
+                        _safe_status("Auto fast mode: very long audio on CUDA")
+
+                effective_fast_mode = bool(fast_mode or auto_fast_mode)
+
+                vad_parameters = {"min_silence_duration_ms": 500}
+                if wav_seconds is not None and wav_seconds >= 20 * 60:
+                    vad_parameters = {"min_silence_duration_ms": 800, "speech_pad_ms": 150}
+                fast_chunk_len = 60
+                if effective_fast_mode:
+                    fast_chunk_len = 30 if used_device_now == "cuda" else 60
+                    vad_parameters = {"min_silence_duration_ms": 1000, "speech_pad_ms": 80}
+                    _safe_status(f"Fast mode enabled: chunk_length={fast_chunk_len}, timestamps=off")
+
+                transcribe_kwargs = {
+                    "beam_size": 1,
+                    "best_of": 1,
+                    "temperature": 0.0,
+                    "language": lang,
+                    "condition_on_previous_text": False,
+                    "vad_filter": True,
+                    "vad_parameters": vad_parameters,
+                    "without_timestamps": True,
+                    "batch_size": int(batch_size),
+                }
+                if effective_fast_mode:
+                    transcribe_kwargs["chunk_length"] = fast_chunk_len
+                _safe_status(f"Whisper参数: device={used_device_now}, batch={batch_size}, chunk={transcribe_kwargs.get('chunk_length', 'auto')}, vad={vad_parameters.get('min_silence_duration_ms')}")
+                try:
+                    import inspect
+
+                    accepted = set(inspect.signature(model.transcribe).parameters.keys())
+                    dropped = sorted([k for k in transcribe_kwargs.keys() if k not in accepted])
+                    transcribe_kwargs = {k: v for k, v in transcribe_kwargs.items() if k in accepted}
+                    if dropped:
+                        _safe_status(f"faster-whisper 参数兼容：已忽略 {', '.join(dropped)}")
+                except Exception:
+                    pass
+
+                q: "queue.Queue[object]" = queue.Queue()
+                worker = threading.Thread(target=_transcribe_in_worker, args=(q, transcribe_kwargs), daemon=True)
+                started_at = time.time()
+                worker.start()
+
+                last_progress_at = started_at
+                last_seg_count = 0
+                last_end_s: float | None = None
+                last_heartbeat_at = started_at
+                max_total_seconds = max(30.0 * 60.0, float(wav_seconds) * 8.0) if wav_seconds is not None else 30.0 * 60.0
+                stall_seconds = 10.0 * 60.0
+                if str(device_for_status).lower() == "cuda":
+                    max_total_seconds = max(60.0 * 60.0, float(wav_seconds) * 12.0) if wav_seconds is not None else 60.0 * 60.0
+                    stall_seconds = max(2.0 * 60.0, float(wav_seconds) * 0.06) if wav_seconds is not None else 2.0 * 60.0
+                    stall_cap = max_total_seconds * 0.4
+                    if stall_seconds > stall_cap:
+                        stall_seconds = stall_cap
+
+                result_text: str | None = None
+                info = None
+                while True:
+                    try:
+                        msg = q.get(timeout=2.0)
+                    except Exception:
+                        msg = None
+
+                    now = time.time()
+                    if now - last_heartbeat_at >= 30.0:
+                        hb = f"Whisper heartbeat: {int(now - started_at)}s elapsed"
+                        if wav_seconds is not None:
+                            hb += f", audio {wav_seconds:.1f}s"
+                        if last_seg_count:
+                            hb += f", segments {last_seg_count}"
+                        if last_end_s is not None:
+                            hb += f", last_end {last_end_s:.1f}s"
+                        _safe_status(hb)
+                        last_heartbeat_at = now
+
+                    if msg is None:
+                        if now - started_at > max_total_seconds:
+                            raise TimeoutError(f"Whisper transcribe timeout after {int(now - started_at)}s")
+                        if last_progress_at and now - last_progress_at > stall_seconds:
+                            raise TimeoutError(f"Whisper appears stalled (no progress for {int(now - last_progress_at)}s)")
+                        continue
+
+                    kind = msg[0]
+                    if kind == "progress":
+                        payload = msg[1] if len(msg) > 1 else {}
+                        last_seg_count = int(payload.get("segments") or last_seg_count)
+                        try:
+                            last_end_s = float(payload.get("end_s")) if payload.get("end_s") is not None else last_end_s
+                        except Exception:
+                            pass
+                        last_progress_at = now
+                        if wav_seconds is not None and last_end_s is not None:
+                            pct = max(0.0, min(100.0, (last_end_s / wav_seconds) * 100.0))
+                            _safe_status(f"Whisper progress: {pct:.1f}% ({last_end_s:.1f}/{wav_seconds:.1f}s), segments={last_seg_count}")
+                        else:
+                            _safe_status(f"Whisper progress: segments={last_seg_count}")
+                    elif kind == "done":
+                        payload = msg[1] if len(msg) > 1 else {}
+                        result_text = str(payload.get("text") or "").strip()
+                        info = payload.get("info")
+                        break
+                    elif kind == "error":
+                        err = msg[1] if len(msg) > 1 else RuntimeError("Unknown transcribe error")
+                        raise err
+
+                text = (result_text or "").strip()
+            except TimeoutError as te:
+                if device_for_status == "cuda":
+                    _safe_status(f"CUDA transcribe stalled, fallback to CPU. Reason: {te}")
+                    cache[f"{cache_key}_gpu_failed_reason"] = f"CUDA stalled: {te}"
+                    cache[f"{cache_key}_gpu_failed"] = True
+                    cache[f"{cache_key}_gpu_retry_once"] = True
+                    cpu_threads = os.cpu_count() or 4
+                    model_dir = os.path.join(os.getcwd(), "models")
+                    os.makedirs(model_dir, exist_ok=True)
+                    model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=model_dir)
+                    cache[cache_key] = model
+                    cache[f"{cache_key}_info"] = {"device": "cpu", "compute_type": "int8"}
+                    cache[f"{cache_key}_gpu_failed"] = True
+                    device_for_status = "cpu"
+                    _safe_status("Retry transcribe on CPU (int8)...")
+                    used_device_now = "cpu"
+                    batch_size = 16 if (os.cpu_count() or 4) >= 8 else 8
+                    if model_size not in {"tiny", "base", "small"}:
+                        batch_size = min(8, batch_size)
+                    transcribe_kwargs = {
+                        "beam_size": 1,
+                        "best_of": 1,
+                        "temperature": 0.0,
+                        "language": lang,
+                        "condition_on_previous_text": False,
+                        "vad_filter": True,
+                        "vad_parameters": vad_parameters,
+                        "without_timestamps": True,
+                        "batch_size": int(batch_size),
+                    }
+                    if effective_fast_mode:
+                        transcribe_kwargs["chunk_length"] = 60
+                    try:
+                        import inspect
+
+                        accepted = set(inspect.signature(model.transcribe).parameters.keys())
+                        dropped = sorted([k for k in transcribe_kwargs.keys() if k not in accepted])
+                        transcribe_kwargs = {k: v for k, v in transcribe_kwargs.items() if k in accepted}
+                        if dropped:
+                            _safe_status(f"faster-whisper 参数兼容：已忽略 {', '.join(dropped)}")
+                    except Exception:
+                        pass
+
+                    q = queue.Queue()
+                    worker = threading.Thread(target=_transcribe_in_worker, args=(q, transcribe_kwargs), daemon=True)
+                    started_at = time.time()
+                    worker.start()
+
+                    last_progress_at = started_at
+                    last_seg_count = 0
+                    last_end_s = None
+                    last_heartbeat_at = started_at
+                    max_total_seconds = max(60.0 * 60.0, float(wav_seconds) * 12.0) if wav_seconds is not None else 60.0 * 60.0
+                    stall_seconds = 5.0 * 60.0  # CPU fallback: 5 分钟无进度则认定卡死
+
+                    result_text = None
+                    info = None
+                    while True:
+                        try:
+                            msg = q.get(timeout=2.0)
+                        except Exception:
+                            msg = None
+
+                        now = time.time()
+                        if now - last_heartbeat_at >= 30.0:
+                            hb = f"Whisper heartbeat: {int(now - started_at)}s elapsed"
+                            if wav_seconds is not None:
+                                hb += f", audio {wav_seconds:.1f}s"
+                            if last_seg_count:
+                                hb += f", segments {last_seg_count}"
+                            if last_end_s is not None:
+                                hb += f", last_end {last_end_s:.1f}s"
+                            _safe_status(hb)
+                            last_heartbeat_at = now
+
+                        if msg is None:
+                            if now - started_at > max_total_seconds:
+                                raise TimeoutError(f"Whisper transcribe timeout after {int(now - started_at)}s")
+                            if last_progress_at and now - last_progress_at > stall_seconds:
+                                raise TimeoutError(f"Whisper appears stalled (no progress for {int(now - last_progress_at)}s)")
+                            continue
+
+                        kind = msg[0]
+                        if kind == "progress":
+                            payload = msg[1] if len(msg) > 1 else {}
+                            last_seg_count = int(payload.get("segments") or last_seg_count)
+                            try:
+                                last_end_s = float(payload.get("end_s")) if payload.get("end_s") is not None else last_end_s
+                            except Exception:
+                                pass
+                            last_progress_at = now
+                            if wav_seconds is not None and last_end_s is not None:
+                                pct = max(0.0, min(100.0, (last_end_s / wav_seconds) * 100.0))
+                                _safe_status(f"Whisper progress: {pct:.1f}% ({last_end_s:.1f}/{wav_seconds:.1f}s), segments={last_seg_count}")
+                            else:
+                                _safe_status(f"Whisper progress: segments={last_seg_count}")
+                        elif kind == "done":
+                            payload = msg[1] if len(msg) > 1 else {}
+                            result_text = str(payload.get("text") or "").strip()
+                            info = payload.get("info")
+                            break
+                        elif kind == "error":
+                            err = msg[1] if len(msg) > 1 else RuntimeError("Unknown transcribe error")
+                            raise err
+
+                    text = (result_text or "").strip()
+                else:
+                    raise
+            
+            # 获取实际使用的 device info
+            dev_info = cache.get(f"{cache_key}_info", {})
+            used_device = dev_info.get("device", "cpu")
+            used_compute = dev_info.get("compute_type", "int8")
+            
+            # 附加 device 信息到文本末尾 (隐式传递给 UI)
+            # 格式：<!-- FW_DEVICE: device_name (compute_type) -->
+            debug_extra = ""
+            if used_device != "cuda":
+                gpu_failed_reason = cache.get(f"{cache_key}_gpu_failed_reason")
+                if gpu_failed_reason:
+                    reason_clean = str(gpu_failed_reason).replace("\n", " ").strip()
+                    if len(reason_clean) > 140:
+                        reason_clean = reason_clean[:140] + "..."
+                    debug_extra = f" | GPU_FAIL: {reason_clean}"
+            debug_tag = f"\n\n<!-- FW_DEVICE: {used_device.upper()} ({used_compute}){debug_extra} -->"
+            
+            if not text:
+                 raise RuntimeError(f"faster-whisper 转写结果为空。Device: {used_device}")
+            return text + debug_tag
+
+        finally:
+            # 恢复环境变量
+            if proxy_url:
+                if original_http:
+                    os.environ["HTTP_PROXY"] = original_http
+                else:
+                    os.environ.pop("HTTP_PROXY", None)
+                    
+                if original_https:
+                    os.environ["HTTPS_PROXY"] = original_https
+                else:
+                    os.environ.pop("HTTPS_PROXY", None)
+
+    except ImportError:
+        # 如果没有安装 faster-whisper，打印警告并回退到 openai-whisper
+        print("Warning: 'faster-whisper' not installed. Using slower 'openai-whisper'. Install faster-whisper for 4x speedup.")
+        pass
+    except Exception as e:
+        # faster-whisper 失败，回退到 openai-whisper
+        fw_error = str(e)
+        print(f"faster-whisper failed: {e}. Falling back to openai-whisper.")
+        import traceback
+        traceback.print_exc()
+        pass
+
+    # --- 以下是原有的 openai-whisper 逻辑 (作为兜底) ---
+    try:
+        import whisper  # type: ignore
+    except Exception as e:
+        msg = "未安装 openai-whisper，无法启用音频转写兜底。"
+        if fw_error:
+            msg += f"\n(此前 faster-whisper 也失败了: {fw_error})"
+        raise RuntimeError(msg) from e
+        
+    print("Fallback to openai-whisper (Legacy)...")
+    
+    # 尝试获取 device (虽然 openai-whisper 自动处理，但我们可以尝试检测)
+    import torch
+    used_device = "CUDA" if torch.cuda.is_available() else "CPU"
+    used_compute = "float16" if used_device == "CUDA" else "float32" # 简单假设
+
+
+    model_name = (model_name or "").strip() or "base"
+    language = (language or "").strip().lower()
+    lang = None if (not language or language == "auto") else language
+
+    cache = getattr(transcribe_audio_with_whisper, "_model_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(transcribe_audio_with_whisper, "_model_cache", cache)
+    model = cache.get(model_name)
+    if model is None:
+        model = whisper.load_model(model_name)
+        cache[model_name] = model
+    
+    # 定义重试参数列表
+    # 策略优化：优先使用 Greedy (beam_size=1)，极大提升速度 (3-5x)
+    # 如果 Greedy 失败，再尝试更稳健的 Beam Search 或 强力兜底
+    
+    retry_configs = [
+        # 1. 极速模式：Greedy Decoding
+        {"fp16": False, "language": lang, "beam_size": 1}, 
+        # 2. 强力兜底：禁用所有过滤，强制输出
+        {"fp16": False, "language": lang, "logprob_threshold": None, "compression_ratio_threshold": None, "condition_on_previous_text": False, "no_speech_threshold": 0.95},
+    ]
+
+    last_exc = None
+    for i, cfg in enumerate(retry_configs):
+        try:
+            # print(f"Whisper attempt {i+1} with config: {cfg}")
+            result = model.transcribe(audio_path, **cfg)
+            text = str((result or {}).get("text") or "").strip()
+            if text:
+                 # 附加 openai-whisper 的 device info
+                extra_msg = f" | ⚠️ faster-whisper 启动失败: {fw_error}" if fw_error else ""
+                debug_tag = f"\n\n<!-- FW_DEVICE: {used_device} ({used_compute}) [OpenAI-Whisper]{extra_msg} -->"
+                return text + debug_tag
+        except Exception as e:
+            last_exc = e
+            # 如果是 KeyError (Linear)，直接抛出，无法重试修复
+            if isinstance(e, KeyError) and "Linear" in str(e):
+                raise KeyError(f"Whisper 模型加载/推理时发生 KeyError: {e}。这通常是 pytorch/whisper 版本不兼容导致。") from e
+            # 继续尝试下一个配置
+
+    # 所有重试都失败
+    if last_exc:
+        msg = str(last_exc)
+        # 获取文件大小信息，辅助 debug
+        file_info = ""
+        try:
+            sz = os.path.getsize(audio_path)
+            file_info = f" (音频文件大小: {sz} bytes)"
+        except:
+            pass
+            
+        # 附加 device 信息到错误消息 (隐式传递给 UI)
+        # 既然 faster-whisper 的 device info 很有用，这里也尝试获取一下
+        # 虽然这里是 openai-whisper，但我们可以简单返回 CPU
+        # 或者我们统一异常格式
+        
+        if "cannot reshape tensor of 0 elements" in msg:
+            raise RuntimeError(f"音频转写失败：未能检测到有效语音片段 (No speech detected)。请检查视频是否静音，或尝试更小的模型{file_info}。") from last_exc
+        raise last_exc
+    
+    raise RuntimeError("音频转写结果为空 (所有重试方案均未产生文本)。")
+
+
+
+def transcribe_video_audio_with_ytdlp(
+    video_url: str,
+    proxy_url: str,
+    timeout_seconds: float,
+    retries: int,
+    cookies_file: str,
+    cookies_from_browser: str,
+    model_name: str,
+    language: str,
+    status_callback=None,
+    fast_mode: bool = False
+) -> tuple[str, str]:
+    class YdlLogger:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def _add(self, level: str, msg: str) -> None:
+            s = strip_ansi(str(msg or "")).strip()
+            if not s:
+                return
+            self.lines.append(f"[{level}] {s}")
+            if len(self.lines) > 400:
+                self.lines = self.lines[-250:]
+
+        def debug(self, msg: str) -> None:
+            self._add("debug", msg)
+
+        def info(self, msg: str) -> None:
+            self._add("info", msg)
+
+        def warning(self, msg: str) -> None:
+            self._add("warning", msg)
+
+        def error(self, msg: str) -> None:
+            self._add("error", msg)
+
+    try:
+        from yt_dlp import YoutubeDL  # type: ignore
+        from yt_dlp.utils import DownloadError  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "未安装 yt-dlp，无法启用音频转写兜底。可执行：python -m pip install yt-dlp -i https://pypi.tuna.tsinghua.edu.cn/simple"
+        ) from e
+
+    def detect_js_runtime() -> tuple[str, str | None]:
+        try:
+            import shutil
+            deno = shutil.which("deno")
+            node = shutil.which("node")
+            bun = shutil.which("bun")
+            qjs = shutil.which("qjs")
+            if deno:
+                return "deno", deno
+            if node:
+                return "node", node
+            if bun:
+                return "bun", bun
+            if qjs:
+                return "quickjs", qjs
+            return "", None
+        except Exception:
+            return "", None
+
+        # 移除此处的本地 is_cookie_error 定义，改用顶层的 _is_cookie_error
+
+    cache_path = _audio_cache_path(video_url)
+    if cache_path and cache_path.exists():
+        try:
+            if cache_path.stat().st_size > 16 * 1024:
+                if status_callback:
+                    status_callback("检测到音频缓存，跳过下载")
+                force_cpu_flag = bool(getattr(transcribe_video_audio_with_ytdlp, "_force_cpu", False))
+                text = transcribe_audio_with_whisper(str(cache_path), model_name=model_name, language=language, proxy_url=proxy_url, status_callback=status_callback, fast_mode=fast_mode, force_cpu=force_cpu_flag)
+                label = f"{_audio_cache_key(video_url)} | whisper:{(model_name or '').strip() or 'base'}"
+                return label, text
+        except Exception:
+            pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        outtmpl = os.path.join(tmp, "%(id)s.%(ext)s")
+        last_err: Exception | None = None
+        last_cookie_error: RuntimeError | None = None
+        last_video_id = ""
+        last_attempt_note = ""
+        last_debug_lines: list[str] = []
+        
+        # 记录无 Cookie 时的错误
+        no_cookie_error: Exception | None = None
+        force_browser_cookie = False
+
+        runtime_name, runtime_path = detect_js_runtime()
+        has_js_runtime = bool(runtime_name)
+        has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
+        client_strategies = [["android"], ["ios"]] + ([[]] if has_cookie_hint else [])
+
+        if fast_mode:
+            format_candidates = ["worstaudio/worst"]
+        else:
+            format_candidates = ["bestaudio/best"]
+        
+        disabled_browsers: set[str] = set()
+        disabled_clients_reason: dict[str, str] = {}
+        
+        start_time = time.time()
+        
+        for client_set in client_strategies:
+            for attempt in range(max(1, int(retries)) + 1):
+                for cookiefile, cfb in CookieManager.get_sources(cookies_file, cookies_from_browser, force_browser_cookie):
+                    if cfb and cfb in disabled_browsers:
+                        continue
+                    for fmt in format_candidates:
+                        client_label = ",".join(client_set) if client_set else "default"
+                        attempt_note = f"client={client_label} fmt={(fmt or 'default')} cookie={'file' if cookiefile else ('browser' if cfb else 'none')}{(' js=' + runtime_name) if has_js_runtime else ''}"
+                    
+                    def progress_hook(d):
+                        if status_callback:
+                            if d['status'] == 'downloading':
+                                p = strip_ansi(str(d.get('_percent_str') or '')).replace('%','')
+                                e = strip_ansi(str(d.get('_eta_str') or ''))
+                                status_callback(f"Downloading audio: {p}% (ETA: {e})")
+                            elif d['status'] == 'finished':
+                                status_callback("Download complete, converting audio...")
+
+                    logger = YdlLogger()
+                    opts: dict = {
+                            "progress_hooks": [progress_hook],
+                            "outtmpl": outtmpl,
+                            "noplaylist": True,
+                            "quiet": True,
+                            "no_warnings": True,
+                            "verbose": True,
+                            "nocheckcertificate": True,
+                            "socket_timeout": float(timeout_seconds),
+                            "retries": 1,
+                            "ignoreerrors": False,
+                            "ignore_config": True,
+                            "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+                            "logger": logger,
+                            "postprocessors": [{
+                                "key": "FFmpegExtractAudio",
+                                "preferredcodec": "wav",
+                            }, {
+                                "key": "FFmpegExtractAudio",
+                                "preferredcodec": "wav",
+                                "preferredquality": "16k",
+                            }],
+                            "postprocessor_args": [
+                                "-ac", "1",
+                                "-ar", "16000"
+                            ],
+                        }
+                    if client_set:
+                        opts["extractor_args"] = {"youtube": {"player_client": client_set}}
+                    should_enable_js_runtime = bool(client_set) and any(c in {"web", "web_safari"} for c in client_set)
+                    if has_js_runtime and should_enable_js_runtime:
+                        if runtime_path:
+                            opts["js_runtimes"] = {runtime_name: {"path": runtime_path}}
+                        else:
+                            opts["js_runtimes"] = {runtime_name: {}}
+                        if runtime_name in {"deno", "bun"}:
+                            opts["remote_components"] = {"ejs:npm"}
+                        else:
+                            opts["remote_components"] = {"ejs:github"}
+                    
+                    if ffmpeg_binary_path:
+                        opts["ffmpeg_location"] = ffmpeg_binary_path
+
+                    if proxy_url:
+                        opts["proxy"] = proxy_url
+                    if cookiefile:
+                        opts["cookiefile"] = cookiefile
+                    elif cfb:
+                        opts["cookiesfrombrowser"] = (cfb,)
+
+                    try:
+                        with YoutubeDL(opts) as ydl:
+                            def pick_audio_format(info: dict, prefer_worst: bool, preferred_ext: str | None = None) -> str | None:
+                                formats = info.get("formats") if isinstance(info, dict) else None
+                                if not formats:
+                                    return None
+                                audio_formats = []
+                                for f in formats:
+                                    if not isinstance(f, dict):
+                                        continue
+                                    acodec = f.get("acodec")
+                                    if not acodec or acodec == "none":
+                                        continue
+                                    if preferred_ext:
+                                        ext = str(f.get("ext") or "").lower()
+                                        if ext != preferred_ext.lower():
+                                            continue
+                                    audio_formats.append(f)
+                                if not audio_formats:
+                                    return None
+                                def score(f: dict) -> float:
+                                    for k in ("abr", "tbr"):
+                                        v = f.get(k)
+                                        if isinstance(v, (int, float)):
+                                            return float(v)
+                                    return 0.0
+                                picked = min(audio_formats, key=score) if prefer_worst else max(audio_formats, key=score)
+                                fid = picked.get("format_id")
+                                return str(fid) if fid else None
+
+                            def has_audio_format(info: dict) -> bool:
+                                return pick_audio_format(info, False, None) is not None or pick_audio_format(info, True, None) is not None
+
+                            try:
+                                # 如检测到禁用的 client，直接跳过
+                                if client_set and any(c in disabled_clients_reason for c in client_set):
+                                    reason = next((disabled_clients_reason.get(c) for c in client_set if c in disabled_clients_reason), "Client disabled")
+                                    if last_err is None:
+                                        last_err = RuntimeError(reason)
+                                    continue
+                                
+                                # 优化：针对 web_safari 和 web 客户端，如果未提供 cookies，大概率会失败，可以考虑跳过或降级
+                                # 但为了保险，我们只在出现特定错误后禁用
+                                
+                                info = ydl.extract_info(video_url, download=False)
+                            except DownloadError as e:
+                                msg = strip_ansi(str(e))
+                                has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
+                                if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
+                                    last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
+                                    if cfb:
+                                        disabled_browsers.add(cfb)
+                                    continue
+
+                                # 针对 "missing a URL" 或 "SABR streaming" 错误，这是 web_safari 客户端的已知问题
+                                if "missing a URL" in msg or "SABR streaming" in msg:
+                                    if "web_safari" in client_set:
+                                        disabled_clients_reason["web_safari"] = "Web Safari 客户端不兼容 (SABR/Missing URL)。"
+                                    last_err = RuntimeError("Web Safari 客户端不兼容。")
+                                    last_attempt_note = attempt_note + " (web_safari issue)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                if "po token" in msg.lower() or "challenge solving failed" in msg.lower() or "only images are available" in msg.lower():
+                                    force_browser_cookie = True
+                                    last_err = RuntimeError("YouTube 触发挑战校验（PO Token/JS Challenge）。已自动切换为浏览器 Cookie 方案重试。")
+                                    last_attempt_note = attempt_note + " (challenge/po token)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                
+                                if has_login_required([], msg):
+                                    force_browser_cookie = True
+                                    for c in client_set:
+                                        if c in {"tv", "tv_embedded"}:
+                                            disabled_clients_reason[c] = "需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。"
+                                    last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
+                                    last_attempt_note = attempt_note + " (login required)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                if "requested format not available" in strip_ansi(str(e)).lower():
+                                    last_err = e
+                                    continue # Skip current iteration and try next client/format
+                                
+                                # 针对 "DRM protected" 错误，直接跳过当前 client
+                                if "drm protected" in msg.lower():
+                                    if "tv" in client_set:
+                                        disabled_clients_reason["tv"] = "TV 客户端遭遇 DRM 保护限制。"
+                                    last_err = RuntimeError("当前客户端遭遇 DRM 保护限制。")
+                                    last_attempt_note = attempt_note + " (DRM protected)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                    
+                                raise e
+
+                            try:
+                                if has_login_required(logger.lines):
+                                    force_browser_cookie = True
+                                    for c in client_set:
+                                        if c in {"tv", "tv_embedded"}:
+                                            disabled_clients_reason[c] = "需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。"
+                                    last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
+                                    last_attempt_note = attempt_note + " (login required)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                if has_po_token_required(logger.lines) and any(c in {"android", "ios", "mweb"} for c in client_set):
+                                    force_browser_cookie = True
+                                    for c in client_set:
+                                        if c in {"android", "ios", "mweb"}:
+                                            disabled_clients_reason[c] = "该客户端需要 PO Token，已降级到其他客户端。"
+                                    last_err = RuntimeError("该客户端需要 PO Token，已降级到其他客户端。")
+                                    last_attempt_note = attempt_note + " (po token required)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                if has_js_challenge_failure(logger.lines):
+                                    force_browser_cookie = True
+                                    if "web" in client_set:
+                                        disabled_clients_reason["web"] = "JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。"
+                                    last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
+                                    last_attempt_note = attempt_note + " (js challenge failed)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                if not has_audio_format(info):
+                                    if "web" in client_set:
+                                        disabled_clients_reason["web"] = "未检测到可用音频格式。建议升级 yt-dlp 或更换网络。"
+                                    last_err = RuntimeError("未检测到可用音频格式。建议升级 yt-dlp 或更换网络。")
+                                    last_attempt_note = attempt_note + " (no audio formats)"
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                if fmt:
+                                    prefer_worst = fmt == "worstaudio/worst" or fmt == "worstaudio" or fmt == "worst"
+                                    preferred_ext = None
+                                    if "ext=m4a" in fmt:
+                                        preferred_ext = "m4a"
+                                    elif "ext=webm" in fmt:
+                                        preferred_ext = "webm"
+                                    elif "ext=opus" in fmt:
+                                        preferred_ext = "opus"
+                                    chosen = pick_audio_format(info, prefer_worst, preferred_ext)
+                                    if chosen:
+                                        ydl.params["format"] = chosen
+                                    else:
+                                        last_err = RuntimeError("Requested format is not available")
+                                        last_attempt_note = attempt_note
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                info = ydl.extract_info(video_url, download=True)
+                                if isinstance(info, dict):
+                                    last_video_id = str(info.get("id") or last_video_id)
+                                last_err = None
+                            except DownloadError as dl_err:
+                                if "requested format not available" in strip_ansi(str(dl_err)).lower():
+                                    last_err = dl_err
+                                    last_attempt_note = attempt_note
+                                    last_debug_lines = logger.lines[-80:]
+                                    continue
+                                last_err = dl_err
+                                last_attempt_note = attempt_note
+                                last_debug_lines = logger.lines[-80:]
+                                break
+                            except Exception as dl_err:
+                                last_err = dl_err
+                                last_attempt_note = attempt_note
+                                last_debug_lines = logger.lines[-80:]
+                                break
+                                
+                    except DownloadError as e:
+                        msg = strip_ansi(str(e))
+                        
+                        has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
+                        if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
+                            last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
+                            if cfb:
+                                disabled_browsers.add(cfb)
+                            continue
+
+                        if "requested format not available" in msg.lower():
+                            last_err = e
+                            last_attempt_note = attempt_note
+                            last_debug_lines = logger.lines[-80:]
+                            continue
+                        
+                        # 检测 EJS 挑战失败或缺少 JS runtime，禁用 web client
+                        if ("ejs" in msg.lower()) or ("challenge solving failed" in msg.lower()) or ("js runtimes: none" in msg.lower()) or ("only images are available" in msg.lower()):
+                            disabled_clients_reason["web"] = "Web 客户端挑战失败，已禁用。"
+                            last_attempt_note = attempt_note + " (EJS/JS runtime issue, web disabled)"
+                            last_debug_lines = logger.lines[-80:]
+                            continue
+
+                        if not cookiefile and not cfb:
+                            no_cookie_error = e
+                            last_err = e
+                        else:
+                            if no_cookie_error:
+                                last_err = no_cookie_error
+                            else:
+                                last_err = e
+                        last_attempt_note = attempt_note
+                        last_debug_lines = logger.lines[-80:]
+
+                        if "HTTP Error 429" in msg or "429" in msg:
+                            time.sleep(2.0 * (attempt + 1))
+                            continue
+                        continue
+                    except Exception as e:
+                        if not cookiefile and not cfb:
+                            no_cookie_error = e
+                            last_err = e
+                        else:
+                            if no_cookie_error:
+                                last_err = no_cookie_error
+                            elif CookieManager.is_cookie_error(str(e)):
+                                if no_cookie_error:
+                                    last_err = no_cookie_error
+                            else:
+                                last_err = e
+                        last_attempt_note = attempt_note
+                        last_debug_lines = logger.lines[-80:]
+                        continue
+
+                if last_err is None:
+                    # 成功获取到信息（且下载成功），不需要再重试其他 client
+                    pass
+
+                candidates = []
+                for p in Path(tmp).glob("*"):
+                    if not p.is_file():
+                        continue
+                    ext = p.suffix.lower()
+                    if ext in {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg"}:
+                        candidates.append(p)
+                if not candidates:
+                    detail_lines = []
+                    if last_attempt_note:
+                        detail_lines.append(f"最近尝试: {last_attempt_note}")
+                    if last_err:
+                        detail_lines.append(f"上一次错误: {strip_ansi(str(last_err))}")
+                    if last_debug_lines:
+                        debug_seen: set[str] = set()
+                        debug_tail: list[str] = []
+                        for item in last_debug_lines[-60:]:
+                            k = item.strip().lower()
+                            if not k or k in debug_seen:
+                                continue
+                            debug_seen.add(k)
+                            debug_tail.append(item.strip())
+                            if len(debug_tail) >= 12:
+                                break
+                        tail = "\n".join(debug_tail)
+                        detail_lines.append("调试日志(尾部):\n" + tail)
+                    detail_text = "\n".join(detail_lines)
+                    if last_err and str(last_err).strip().startswith("未下载到音频文件"):
+                        pass
+                    elif detail_text:
+                        last_err = RuntimeError("未下载到音频文件（可能被限制或链接无效）。\n" + detail_text)
+                    else:
+                        last_err = RuntimeError("未下载到音频文件（可能被限制或链接无效）。")
+                    continue
+                audio = max(candidates, key=lambda x: x.stat().st_size)
+                cached_audio = None
+                
+                # 记录下载耗时
+                download_duration = time.time() - start_time
+                if status_callback: 
+                    status_callback(f"Download finished in {download_duration:.1f}s. Audio extracted. Starting Whisper transcription...")
+                
+                if cache_path:
+                    try:
+                        if (not cache_path.exists()) or (cache_path.stat().st_size < audio.stat().st_size):
+                            shutil.copy2(audio, cache_path)
+                        if cache_path.exists() and cache_path.stat().st_size > 16 * 1024:
+                            cached_audio = cache_path
+                    except Exception:
+                        cached_audio = None
+                
+                force_cpu_flag = bool(getattr(transcribe_video_audio_with_ytdlp, "_force_cpu", False))
+                audio_path = str(cached_audio or audio)
+                
+                t_transcribe_start = time.time()
+                text = transcribe_audio_with_whisper(audio_path, model_name=model_name, language=language, proxy_url=proxy_url, status_callback=status_callback, fast_mode=fast_mode, force_cpu=force_cpu_flag)
+                transcribe_duration = time.time() - t_transcribe_start
+                
+                # 将耗时信息注入到 text 末尾的注释中，供 UI 解析
+                timing_tag = f"<!-- TIMING: download={download_duration:.1f}, transcribe={transcribe_duration:.1f} -->"
+                text += timing_tag
+                
+                label = f"{last_video_id or (cached_audio.stem if cached_audio else audio.stem)} | whisper:{(model_name or '').strip() or 'base'}"
+                return label, text
+
+        if last_err is not None:
+            raise last_err
+        if last_cookie_error:
+            raise last_cookie_error
+        raise RuntimeError("音频转写兜底失败（未知原因）。")
+
+
+def fetch_available_models(api_key: str, base_url: str, proxy_url: str = None) -> list[str]:
+    error_msg = ""
+    # 1. 尝试使用 OpenAI SDK
+    try:
+        from openai import OpenAI
+        import httpx
+        
+        client_kwargs = {"api_key": api_key}
+        if base_url and base_url.strip():
+            client_kwargs["base_url"] = base_url.strip()
+        
+        httpx_kwargs = {"verify": False}
+        if proxy_url and proxy_url.strip():
+            httpx_kwargs["proxy"] = proxy_url.strip()
+        
+        client_kwargs["http_client"] = httpx.Client(**httpx_kwargs)
+        
+        client = OpenAI(**client_kwargs)
+        models_page = client.models.list()
+        
+        model_ids = []
+        for m in models_page:
+            if hasattr(m, "id"):
+                model_ids.append(m.id)
+            elif isinstance(m, dict):
+                model_ids.append(m.get("id"))
+                
+        return sorted(model_ids)
+    except Exception as e:
+        error_msg = str(e)
+    
+    # 2. 如果 SDK 失败，尝试直接 Requests 请求 (兜底)
+    try:
+        import requests
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        target_url = base_url.strip()
+        if not target_url.endswith("/"):
+            target_url += "/"
+        
+        # 尝试猜测 models 端点
+        if "v1" not in target_url:
+            target_url += "v1/"
+        target_url += "models"
+        
+        proxies = None
+        if proxy_url and proxy_url.strip():
+            proxies = {"http": proxy_url, "https": proxy_url}
+            
+        r = requests.get(target_url, headers=headers, proxies=proxies, verify=False, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        
+        model_ids = []
+        data_list = data.get("data", [])
+        if isinstance(data_list, list):
+            for m in data_list:
+                if isinstance(m, dict):
+                    model_ids.append(m.get("id"))
+        
+        if model_ids:
+            # 简单过滤，排除 clearly non-chat models
+            filtered = [
+                m for m in model_ids 
+                if not any(x in m for x in ["dall-e", "tts", "whisper", "embedding", "babbage", "davinci", "curie", "ada"])
+            ]
+            return sorted(filtered) if filtered else sorted(model_ids)
+            
+    except Exception as e2:
+        error_msg += f" | Direct HTTP failed: {e2}"
+
+    raise RuntimeError(f"获取模型列表失败: {error_msg}")
+
+def perform_web_search(queries: list[str], proxy: str = None) -> str:
+    if not queries:
+        return ""
+    
+    results_text = []
+    
+    # 定义生成回退链接的辅助函数
+    def add_fallback_links(q_term):
+        try:
+            encoded_q = quote(q_term)
+            google_url = f"https://www.google.com/search?q={encoded_q}"
+            bing_url = f"https://www.bing.com/search?q={encoded_q}"
+            results_text.append(f"### 搜索关键字: {q_term} (自动抓取受限)")
+            results_text.append(f"- [🔍 Google 验证]({google_url})")
+            results_text.append(f"- [🔍 Bing 验证]({bing_url})")
+            results_text.append("")
+        except Exception:
+            pass
+
+    # 如果没有安装 DDGS，直接生成回退链接
+    if not DDGS:
+        for q in queries:
+            add_fallback_links(q)
+        return "\n".join(results_text)
+
+    try:
+        ddgs = DDGS(proxy=proxy, timeout=10)
+        for q in queries:
+            found_something = False
+            try:
+                search_res = ddgs.text(q, max_results=2) 
+                if search_res:
+                    found_something = True
+                    results_text.append(f"### 搜索关键字: {q}")
+                    for r in search_res:
+                        title = r.get('title', '')
+                        href = r.get('href', '')
+                        body = r.get('body', '')
+                        results_text.append(f"- [{title}]({href}): {body}")
+                    results_text.append("")
+            except Exception as e:
+                print(f"Search failed for {q}: {e}")
+            
+            # 如果该关键字没查到结果，生成回退链接
+            if not found_something:
+                add_fallback_links(q)
+
+    except Exception as e:
+        # DDGS 初始化失败（如代理问题），全部回退
+        print(f"DDGS init failed: {e}")
+        results_text.append(f"> ⚠️ 自动搜索服务暂时不可用 ({str(e)})，已为您生成手动验证链接：\n")
+        for q in queries:
+            add_fallback_links(q)
+            
+    return "\n".join(results_text)
+
+def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
+    if not text or not text.strip():
+        return "没有可总结的内容（文本为空）。"
+    if not api_key:
+        return "请填写 API Key 以启用总结功能。"
+    
+    try:
+        from openai import OpenAI
+        import httpx
+    except ImportError:
+        return "未安装 openai 库（DeepSeek 等大模型均依赖此通用 SDK），无法进行总结。"
+
+    try:
+        # 构造客户端
+        client_kwargs = {"api_key": api_key}
+        if base_url and base_url.strip():
+            client_kwargs["base_url"] = base_url.strip()
+        
+        # 配置 httpx client (代理 + 禁用 SSL 验证)
+        httpx_kwargs = {"verify": False}
+        if proxy_url and proxy_url.strip():
+            httpx_kwargs["proxy"] = proxy_url.strip()
+        
+        client_kwargs["http_client"] = httpx.Client(**httpx_kwargs)
+        
+        client = OpenAI(**client_kwargs)
+        
+        content = text.strip()
+        content_len = len(content)
+        max_input_len = 16000 if content_len > 18000 else 20000
+        if content_len > max_input_len:
+            content = content[:max_input_len] + "\n...(内容过长已截断)..."
+
+        from datetime import datetime
+        current_date = datetime.now().strftime("%Y-%m-%d")
+
+        # --- Step 1: Analyze & Generate Search Queries ---
+        search_context = ""
+        # Only perform search if DDGS is available and content is substantial
+        if DDGS and len(content) > 100:
+            try:
+                analysis_prompt = (
+                    f"当前日期: {current_date}。\n"
+                    "请分析以下文本，提取 3 个最需要进行事实核查的关键新闻事件或声明。\n"
+                    "请直接输出 JSON 格式，不要包含 Markdown 标记：\n"
+                    "{ \"queries\": [\"搜索关键词1\", \"搜索关键词2\", \"搜索关键词3\"] }\n"
+                    "关键词应包含核心实体和事件，适合搜索引擎检索，以验证其真实性。\n\n"
+                    f"文本内容摘要：{content[:4000]}"
+                )
+                
+                # Use a separate non-stream call for analysis
+                ana_resp = client.chat.completions.create(
+                    model=model.strip() or "gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": analysis_prompt}],
+                    response_format={"type": "json_object"},
+                    max_tokens=500,
+                    temperature=0.3
+                )
+                q_json_str = ana_resp.choices[0].message.content
+                q_json = json.loads(q_json_str)
+                queries = q_json.get("queries", [])
+                
+                if queries:
+                    print(f"Executing search queries: {queries}")
+                    search_res_str = perform_web_search(queries, proxy=proxy_url)
+                    if search_res_str:
+                        search_context = f"\n\n**【实时搜索结果（用于事实核查）】**\n{search_res_str}\n\n请利用以上搜索结果来填写事实核查表中的“来源/出处”一栏，必须包含具体的 URL 链接。"
+            except Exception as e:
+                print(f"Search step failed: {e}")
+
+        # --- Step 2: Final Summarization ---
+        prompt = (
+            f"你是一个专业的新闻分析师和事实核查专家。当前真实日期是：{current_date}。\n"
+            "请务必基于此日期进行时效性判断，不要使用你训练时的截止日期（如2023或2024）。\n"
+            "请分析以下视频字幕，生成一份包含两个部分的深度报告。\n"
+            f"{search_context}\n\n"
+            "【输出格式要求】\n"
+            "请严格输出为 JSON 格式，包含以下两个字段：\n"
+            "1. `summary_markdown`: 视频内容的**深度总结**（Markdown 格式，不少于 600 字）。\n"
+            "   - 包含：核心主题、详细摘要（分点阐述背景、经过、影响）、关键要点、金句、结论。\n"
+            "   - 请确保内容详实，拒绝空洞的概括。\n"
+            "2. `fact_check_markdown`: 对视频中提到的新闻事件进行真实性核查（Markdown 格式）。\n"
+            "   - 请以表格形式列出：\n"
+            "     | 新闻事件 | 真实性评估 | 来源/出处 | 备注 |\n"
+            "     | --- | --- | --- | --- |\n"
+            "     | (事件描述) | (真/假/存疑) | (必须基于提供的【实时搜索结果】或你的知识库提供具体来源 URL，如 `[BBC](https://...)`) | (简要分析) |\n"
+            "   - 注意：基于你截至目前的知识库和提供的搜索结果进行判断。\n"
+            "   - **重要：在“来源/出处”列，请尽量提供可访问的新闻链接。如果无法确认来源，请标注“需进一步核实”。**\n\n"
+            "**字幕内容输入：**\n"
+            f"{content}"
+        )
+        max_tokens = 3000
+        if content_len >= 14000:
+             prompt = (
+                f"你是一个专业的新闻分析师。当前日期是：{current_date}。\n"
+                "请对以下长视频字幕进行总结和事实核查。\n"
+                f"{search_context}\n\n"
+                "【输出格式要求】\n"
+                "请严格输出为 JSON 格式，包含两个字段：\n"
+                "1. `summary_markdown`: 快速总结（核心一句话、8-12条核心要点、结论，不少于 500 字）。\n"
+                "2. `fact_check_markdown`: 新闻事实核查表（Markdown 表格）。\n"
+                "   - 包含：新闻事件、真实性评估、来源（请务必提供 URL 链接）、备注。\n\n"
+                "**字幕内容输入：**\n"
+                f"{content}"
+            )
+             max_tokens = 2500
+        elif content_len >= 9000:
+            max_tokens = 2200
+        print(f"SummarizeText: content_len={content_len}, max_tokens={max_tokens}, model={(model or '').strip() or 'gpt-3.5-turbo'}")
+
+        response = client.chat.completions.create(
+            model=model.strip() or "gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "你是一个专业的视频内容总结与事实核查助手。请始终以 JSON 格式回复。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            stream=stream,
+        )
+        
+        if stream:
+            return response
+        
+        # 增加鲁棒性处理：某些情况下可能返回 JSON 字符串或字典
+        raw_resp = response
+        if isinstance(raw_resp, str):
+            if raw_resp.strip().lstrip().startswith("<"):
+                # 检测到 HTML 响应
+                return f"总结失败：返回了 HTML 内容而非 JSON。\n可能原因：\n1. Base URL 填写错误（填写了网页地址而非 API 地址）。\n2. 代理/网关拦截了请求并返回了错误页面。\n\n原始响应预览:\n{raw_resp[:500]}"
+            
+            try:
+                raw_resp = json.loads(raw_resp)
+            except Exception:
+                pass
+        
+        summary_data = {}
+        content_str = ""
+        
+        if isinstance(raw_resp, dict):
+            # 字典访问模式
+            choices = raw_resp.get("choices", [])
+            if choices and len(choices) > 0:
+                msg = choices[0].get("message", {})
+                content_str = msg.get("content", "")
+        else:
+            # 对象属性访问模式 (OpenAI v1 standard)
+            if hasattr(raw_resp, "choices") and len(raw_resp.choices) > 0:
+                content_str = raw_resp.choices[0].message.content
+        
+        if not content_str:
+             return f"总结失败：无法解析响应内容。\n原始响应: {str(response)[:500]}"
+
+        try:
+            summary_data = json.loads(content_str)
+            # 重新封装为 JSON 字符串返回，以便前端解析
+            return json.dumps(summary_data, ensure_ascii=False)
+        except json.JSONDecodeError:
+            # 如果 AI 没返回标准 JSON，尝试直接返回文本（兼容旧逻辑）
+            # 或者我们构造一个伪 JSON
+            return json.dumps({
+                "summary_markdown": content_str, 
+                "fact_check_markdown": "⚠️ AI 未能按照 JSON 格式返回事实核查结果，请查看左侧总结。"
+            }, ensure_ascii=False)
+
+    except Exception as e:
+        msg = str(e)
+        if "Model does not exist" in msg or "code': 20012" in msg:
+            msg += "\n\n提示：你使用的 Base URL 可能不支持该模型，请在下拉框选择正确的模型（如 deepseek-chat）或检查 API 文档。"
+        elif "Incorrect API key" in msg or "code': 401" in msg:
+             msg += "\n\n提示：API Key 错误，请检查是否填写正确。"
+        return f"总结失败：{msg}"
+
+
+def get_video_transcript(
+    api: YouTubeTranscriptApi,
+    video_id: str,
+    video_url: str,
+    languages: list[str] | None = None,
+) -> str:
+    asr_force_cpu = bool(getattr(api, "_asr_force_cpu", False))
+    # 1. 检查是否为 Bilibili 视频
+    # 如果是 Bilibili，直接使用 yt-dlp 或 whisper，跳过 YouTubeTranscriptApi
+    if "bilibili.com" in video_url or re.match(r"^BV[a-zA-Z0-9]{10}$", video_id):
+        proxy_url = str(getattr(api, "_effective_proxy", "") or "")
+        timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
+        retries = int(getattr(api, "_retries", 2) or 2)
+        cookies_file = str(getattr(api, "_cookies_file", "") or "")
+        cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
+        asr_enabled = bool(getattr(api, "_asr_enabled", False))
+        asr_model = str(getattr(api, "_asr_model", "") or "")
+        asr_language = str(getattr(api, "_asr_language", "") or "")
+        asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
+        langs = expand_languages(languages or ["zh-Hans", "zh", "en"]) # B站默认中文优先
+
+        # 尝试 yt-dlp 获取字幕 (B站可能有 CC 字幕)
+        try:
+            label, text = fetch_subtitles_with_ytdlp(
+                video_url,
+                preferred_langs=langs,
+                proxy_url=proxy_url,
+                timeout_seconds=timeout_seconds,
+                retries=retries,
+                cookies_file=cookies_file,
+                cookies_from_browser=cookies_from_browser,
+            )
+            if text and text.strip() and not is_html_like_text(text):
+                header = f"[bilibili-cc | {label}]"
+                return header + "\n\n" + text
+        except Exception:
+            pass
+        
+        # 尝试 Whisper 转写 (B站最常用)
+        if asr_enabled:
+            try:
+                status_cb = getattr(api, "_status_callback", None)
+                label, text = transcribe_video_audio_with_ytdlp(
+                    video_url=video_url,
+                    proxy_url=proxy_url,
+                    timeout_seconds=timeout_seconds,
+                    retries=retries,
+                    cookies_file=cookies_file,
+                    cookies_from_browser=cookies_from_browser,
+                    model_name=asr_model,
+                    language=asr_language,
+                    status_callback=status_cb,
+                    fast_mode=asr_fast_mode
+                )
+                return f"[bilibili-whisper | {label}]\n\n{text}"
+            except Exception as e:
+                raise RuntimeError(f"Bilibili 视频转写失败: {e}")
+        
+        raise RuntimeError("Bilibili 视频未找到字幕，且未启用音频转写 (Whisper)。")
+
+    # 2. YouTube 逻辑保持不变
+    langs = expand_languages(languages or ["en"])
+    asr_enabled = bool(getattr(api, "_asr_enabled", False))
+    asr_model = str(getattr(api, "_asr_model", "") or "")
+    asr_language = str(getattr(api, "_asr_language", "") or "")
+    asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
+    try:
+        transcript = api.fetch(video_id, languages=langs)
+        content = "\n".join([entry.text for entry in transcript])
+        if is_html_like_text(content):
+            raise RequestBlocked("返回 HTML 页面源码")
+        header = f"[{transcript.language_code} | {'自动' if transcript.is_generated else '人工'}] 片段数: {len(transcript)}"
+        return header + "\n\n" + content
+    except NoTranscriptFound:
+        transcript_list = api.list(video_id)
+        chosen = None
+        for t in transcript_list:
+            chosen = t
+            if not t.is_generated:
+                break
+        if chosen is None:
+            raise
+        transcript = chosen.fetch()
+        content = "\n".join([entry.text for entry in transcript])
+        if is_html_like_text(content):
+            raise RequestBlocked("返回 HTML 页面源码")
+        header = f"[{transcript.language_code} | {'自动' if transcript.is_generated else '人工'}] 片段数: {len(transcript)}（已忽略语言优先级：{','.join(langs)}）"
+        return header + "\n\n" + content
+    except (TranscriptsDisabled, PoTokenRequired, RequestBlocked, IpBlocked, requests.exceptions.RequestException) as e:
+        proxy_url = str(getattr(api, "_effective_proxy", "") or "")
+        timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
+        retries = int(getattr(api, "_retries", 2) or 2)
+        cookies_file = str(getattr(api, "_cookies_file", "") or "")
+        cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
+        try:
+            label, text = fetch_subtitles_with_ytdlp(
+                video_url,
+                preferred_langs=langs,
+                proxy_url=proxy_url,
+                timeout_seconds=timeout_seconds,
+                retries=retries,
+                cookies_file=cookies_file,
+                cookies_from_browser=cookies_from_browser,
+            )
+            if text and text.strip() and not is_html_like_text(text):
+                header = f"[yt-dlp | {label}]"
+                return header + "\n\n" + text
+        except Exception:
+            pass
+
+        if asr_enabled:
+            status_cb = getattr(api, "_status_callback", None)
+            # 传递强制CPU标志到内部函数
+            setattr(transcribe_video_audio_with_ytdlp, "_force_cpu", asr_force_cpu)
+            label, text = transcribe_video_audio_with_ytdlp(
+                video_url=video_url,
+                proxy_url=proxy_url,
+                timeout_seconds=timeout_seconds,
+                retries=retries,
+                cookies_file=cookies_file,
+                cookies_from_browser=cookies_from_browser,
+                model_name=asr_model,
+                language=asr_language,
+                status_callback=status_cb,
+                fast_mode=asr_fast_mode
+            )
+            return f"[asr | {label}]\n\n{text}"
+
+        raise e
+
+
+def list_available_transcripts(api: YouTubeTranscriptApi, video_id: str) -> str:
+    transcript_list = api.list(video_id)
+    rows = []
+    for t in transcript_list:
+        kind = "自动" if t.is_generated else "人工"
+        translatable = "可翻译" if t.is_translatable else "不可翻译"
+        rows.append(f"{t.language_code}\t{kind}\t{translatable}\t{t.language}")
+    if not rows:
+        return "未检测到任何字幕轨道。"
+    return "language_code\t类型\t翻译\t语言\n" + "\n".join(rows)
+
+
+def format_error(e: Exception) -> str:
+    raw_msg = strip_ansi(str(e))
+    if isinstance(e, (InvalidVideoId, ValueError)):
+        msg = "无法解析视频 ID，请检查链接或直接粘贴 11 位 ID。"
+    elif isinstance(e, TranscriptsDisabled):
+        msg = "该视频字幕被关闭或不可用。可换一个有字幕的视频，或后续接入“音频转写兜底”。"
+    elif isinstance(e, NoTranscriptFound):
+        msg = "没有匹配你设置语言优先级的字幕。可先点“检测字幕”查看可用语言代码。"
+    elif isinstance(e, (VideoUnavailable, VideoUnplayable)):
+        msg = "视频不可用/不可播放（可能地区限制、删除或需要登录）。"
+    elif isinstance(e, AgeRestricted):
+        msg = "年龄限制视频，可能需要登录或不同的抓取方式。"
+    elif isinstance(e, (IpBlocked, RequestBlocked)):
+        msg = "请求被 YouTube 限制/风控。建议更换网络、降低频率或配置代理。"
+    elif isinstance(e, PoTokenRequired):
+        msg = "YouTube 需要 PoToken，当前方式可能抓不到字幕。"
+    elif isinstance(e, requests.exceptions.ProxyError):
+        msg = "代理不可用，请检查代理地址格式与连通性。"
+    elif isinstance(e, requests.exceptions.ConnectTimeout):
+        msg = "连接超时，请增大超时或使用代理/可访问网络。"
+    elif isinstance(e, requests.exceptions.ChunkedEncodingError):
+        msg = "连接中途断流（常见于代理/链路不稳定）。建议增大超时、提高重试次数，或更换更稳定的代理。"
+    elif isinstance(e, requests.exceptions.ConnectionError):
+        msg = "网络连接失败（可能无法访问 YouTube）。可尝试代理或更换网络。"
+    elif isinstance(e, RuntimeError) and "yt-dlp" in str(e):
+        msg = str(e)
+    elif isinstance(e, RuntimeError) and "openai-whisper" in str(e):
+        msg = str(e)
+    elif isinstance(e, RuntimeError) and "音频转写失败" in str(e):
+        msg = str(e)
+    elif isinstance(e, KeyError) and "Linear" in raw_msg:
+        msg = "Whisper 模型加载失败 (KeyError: Linear)。可能是 PyTorch 版本不兼容或模型文件损坏。建议尝试删除缓存的模型文件或重装 openai-whisper。"
+    elif isinstance(e, FileNotFoundError) and ("ffmpeg" in raw_msg.lower() or "winerror 2" in raw_msg.lower()):
+        msg = "未安装 ffmpeg（或未加入 PATH），无法进行音频转写。请先安装 ffmpeg 后重试。"
+    elif ("could not copy" in raw_msg.lower() and "cookie" in raw_msg.lower()) or ("cookie database" in raw_msg.lower()) or ("could not find" in raw_msg.lower() and "cookies" in raw_msg.lower()):
+        msg = "无法读取浏览器 Cookies（数据库被占用/无权限，或未找到对应浏览器的 Cookie 数据库）。建议关闭浏览器后重试，或切换可用浏览器/关闭自动读取 Cookies。"
+    elif "HTTP Error 429" in raw_msg or "too many 429" in raw_msg.lower() or "429" in raw_msg:
+        msg = "触发 YouTube 429 限流/风控。建议降低频率并等待一段时间，或使用更稳定的代理；也可启用“自动读取浏览器 Cookies”。"
+    else:
+        msg = str(e) or e.__class__.__name__
+
+    msg = strip_ansi(msg)
+    return f"失败原因：{msg}\n\n异常类型：{e.__class__.__name__}\n\n原始错误：{strip_ansi(repr(e))}"
+
+
+def get_transcript_from_input(url_or_id: str, languages_csv: str) -> tuple[str, str, str]:
+    video_url = normalize_video_url(url_or_id)
+    video_id = extract_video_id(video_url)
+    languages = [s.strip() for s in (languages_csv or "").split(",") if s.strip()]
+    return video_id, video_url, ",".join(languages or ["zh-Hans", "zh", "en"])
+
+
+
+
+
+def search_channels(
+    keyword: str,
+    limit: int = 3,
+    proxy_url: str = "",
+    timeout_seconds: float = 10.0
+) -> dict:
+    """
+    搜索 YouTube 和 Bilibili 频道
+    返回:
+    {
+        "youtube": [
+            {"id": "...", "name": "...", "url": "...", "avatar": "...", "desc": "...", "platform": "youtube"},
+            ...
+        ],
+        "bilibili": [
+            {"id": "...", "name": "...", "url": "...", "avatar": "...", "desc": "...", "platform": "bilibili"},
+            ...
+        ]
+    }
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+    
+    results = {"youtube": [], "bilibili": []}
+    
+    def _search_bilibili():
+        try:
+            # Bilibili User Search API
+            api_url = "https://api.bilibili.com/x/web-interface/search/type"
+            params = {
+                "search_type": "bili_user",
+                "keyword": keyword,
+            }
+            # Encode keyword for referer
+            import urllib.parse
+            encoded_kw = urllib.parse.quote(keyword)
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": f"https://search.bilibili.com/upuser?keyword={encoded_kw}",
+                "Cookie": "buvid3=infoc;" # 简单的伪造 cookie 可能有助于绕过 412
+            }
+            
+            # 使用 Session
+            s = requests.Session()
+            resp = s.get(api_url, params=params, headers=headers, timeout=timeout_seconds)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if data.get("code") == 0:
+                items = data.get("data", {}).get("result")
+                if not items: return
+                
+                for item in items[:limit]:
+                    # Bilibili user item: mid, uname, upic, usign
+                    mid = str(item.get("mid"))
+                    avatar = item.get("upic", "")
+                    if avatar.startswith("//"):
+                        avatar = "https:" + avatar
+                        
+                    results["bilibili"].append({
+                        "id": mid,
+                        "name": item.get("uname"),
+                        "url": f"https://space.bilibili.com/{mid}",
+                        "avatar": avatar,
+                        "desc": item.get("usign", "")[:50] + "..." if item.get("usign") else "",
+                        "platform": "bilibili"
+                    })
+        except Exception as e:
+            print(f"Bilibili search failed: {e}")
+            pass
+
+    def _search_youtube():
+        try:
+            # YouTube Search via yt-dlp
+            from yt_dlp import YoutubeDL
+            
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": True,
+                "nocheckcertificate": True,
+                "ignoreerrors": True,
+                "socket_timeout": timeout_seconds,
+            }
+            if proxy_url:
+                opts["proxy"] = proxy_url
+            
+            # 搜索稍微多一点，以便去重
+            search_query = f"ytsearch{limit*2}:{keyword}"
+            
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+                if not info: return
+                
+                entries = info.get("entries", [])
+                seen_channels = set()
+                
+                for e in entries:
+                    if not e: continue
+                    c_id = e.get("channel_id") or e.get("uploader_id")
+                    if not c_id: continue
+                    
+                    if c_id in seen_channels: continue
+                    seen_channels.add(c_id)
+                    
+                    c_name = e.get("channel") or e.get("uploader")
+                    c_url = e.get("channel_url") or f"https://www.youtube.com/channel/{c_id}"
+                    
+                    # 尝试获取头像 (fix: flat 模式无头像，需单独获取)
+                    avatar_url = ""
+                    try:
+                        # 复用 get_channel_info 获取头像
+                        # 注意：这会增加耗时，但为了头像显示是必要的
+                        _, _, _, avatar_url = get_channel_info(
+                           c_url, proxy_url, timeout_seconds=5.0
+                        )
+                    except:
+                        pass
+                    
+                    results["youtube"].append({
+                        "id": c_id,
+                        "name": c_name,
+                        "url": c_url,
+                        "avatar": avatar_url,
+                        "desc": "",
+                        "platform": "youtube"
+                    })
+                    
+                    if len(results["youtube"]) >= limit:
+                        break
+                        
+        except Exception as e:
+            # print(f"YouTube search failed: {e}")
+            pass
+
+    # 并发执行
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        executor.submit(_search_bilibili)
+        executor.submit(_search_youtube)
+        
+    return results
+
+
+def get_channel_info(
+    channel_url: str,
+    proxy_url: str,
+    timeout_seconds: float = 20.0,
+    retries: int = 2,
+    cookies_file: str = "",
+    cookies_from_browser: str = "",
+) -> tuple[str, str, str, str]:
+    """
+    获取频道信息
+    返回: (channel_id, channel_name, canonical_url, avatar_url)
+    """
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        raise RuntimeError("未安装 yt-dlp")
+
+    last_err: Exception | None = None
+    
+    # 尝试标准化 URL
+    original_input = channel_url.strip()
+    url_candidates = []
+
+    if original_input.startswith("http"):
+        url_candidates.append(original_input)
+    elif original_input.startswith("@"):
+        url_candidates.append(f"https://www.youtube.com/{original_input}")
+    elif re.match(r"^BV[a-zA-Z0-9]{10}$", original_input):
+        # Bilibili BV ID
+        pass
+    elif re.match(r"^\d+$", original_input):
+        # 纯数字可能是 Bilibili UID
+        url_candidates.append(f"https://space.bilibili.com/{original_input}")
+    else:
+        # 1. 假设是 channel ID
+        if re.fullmatch(r"UC[a-zA-Z0-9_-]{22}", original_input):
+            url_candidates.append(f"https://www.youtube.com/channel/{original_input}")
+        # 2. 尝试 ytsearch
+        url_candidates.append(f"ytsearch1:{original_input}")
+
+    # Bilibili API fallback
+    # 如果 URL 是 B站空间链接，直接解析 mid 并调用 API
+    # 避免 yt-dlp 412 错误
+    bili_mid = None
+    if "bilibili.com" in original_input:
+        import re
+        # 匹配 space.bilibili.com/123456
+        m = re.search(r"space\.bilibili\.com/(\d+)", original_input)
+        if m:
+            bili_mid = m.group(1)
+        
+    if bili_mid:
+        try:
+            import requests
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": f"https://space.bilibili.com/{bili_mid}",
+            }
+            api_url = f"https://api.bilibili.com/x/space/acc/info?mid={bili_mid}"
+            resp = requests.get(api_url, headers=headers, timeout=timeout_seconds)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    info_data = data.get("data", {})
+                    c_id = str(info_data.get("mid"))
+                    c_name = info_data.get("name")
+                    c_avatar = info_data.get("face", "")
+                    if c_avatar.startswith("//"):
+                        c_avatar = "https:" + c_avatar
+                    # 强制 B站图片使用 https
+                    if "hdslb.com" in c_avatar and c_avatar.startswith("http://"):
+                        c_avatar = c_avatar.replace("http://", "https://")
+                        
+                    c_url = f"https://space.bilibili.com/{c_id}"
+                    
+                    return str(c_id), str(c_name), str(c_url), str(c_avatar), "bilibili"
+        except Exception:
+            pass # Fallback to yt-dlp if API fails
+    
+    # 强制 B站 API 请求带上 Cookie
+    # 如果上面简单的 requests 失败了 (可能因为没有 cookie)，
+    # 这里我们不需要做什么，因为下面会进入 yt-dlp 流程。
+    # 但 yt-dlp 也会失败 (412)。
+    # 所以我们需要确保上面的 API 请求能成功。
+    if bili_mid:
+         try:
+             import requests
+             # 使用 Session 并伪造更完整的 Header
+             s = requests.Session()
+             headers = {
+                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                 "Referer": f"https://space.bilibili.com/{bili_mid}",
+                 "Cookie": "buvid3=infoc;" # 尝试添加 cookie
+             }
+             api_url = f"https://api.bilibili.com/x/space/acc/info?mid={bili_mid}"
+             resp = s.get(api_url, headers=headers, timeout=timeout_seconds)
+             if resp.status_code == 200:
+                 data = resp.json()
+                 if data.get("code") == 0:
+                     info_data = data.get("data", {})
+                     c_id = str(info_data.get("mid"))
+                     c_name = info_data.get("name")
+                     c_avatar = info_data.get("face", "")
+                     if c_avatar.startswith("//"):
+                         c_avatar = "https:" + c_avatar
+                     c_url = f"https://space.bilibili.com/{c_id}"
+                     return str(c_id), str(c_name), str(c_url), str(c_avatar), "bilibili"
+         except Exception:
+             pass
+
+    for attempt in range(max(1, int(retries))):
+        for candidate_url in url_candidates:
+            for cookiefile, cfb in CookieManager.get_sources(cookies_file, cookies_from_browser, False):
+                opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "extract_flat": True,
+                    "playlistend": 1, # 我们只需要频道元数据
+                    "socket_timeout": float(timeout_seconds),
+                    "nocheckcertificate": True,
+                    "ignoreerrors": True, # 忽略错误，以便尝试下一个候选
+                }
+                if proxy_url:
+                    opts["proxy"] = proxy_url
+                if cookiefile:
+                    opts["cookiefile"] = cookiefile
+                elif cfb:
+                    opts["cookiesfrombrowser"] = (cfb,)
+
+                with YoutubeDL(opts) as ydl:
+                    try:
+                        info = ydl.extract_info(candidate_url, download=False)
+                        if not info:
+                            continue
+                        
+                        # 如果是搜索结果，info['entries'] 会包含视频列表
+                        if "entries" in info:
+                            entries = info.get("entries", [])
+                            if not entries:
+                                continue
+                            # 取第一个视频的信息
+                            info = entries[0]
+                        
+                        # 尝试提取信息
+                        c_id = info.get("channel_id") or info.get("uploader_id")
+                        c_name = info.get("channel") or info.get("uploader") or info.get("title")
+                        c_url = info.get("channel_url") or info.get("uploader_url")
+                        
+                        # 尝试提取头像
+                        c_avatar = ""
+
+                        # 确定平台
+                        platform = "youtube"
+                        if "bilibili.com" in candidate_url or "space.bilibili.com" in str(c_url):
+                            platform = "bilibili"
+                        
+                        # 优先从 thumbnails 提取
+                        thumbnails = info.get("thumbnails")
+                        if thumbnails:
+                            # 1. 尝试找 B站特有的 face 字段 (yt-dlp 可能会映射到 thumbnail 列表)
+                            # 或者找 id 为 avatar_uncropped
+                            for t in thumbnails:
+                                if t.get("id") == "avatar_uncropped":
+                                    c_avatar = t.get("url")
+                                    break
+
+                            # 2. 如果是 YouTube，优先找 ggpht.com 的图片 (这是频道头像)，避开 ytimg.com (这是视频封面)
+                            if not c_avatar and platform == "youtube":
+                                for t in thumbnails:
+                                    u = t.get("url", "")
+                                    if "ggpht.com" in u:
+                                        c_avatar = u
+                                        break
+                            
+                            # 3. 如果是 Bilibili，尝试从 entries[0] 获取 uploader_id 
+                            # 然后构造 API 请求或从视频 info 中找头像 (yt-dlp 对 B站频道页解析的 thumbnails 往往是视频封面而非头像)
+                            if not c_avatar and ("bilibili.com" in candidate_url or "space.bilibili.com" in str(c_url)):
+                                # B站频道解析时，thumbnails 往往是视频封面，而不是头像
+                                # 尝试从 entries 中获取第一个视频的 uploader 信息，有时候会有头像
+                                if "entries" in info:
+                                    entries = info.get("entries", [])
+                                    if entries:
+                                        first_entry = entries[0]
+                                        # 尝试直接请求 API 获取头像 (需要 uploader_id)
+                                        # 但这里为了简单，我们先看 first_entry 是否有 owner_thumbnail
+                                        # yt-dlp 对 B站视频通常不返回 owner_thumbnail
+                                        pass
+                                
+                                # B站兜底：如果实在找不到，尝试用 requests 请求 B站 API
+                                # https://api.bilibili.com/x/space/acc/info?mid={mid}
+                                # 需要 mid
+                                if not c_avatar and c_id and c_id.isdigit():
+                                    try:
+                                        import requests
+                                        # 简单的 API 请求，不带 cookie 可能会失败，但值得一试
+                                        headers = {"User-Agent": "Mozilla/5.0"}
+                                        r = requests.get(f"https://api.bilibili.com/x/space/acc/info?mid={c_id}", headers=headers, timeout=5)
+                                        if r.status_code == 200:
+                                            j = r.json()
+                                            if j.get("code") == 0:
+                                                c_avatar = j.get("data", {}).get("face", "")
+                                    except:
+                                        pass
+
+                            # 4. 常规逻辑：找正方形图片
+                            if not c_avatar:
+                                for t in thumbnails:
+                                    w = t.get("width")
+                                    h = t.get("height")
+                                    if w and h and w == h:
+                                        # 再次检查：如果是 YouTube，排除 ytimg
+                                        if platform == "youtube" and "ytimg.com" in t.get("url", ""):
+                                            continue
+                                        c_avatar = t.get("url")
+                                        break
+                            
+                            # 5. 兜底：取最后一个 (通常是最大的)
+                            if not c_avatar and len(thumbnails) > 0:
+                                # 如果是 YouTube，尽量不要取 ytimg
+                                candidate = thumbnails[-1].get("url")
+                                if platform == "youtube" and "ytimg.com" in candidate:
+                                    # 尝试往前找一个不是 ytimg 的
+                                    for t in reversed(thumbnails):
+                                        if "ytimg.com" not in t.get("url", ""):
+                                            c_avatar = t.get("url")
+                                            break
+                                else:
+                                    c_avatar = candidate
+
+                        if c_id and c_name:
+                            # 规范化 channel url (优先用 handle url 或 channel id url)
+                            if not c_url:
+                                if "youtube.com" in candidate_url:
+                                    c_url = f"https://www.youtube.com/channel/{c_id}"
+                                elif "bilibili.com" in candidate_url:
+                                    c_url = f"https://space.bilibili.com/{c_id}"
+                                else:
+                                    c_url = candidate_url # Fallback
+                            
+                            return str(c_id), str(c_name), str(c_url), str(c_avatar or ""), platform
+                            
+                    except Exception as e:
+                        last_err = e
+                        continue
+            
+            # 如果当前 candidate 成功返回了，上面就 return 了
+            # 如果失败了，继续下一个 candidate (例如先试 channel id 失败，再试搜索)
+    
+    if last_err:
+        raise RuntimeError(strip_ansi(str(last_err)))
+    raise RuntimeError(f"无法找到频道信息: {original_input}")
+
+
+
+
+def get_channel_recent_videos(
+    channel_url: str,
+    limit: int = 5,
+    proxy_url: str = "",
+    timeout_seconds: float = 20.0,
+    retries: int = 2,
+    cookies_file: str = "",
+    cookies_from_browser: str = "",
+    filter_longest: bool = False,
+    min_duration_seconds: int = 0,
+    only_streams: bool = False,
+) -> list[dict]:
+    """
+    获取频道最新视频，支持混合扫描 /videos 和 /streams 以确保不错过长直播回放。
+    
+    filter_longest: 如果为 True，将采用"混合提取"策略：
+      1. 快速扫描 /videos 和 /streams 获取候选列表
+      2. 对前 15 个候选视频进行详细抓取(获取准确时长和日期)
+      3. 在最近发布的 6 个视频中选择时长最长的一个
+    
+    min_duration_seconds: 最小时长限制（秒），用于过滤短视频。
+    
+    only_streams: 如果为 True，仅扫描 /streams 页面（针对直播回放为主的频道）。
+    
+    返回: list of {id, title, url, upload_date, duration}
+    """
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        raise RuntimeError("未安装 yt-dlp")
+
+    from datetime import datetime
+
+    base_url = channel_url.strip().rstrip("/")
+    # 构造待扫描的 tab 列表
+    # 如果是 Bilibili，直接扫描主页 (yt-dlp 会自动处理)
+    if "bilibili.com" in base_url:
+        targets = [base_url]
+    else:
+        # YouTube 逻辑
+        # 初始化 targets 列表
+        targets = []
+        
+        if only_streams:
+            # 强制仅扫描直播回放页面
+            targets.append(base_url + "/streams")
+        # 如果明确指定了 tab，就只扫那个；否则扫 videos 和 streams
+        elif any(x in base_url for x in ["/videos", "/shorts", "/streams", "/live", "/featured"]):
+            targets.append(base_url)
+        else:
+            targets.append(base_url + "/videos")
+            targets.append(base_url + "/streams")
+
+    candidates_map = {}  # id -> item
+
+    for attempt in range(max(1, int(retries))):
+        for cookiefile, cfb in CookieManager.get_sources(cookies_file, cookies_from_browser, False):
+            # 第一步：快速扫描 (extract_flat=True)
+            for target_url in targets:
+                opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "extract_flat": True,
+                    "playlistend": 15,  # 扩大扫描范围到前 15 个，确保即便有一堆 Shorts 也能扫到正片
+                    "socket_timeout": float(timeout_seconds),
+                    "nocheckcertificate": True,
+                    "ignoreerrors": True,
+                }
+                if proxy_url:
+                    opts["proxy"] = proxy_url
+                if cookiefile:
+                    opts["cookiefile"] = cookiefile
+                elif cfb:
+                    opts["cookiesfrombrowser"] = (cfb,)
+
+                with YoutubeDL(opts) as ydl:
+                    try:
+                        info = ydl.extract_info(target_url, download=False)
+                        if not info:
+                            continue
+                        
+                        entries = info.get("entries", [])
+                        for e in entries:
+                            if not e: continue
+                            v_id = e.get("id")
+                            if not v_id: continue
+                            
+                            # 记录基础信息
+                            if v_id not in candidates_map:
+                                candidates_map[v_id] = {
+                                    "id": v_id,
+                                    "title": e.get("title", "无标题"),
+                                    "url": e.get("url") or f"https://www.youtube.com/watch?v={v_id}",
+                                    # flat 模式下 upload_date 可能不准或缺失
+                                    "upload_date": e.get("upload_date"), 
+                                    "duration": e.get("duration") or 0,
+                                }
+                    except Exception:
+                        pass
+            
+            if candidates_map:
+                break
+        if candidates_map:
+            break
+
+    if not candidates_map:
+        return []
+
+    # 转为列表
+    all_candidates = list(candidates_map.values())
+
+    # 如果不需要过滤长视频，直接尽量按原有信息排序返回
+    if not filter_longest:
+        return all_candidates[:limit]
+
+    # === filter_longest 混合模式逻辑 ===
+    # 优化：如果 all_candidates 中已经有 duration 和 upload_date，则不需要 fetch_detail
+    # 只有当 duration 为 0/None 或者需要精确过滤时才 fetch_detail
+    
+    # 预过滤：如果 flat 模式已经拿到了时长，且明显小于阈值，直接排除
+    # 这样可以避免对 Shorts 发起无意义的 detail 请求，大幅提升速度
+    threshold_duration = min_duration_seconds if min_duration_seconds > 0 else 180
+    
+    check_list = []
+    for item in all_candidates:
+        flat_dur = item.get("duration")
+        # 如果时长已知且小于阈值，直接跳过 (Shorts 过滤)
+        if flat_dur and flat_dur > 0 and flat_dur < threshold_duration:
+            continue
+        check_list.append(item)
+
+    detailed_results = []
+    
+    # 需要 fetch 的列表
+    need_fetch = []
+    # 已经可以直接用的列表
+    ready_results = []
+    
+    for item in check_list:
+        # 如果是 YouTube，flat 模式通常有 duration
+        # 但 upload_date 有时是 None 或者 'NA'
+        # 如果 duration > 0 且有 upload_date，直接用
+        
+        has_dur = item.get("duration") and item.get("duration") > 0
+        has_date = item.get("upload_date")
+        
+        # 如果有了 duration 和 date，直接复用，不重新抓取
+        if has_dur and has_date:
+            ready_results.append(item)
+        else:
+            need_fetch.append(item)
+            
+    # 如果所有都需要 fetch，或者需要更精确的信息
+    # 为了保险起见，如果 need_fetch 很多，我们只取前 10 个去 fetch
+    if need_fetch:
+        need_fetch = need_fetch[:10]
+
+    def fetch_detail_item(item, proxy_url_val):
+        try:
+            # 缩短单个视频的超时时间，因为如果太慢通常是网络问题
+            local_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": False,
+                "socket_timeout": 5, # 再次缩短超时到 5s
+                "nocheckcertificate": True,
+                "ignoreerrors": True,
+            }
+            if proxy_url_val:
+                local_opts["proxy"] = proxy_url_val
+                
+            with YoutubeDL(local_opts) as ydl:
+                info = ydl.extract_info(item["url"], download=False)
+                if info:
+                    return {
+                        "id": info.get("id"),
+                        "title": info.get("title"),
+                        "url": info.get("webpage_url") or item["url"],
+                        "upload_date": info.get("upload_date"),
+                        "duration": info.get("duration") or 0,
+                    }
+        except Exception:
+            pass
+        # 失败则返回原始数据
+        return item
+
+    if need_fetch:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 限制并发数，避免瞬间太多请求
+        # 提高内部并发数到 10，加快单个频道的处理速度
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_detail_item, item, proxy_url) for item in need_fetch]
+            for future in as_completed(futures):
+                res = future.result()
+                detailed_results.append(res)
+    
+    # 合并结果
+    detailed_results.extend(ready_results)
+            
+    # 过滤掉获取不到日期的（极少情况）
+    valid_results = [x for x in detailed_results if x.get("upload_date")]
+
+    # 基础时长过滤：默认 180s (3分钟)，如果指定了 min_duration_seconds 则使用指定值
+    # 这一步更严格地排除掉 Shorts/剪辑片段/预告片等干扰项，只保留正片
+    threshold_duration = min_duration_seconds if min_duration_seconds > 0 else 180
+    valid_results = [x for x in valid_results if x.get("duration", 0) >= threshold_duration]
+
+    # 按日期降序排序 (最新的在前)
+    # 注意：yt-dlp 返回的日期格式是 YYYYMMDD，字符串比较即可
+    valid_results.sort(key=lambda x: x["upload_date"], reverse=True)
+
+    if not valid_results:
+        # 如果过滤完没视频了，尝试放宽标准找一个最长的，避免完全空
+        # 比如有些正片可能只有 2 分钟，或者全是短片时至少给一个
+        detailed_results.sort(key=lambda x: x.get("duration", 0), reverse=True)
+        if detailed_results:
+             return [detailed_results[0]]
+        return []
+
+    # 获取今天的日期字符串
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y%m%d")
+
+    # 逻辑回退到"简单而健壮"的版本，但增加 scan 深度。
+    # 用户反馈之前的版本更好，说明复杂的"今天/昨天"逻辑可能有误判（特别是跨时区时）。
+    # 最朴素的需求：
+    # 1. 必须是"最近"发布的。
+    # 2. 尽量是"正片"（长视频）。
+    
+    # 我们已经有了 valid_results，它是按 upload_date 降序排列的。
+    # 并且已经过滤掉了 < 3分钟的短片。
+    
+    # 直接取前 3 个。
+    # 为什么这样是对的？
+    # 1. 如果今天发了 3 个视频，都是长视频 -> 取前3个 -> 正确。
+    # 2. 如果今天发了 1 个长视频，昨天发了 2 个 -> 取前3个 -> 正确（包含了最新的）。
+    # 3. 如果今天没发，昨天发了 1 个 -> 取前3个 -> 正确（包含了最新的）。
+    
+    # 唯一的问题：如果今天发了 5 个视频，前 3 个是短评(5min)，第 4 个是正片(30min)。
+    # 按时间排序会取前 3 个短评，漏掉正片。
+    # 但用户同时也抱怨"不是最新时间的"。
+    # 这说明"时间"的优先级 > "时长"。
+    # 如果为了找长视频而去取旧视频，用户会不满意。
+    
+    # 折中方案：
+    # 在最近的 N 个（比如 5 个）候选视频中，优先展示。
+    # 如果我们直接返回前 3 个，这是最符合"Timeline"逻辑的。
+    # 用户说"还不如之前的"，之前的逻辑其实是"取最近10个 -> 加权打分 -> 取1个"。
+    # 现在用户要"取3个"。
+    
+    # 让我们尝试最直观的逻辑：
+    # 返回【最近发布的】且【时长合格】的视频，最多 3 个。
+    # 不做任何额外的日期分组或时长重排序，完全信任时间轴。
+    
+    return valid_results[:3]
+
+
+def check_network(proxy_url: str, timeout: float = 5.0) -> str | None:
+    try:
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        
+        def _do_check(verify: bool) -> None:
+            s = requests.Session()
+            s.trust_env = False
+            if proxies:
+                s.proxies.update(proxies)
+            # 先试 Google
+            try:
+                r = s.get("https://www.google.com", timeout=timeout, stream=True, verify=verify)
+                r.close()
+                return
+            except Exception:
+                pass
+            # 再试 YouTube
+            r = s.get("https://www.youtube.com", timeout=timeout, stream=True, verify=verify)
+            r.close()
+
+        try:
+            _do_check(verify=True)
+            return None
+        except Exception as e1:
+            # 如果第一次失败，尝试关闭 SSL 验证（针对某些中间人代理）
+            try:
+                _do_check(verify=False)
+                return None
+            except Exception:
+                # 如果还是失败，返回第一次的错误
+                return f"{e1.__class__.__name__}: {e1}"
+    except Exception as e:
+        return f"{e.__class__.__name__}: {e}"

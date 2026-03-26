@@ -1,0 +1,50 @@
+            r"unable to extract.*cookie",
+        ]
+        return any(re.search(p, s) for p in patterns)
+
+    @staticmethod
+    def get_fatal_msg(err_msg: str, browser: str) -> str:
+        """生成统一且带有具体指引的致命 Cookie 错误信息"""
+        browser_name = browser or "浏览器"
+        details = strip_ansi(err_msg).replace("ERROR: ", "").strip()
+        d_lower = details.lower()
+        
+        # 1. 针对新版 Chromium 的解密限制 (DPAPI)
+        if "dpapi" in d_lower:
+            return (
+                f"❌ 浏览器 Cookie 解密失败 (DPAPI Error)。\n"
+                f"原因：{browser_name} (新版基于 Chromium 127+) 引入了增强加密，外部程序已无法直接解密 Cookie。\n\n"
+                f"💡 解决方法：\n"
+                f"1. **使用 Firefox**：Firefox 暂不受此限制影响，请在 Firefox 中登录 YouTube 后，在设置中将浏览器改为 firefox (或 auto)。\n"
+                f"2. **手动导出 Cookie**：安装浏览器插件（如 'Get cookies.txt LOCALLY'）导出 cookies.txt，并在设置中提供文件路径。\n\n"
+                f"原始细节: {details}"
+            )
+            
+        # 2. 针对数据库锁定/无法复制 (常见于浏览器未彻底关闭)
+        # 匹配 "could not copy", "database is locked", "used by another process", "WinError 32" 等
+          @staticmethod
+    def get_sources(cookies_file: str, cookies_from_browser: str, force_browser_cookie: bool = False) -> list[tuple[str, str]]:
+        """返回 (cookiefile, browser) 元组列表，支持智能回退"""
+        file_path = (cookies_file or "").strip()
+        browser_name = (cookies_from_browser or "").strip().lower()
+        
+        if file_path and os.path.exists(file_path):
+            return [(file_path, "")]
+            
+        sources = []
+        if not force_browser_cookie:
+            sources.append(("", "")) # 仅在非强制模式下尝试无 Cookie
+        
+        # 确定浏览器候选列表
+        candidates = []
+        if browser_name and browser_name != "auto":
+            candidates = [browser_name]
+            # 后备方案：如果显式指定了容易受限的 Chromium，则将 firefox 作为最后保单
+            if browser_name in ["chrome", "edge", "brave", "chromium"] and "firefox" not in candidates:
+                candidates.append("firefox")
+        else:
+            # 自动模式或默认：Firefox 优先级最高（最稳），其次是主流 Chromium
+            candidates = ["firefox", "edge", "chrome", "brave", "chromium"]
+
+        for b in candidates:
+            if CookieManager.is_browser_available(b):
