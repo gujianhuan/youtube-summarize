@@ -1,2 +1,7 @@
+streamlit
+requests
 youtube-transcript-api
 yt-dlp
+imageio-ffmpeg
+openai
+duckduckgo-search
