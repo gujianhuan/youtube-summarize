@@ -1091,7 +1091,7 @@ with tab_single:
         if not url:
             st.warning("请输入视频链接")
         else:
-            task_id = submit_task(url, model_selected, proxy_input, use_system_proxy, api_key, base_url, settings)
+            task_id = submit_task(url, model_selected, proxy_input, use_system_proxy, api_key, base_url)
             st.session_state.bg_task_id = task_id
             st.rerun()
 
