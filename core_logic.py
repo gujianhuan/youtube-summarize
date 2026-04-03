@@ -21,36 +21,43 @@ try:
 except ImportError:
     DDGS = None
 
-# 自动配置 ffmpeg 环境 (从 imageio-ffmpeg 获取)
-ffmpeg_binary_path = None
-try:
-    import imageio_ffmpeg
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    if ffmpeg_path:
+def _configure_ffmpeg_path() -> str | None:
+    """跨平台注册 imageio-ffmpeg 提供的二进制，兼容 Windows 和 Linux 部署环境。"""
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if not ffmpeg_path:
+            return None
+
         ffmpeg_dir = os.path.dirname(ffmpeg_path)
-        # imageio-ffmpeg 的可执行文件可能带版本号（如 ffmpeg-win-x86_64-v7.1.exe）
-        # whisper/yt-dlp 默认调用 'ffmpeg'，所以必须确保目录下有 ffmpeg.exe
-        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+        ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        target_ffmpeg = os.path.join(ffmpeg_dir, ffmpeg_name)
+
         if not os.path.exists(target_ffmpeg):
             try:
-                print(f"Copying ffmpeg to {target_ffmpeg}...")
                 shutil.copy2(ffmpeg_path, target_ffmpeg)
+                if os.name != "nt":
+                    os.chmod(target_ffmpeg, 0o755)
             except Exception as e:
-                print(f"Failed to copy ffmpeg: {e}")
-        
-        if os.path.exists(target_ffmpeg):
-            ffmpeg_binary_path = ffmpeg_dir # yt-dlp needs the directory or executable? 
-            # yt-dlp "ffmpeg_location" accepts path to binary or directory.
-            # Let's use the directory if it contains ffmpeg.exe
-            ffmpeg_binary_path = ffmpeg_dir
+                print(f"Failed to create ffmpeg alias {target_ffmpeg}: {e}")
 
         if ffmpeg_dir not in os.environ.get("PATH", ""):
             os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
             print(f"Added ffmpeg to PATH: {ffmpeg_dir}")
-except ImportError:
-    print("imageio-ffmpeg not found. Assuming ffmpeg is in PATH.")
-except Exception as e:
-    print(f"Failed to auto-configure ffmpeg: {e}")
+
+        # 直接返回可执行文件路径，避免 Linux 环境误用 ffmpeg.exe 导致 yt-dlp 识别失败。
+        return ffmpeg_path
+    except ImportError:
+        print("imageio-ffmpeg not found. Assuming ffmpeg is in PATH.")
+        return None
+    except Exception as e:
+        print(f"Failed to auto-configure ffmpeg: {e}")
+        return None
+
+
+# 自动配置 ffmpeg 环境 (从 imageio-ffmpeg 获取)
+ffmpeg_binary_path = _configure_ffmpeg_path()
 
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
@@ -67,24 +74,9 @@ from youtube_transcript_api._errors import (
     VideoUnplayable,
 )
 
-# 自动配置 ffmpeg 和 nodejs 环境
+# 自动配置 nodejs 环境
 try:
-    import imageio_ffmpeg
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    if ffmpeg_path:
-        ffmpeg_dir = os.path.dirname(ffmpeg_path)
-        # imageio-ffmpeg 的可执行文件可能带版本号（如 ffmpeg-win-x86_64-v7.1.exe）
-        # whisper 默认调用 'ffmpeg'，所以必须确保目录下有 ffmpeg.exe
-        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
-        if not os.path.exists(target_ffmpeg):
-            print(f"正在创建 ffmpeg.exe 副本: {target_ffmpeg}")
-            shutil.copy2(ffmpeg_path, target_ffmpeg)
-        
-        if ffmpeg_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-            print(f"已自动添加 ffmpeg 到 PATH: {ffmpeg_dir}")
-
-    # 自动检测并添加 node.exe 到 PATH (用于 yt-dlp web 客户端解密)
+    # 自动检测并添加 node.exe 到 PATH (仅本地 Windows 调试时可能用到)
     possible_node_paths = [
         r"d:\Program Files",
         r"D:\Program Files",
@@ -2298,9 +2290,11 @@ def transcribe_video_audio_with_ytdlp(
                     pass
 
                 candidates = []
-                for p in Path(tmp).glob("*"):
+                temp_outputs = []
+                for p in Path(tmp).rglob("*"):
                     if not p.is_file():
                         continue
+                    temp_outputs.append(f"{p.name} ({p.stat().st_size} bytes)")
                     ext = p.suffix.lower()
                     if ext in {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg"}:
                         candidates.append(p)
@@ -2323,6 +2317,8 @@ def transcribe_video_audio_with_ytdlp(
                                 break
                         tail = "\n".join(debug_tail)
                         detail_lines.append("调试日志(尾部):\n" + tail)
+                    if temp_outputs:
+                        detail_lines.append("临时目录文件:\n" + "\n".join(temp_outputs[:12]))
                     detail_text = "\n".join(detail_lines)
                     if last_err and str(last_err).strip().startswith("未下载到音频文件"):
                         pass
