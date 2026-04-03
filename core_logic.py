@@ -613,28 +613,7 @@ def fetch_subtitles_with_ytdlp(
             "未安装 yt-dlp，无法启用兜底抓取。可执行：python -m pip install yt-dlp -i https://pypi.tuna.tsinghua.edu.cn/simple"
         ) from e
 
-    def detect_js_runtime() -> tuple[str, str | None]:
-        try:
-            import shutil
-            deno = shutil.which("deno")
-            node = shutil.which("node")
-            bun = shutil.which("bun")
-            qjs = shutil.which("qjs")
-            if deno:
-                return "deno", deno
-            if node:
-                return "node", node
-            if bun:
-                return "bun", bun
-            if qjs:
-                return "quickjs", qjs
-            return "", None
-        except Exception:
-            return "", None
-
-    runtime_name, runtime_path = detect_js_runtime()
-    has_js_runtime = bool(runtime_name)
-    allow_web_client = has_js_runtime and runtime_name in {"deno", "bun", "node"}
+    # 移除 detect_js_runtime 的定义，改用 yt-dlp 原生解释器或 yt_dlp_ejs
     langs = preferred_langs[:] if preferred_langs else []
     with tempfile.TemporaryDirectory() as tmp:
         outtmpl = os.path.join(tmp, "%(id)s.%(ext)s")
@@ -729,10 +708,7 @@ def fetch_subtitles_with_ytdlp(
         def try_extract_and_download_by_url() -> tuple[str, str] | None:
             nonlocal force_browser_cookie, last_cookie_error, disabled_browsers
             sess = build_download_session()
-            if allow_web_client:
-                client_sets: list[list[str]] = [["android"], ["ios"], ["web_safari"], ["web"], ["tv"]]
-            else:
-                client_sets = [["android"], ["ios"], ["tv"]]
+            client_sets: list[list[str]] = [["android"], ["ios"], ["web_safari"], ["web"], ["tv"]]
             attempt_retries = max(1, int(retries))
             
             # 用于记录 "无 Cookie" 模式下的错误
@@ -758,20 +734,12 @@ def fetch_subtitles_with_ytdlp(
                             "geo_bypass": True,
                             "ignoreerrors": False,
                             "ignore_config": True,  # 忽略全局配置文件，避免意外读取 Cookie
+                            "impersonate": "chrome",
                             # "format": "bestaudio/best", # 移除强制格式，允许自动选择最佳可用格式（仅获取信息）
                             "http_headers": {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
                             "extractor_args": {"youtube": {"player_client": client_set}},
                             "logger": logger,
                         }
-                        if has_js_runtime:
-                            if runtime_path:
-                                opts["js_runtimes"] = {runtime_name: {"path": runtime_path}}
-                            else:
-                                opts["js_runtimes"] = {runtime_name: {}}
-                            if runtime_name in {"deno", "bun"}:
-                                opts["remote_components"] = {"ejs:npm"}
-                            else:
-                                opts["remote_components"] = {"ejs:github"}
                         if proxy_url:
                             opts["proxy"] = proxy_url
                         if cookiefile:
@@ -964,19 +932,11 @@ def fetch_subtitles_with_ytdlp(
                         "geo_bypass": True,
                         "ignoreerrors": False,
                         "ignore_config": True,
+                        "impersonate": "chrome",
                         "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
                         "extractor_args": {"youtube": {"player_client": client_set}},
                         "logger": logger,
                     }
-                    if has_js_runtime:
-                        if runtime_path:
-                            opts["js_runtimes"] = {runtime_name: {"path": runtime_path}}
-                        else:
-                            opts["js_runtimes"] = {runtime_name: {}}
-                        if runtime_name in {"deno", "bun"}:
-                            opts["remote_components"] = {"ejs:npm"}
-                        else:
-                            opts["remote_components"] = {"ejs:github"}
                     if proxy_url:
                         opts["proxy"] = proxy_url
                     if cookiefile:
@@ -2015,25 +1975,7 @@ def transcribe_video_audio_with_ytdlp(
             "未安装 yt-dlp，无法启用音频转写兜底。可执行：python -m pip install yt-dlp -i https://pypi.tuna.tsinghua.edu.cn/simple"
         ) from e
 
-    def detect_js_runtime() -> tuple[str, str | None]:
-        try:
-            import shutil
-            deno = shutil.which("deno")
-            node = shutil.which("node")
-            bun = shutil.which("bun")
-            qjs = shutil.which("qjs")
-            if deno:
-                return "deno", deno
-            if node:
-                return "node", node
-            if bun:
-                return "bun", bun
-            if qjs:
-                return "quickjs", qjs
-            return "", None
-        except Exception:
-            return "", None
-
+        # 移除 detect_js_runtime 的定义，改用 yt-dlp 原生解释器或 yt_dlp_ejs
         # 移除此处的本地 is_cookie_error 定义，改用顶层的 _is_cookie_error
 
     cache_path = _audio_cache_path(video_url)
@@ -2061,10 +2003,8 @@ def transcribe_video_audio_with_ytdlp(
         no_cookie_error: Exception | None = None
         force_browser_cookie = False
 
-        runtime_name, runtime_path = detect_js_runtime()
-        has_js_runtime = bool(runtime_name)
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["android"], ["ios"]] + ([[]] if has_cookie_hint else [])
+        client_strategies = [["android"], ["ios"], ["tv"], ["web_creator"], ["mweb"]] + ([[]] if has_cookie_hint else [])
 
         if fast_mode:
             format_candidates = ["worstaudio/worst"]
@@ -2083,7 +2023,7 @@ def transcribe_video_audio_with_ytdlp(
                         continue
                     for fmt in format_candidates:
                         client_label = ",".join(client_set) if client_set else "default"
-                        attempt_note = f"client={client_label} fmt={(fmt or 'default')} cookie={'file' if cookiefile else ('browser' if cfb else 'none')}{(' js=' + runtime_name) if has_js_runtime else ''}"
+                        attempt_note = f"client={client_label} fmt={(fmt or 'default')} cookie={'file' if cookiefile else ('browser' if cfb else 'none')}"
                     
                     def progress_hook(d):
                         if status_callback:
@@ -2108,6 +2048,7 @@ def transcribe_video_audio_with_ytdlp(
                             "ignoreerrors": False,
                             "ignore_config": True,
                             "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+                            "impersonate": "chrome",
                             "logger": logger,
                             "postprocessors": [{
                                 "key": "FFmpegExtractAudio",
@@ -2124,17 +2065,6 @@ def transcribe_video_audio_with_ytdlp(
                         }
                     if client_set:
                         opts["extractor_args"] = {"youtube": {"player_client": client_set}}
-                    should_enable_js_runtime = bool(client_set) and any(c in {"web", "web_safari"} for c in client_set)
-                    if has_js_runtime and should_enable_js_runtime:
-                        if runtime_path:
-                            opts["js_runtimes"] = {runtime_name: {"path": runtime_path}}
-                        else:
-                            opts["js_runtimes"] = {runtime_name: {}}
-                        if runtime_name in {"deno", "bun"}:
-                            opts["remote_components"] = {"ejs:npm"}
-                        else:
-                            opts["remote_components"] = {"ejs:github"}
-                    
                     if ffmpeg_binary_path:
                         opts["ffmpeg_location"] = ffmpeg_binary_path
 

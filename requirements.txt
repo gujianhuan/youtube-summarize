@@ -6,3 +6,5 @@ imageio-ffmpeg
 openai
 duckduckgo-search
 faster-whisper
+curl_cffi
+yt_dlp_ejs
