@@ -711,213 +711,27 @@ if "last_saved_settings" not in st.session_state:
         "remember_api_key": remember_api_key_initial,
     }
 
-# --- 侧边栏配置 ---
-with st.sidebar:
-    st.header("⚙️ 设置")
-    
-    with st.expander("🌐 网络 & 代理", expanded=False):
-        def on_ai_settings_change():
-            st.session_state.proxy = st.session_state.proxy_input
-            st.session_state.api_key = st.session_state.api_key_input
-            st.session_state.base_url = st.session_state.base_url_input
-            remember_api_key = bool(st.session_state.remember_api_key)
-            persisted_api_key = st.session_state.api_key if remember_api_key else ""
-            update_settings_partial({
-                "api_key": persisted_api_key,
-                "base_url": st.session_state.base_url,
-                "model": st.session_state.model,
-                "proxy": st.session_state.proxy,
-                "remember_api_key": remember_api_key
-            })
-            if isinstance(st.session_state.settings, dict):
-                st.session_state.settings.update({
-                    "api_key": persisted_api_key,
-                    "base_url": st.session_state.base_url,
-                    "model": st.session_state.model,
-                    "proxy": st.session_state.proxy,
-                    "remember_api_key": remember_api_key
-                })
-            st.toast("设置已自动保存", icon="✅")
+# --- 后台硬编码/环境变量配置 (对外隐藏设置) ---
+proxy_input = os.environ.get("PROXY_URL", st.session_state.settings.get("proxy", ""))
+use_system_proxy = False
+languages = "zh-Hans,zh-Hant,zh-TW,zh,en,ja,ko"
+cookies_browser = "auto"
+auto_cookies = False
+timeout = 60
+retries = 3
 
-        proxy_input = st.text_input(
-            "HTTP 代理 (可选)",
-            value=st.session_state.proxy,
-            placeholder="http://127.0.0.1:7890",
-            key="proxy_input",
-            on_change=on_ai_settings_change
-        )
-        use_system_proxy = st.checkbox("使用系统代理", value=True)
-    
-    with st.expander("🕸️ 抓取设置", expanded=False):
-        languages = st.text_input("语言优先级", value="zh-Hans,zh,en")
-        cookies_browser = st.selectbox(
-            "Cookies 来源浏览器", 
-            ["auto", "chrome", "edge", "firefox", "brave", "chromium"], 
-            index=0,
-            help="选择 'auto' 将按稳定性排序尝试浏览器 (推荐)。注意：新版 Edge/Chrome (127+) 已限制外部读取，建议在 Firefox 中登录并选择 firefox 或使用 auto 模式。"
-        )
-        auto_cookies = st.checkbox("自动读取浏览器 Cookies", value=True)
-        timeout = st.number_input("超时时间 (秒)", value=60, min_value=5, max_value=300)
-        retries = st.number_input("重试次数", value=2, min_value=0, max_value=10)
-    
-    with st.expander("🎙️ 音频转写 (Whisper)", expanded=False):
-        asr_enabled = st.checkbox("无字幕时启用转写", value=True)
-        asr_model = st.selectbox("Whisper 模型", ["tiny", "base", "small", "medium", "large"], index=0, help="tiny 最快但精度稍低；base 平衡；small/medium 精度更高但耗时更长")
-        asr_fast_mode = st.checkbox("极速模式", value=True, help="以速度优先：更大 chunk、更少解码开销，可能略降精度")
-        st.session_state.asr_force_cpu = False
-        
-        # 检测 faster-whisper 是否安装，给出提示
-        try:
-            import faster_whisper
-            # 尝试获取当前运行的设备信息
-            # 由于 app.py 无法直接访问 core_logic 的函数内部变量，我们只能静态提示
-            # 或者我们可以在 core_logic 暴露一个 get_device_info
-            
-            def _check_cuda_available():
-                try:
-                    import ctranslate2
-                    if hasattr(ctranslate2, "get_cuda_device_count"):
-                        count = ctranslate2.get_cuda_device_count()
-                        if count and count > 0:
-                            return True, ""
-                        return False, "ctranslate2 未检测到 CUDA 设备"
-                    return False, "当前 ctranslate2 版本不支持 CUDA 检测"
-                except Exception as e:
-                    return False, f"CUDA 检测失败: {e}"
+asr_enabled = True
+asr_model = os.environ.get("ASR_MODEL", "base")
+asr_fast_mode = True
 
-            cuda_ok, cuda_reason = _check_cuda_available()
-            st.caption("✅ 已检测到 faster-whisper 加速引擎")
-            if cuda_ok:
-                st.caption("✅ 已检测到可用 GPU (CUDA)，将自动启用加速")
-            else:
-                st.caption(f"⚠️ 未检测到可用 GPU (CUDA)：{cuda_reason}")
-            st.caption("🚀 性能提示：系统将自动尝试调用 GPU (CUDA)。如果失败，将回退到多核 CPU 模式 (已优化线程数)。")
-            
-        except ImportError:
-            st.caption("⚠️ 未检测到 faster-whisper。建议运行 `pip install faster-whisper` 以获得 4-10 倍提速。")
+api_key = os.environ.get("OPENAI_API_KEY", st.session_state.settings.get("api_key", ""))
+base_url = os.environ.get("OPENAI_BASE_URL", st.session_state.settings.get("base_url", "https://api.openai.com/v1"))
+model_selected = os.environ.get("OPENAI_MODEL", st.session_state.settings.get("model", "gpt-3.5-turbo"))
 
-    with st.expander("🤖 AI 总结设置", expanded=True):
-        remember_api_key = st.checkbox(
-            "记住 API Key",
-            key="remember_api_key",
-            on_change=on_ai_settings_change
-        )
-        api_key = st.text_input(
-            "API Key",
-            value=st.session_state.api_key,
-            type="password",
-            key="api_key_input",
-            on_change=on_ai_settings_change
-        )
-        base_url = st.text_input(
-            "Base URL",
-            value=st.session_state.base_url,
-            key="base_url_input",
-            on_change=on_ai_settings_change
-        )
-        
-        col_model, col_refresh = st.columns([3, 1])
-        with col_refresh:
-            # 下沉按钮，对齐下拉框
-            st.write("") 
-            st.write("")
-            if st.button("🔄", help="刷新模型列表"):
-                if not api_key:
-                    st.error("请先填 Key")
-                else:
-                    try:
-                        with st.spinner("..."):
-                            models = fetch_available_models(api_key, base_url, proxy_input)
-                            if models:
-                                st.session_state.available_models = models
-                                st.toast(f"成功获取 {len(models)} 个模型", icon="✅")
-                            else:
-                                st.warning("列表为空")
-                    except Exception as e:
-                        st.error(f"失败: {e}")
-
-        with col_model:
-            model_index = 0
-            if st.session_state.model in st.session_state.available_models:
-                model_index = st.session_state.available_models.index(st.session_state.model)
-            
-            # 优化：使用 st.selectbox 的 key 来避免每次渲染都重置
-            # 并且将 save_settings 移到回调中，或者只在值改变时触发
-            def on_model_change():
-                st.session_state.model = st.session_state.selectbox_model
-                remember_api_key = bool(st.session_state.remember_api_key)
-                persisted_api_key = st.session_state.api_key if remember_api_key else ""
-                update_settings_partial({
-                    "api_key": persisted_api_key,
-                    "base_url": st.session_state.base_url,
-                    "model": st.session_state.model,
-                    "proxy": st.session_state.proxy,
-                    "remember_api_key": remember_api_key
-                })
-
-            model_selected = st.selectbox(
-                "模型", 
-                st.session_state.available_models, 
-                index=model_index,
-                key="selectbox_model",
-                on_change=on_model_change
-            )
-    
-    # 移除复选框，默认就是自动总结
-    # auto_summary = st.checkbox("抓取后自动总结", value=True)
-
-    st.session_state.proxy = proxy_input
-    st.session_state.api_key = api_key
-    st.session_state.base_url = base_url
-
-    # 显式保存按钮，解决输入框失去焦点未触发 on_change 的问题
-    if st.button("💾 保存设置", use_container_width=True):
-        # 强制从组件状态同步最新值
-        if "api_key_input" in st.session_state:
-            st.session_state.api_key = st.session_state.api_key_input
-        if "base_url_input" in st.session_state:
-            st.session_state.base_url = st.session_state.base_url_input
-        if "proxy_input" in st.session_state:
-            st.session_state.proxy = st.session_state.proxy_input
-        
-        remember_api_key = bool(st.session_state.get("remember_api_key", True))
-        persisted_api_key = st.session_state.api_key if remember_api_key else ""
-        
-        try:
-            new_settings = {
-                "api_key": persisted_api_key,
-                "base_url": st.session_state.base_url,
-                "model": st.session_state.model,
-                "proxy": st.session_state.proxy,
-                "remember_api_key": remember_api_key
-            }
-            update_settings_partial(new_settings)
-            
-            # 同时更新内存中的 settings 对象
-            if isinstance(st.session_state.settings, dict):
-                st.session_state.settings.update(new_settings)
-                
-            st.toast("设置已保存！请刷新页面验证。", icon="✅")
-            time.sleep(0.5) # 给一点时间让 toast 显示
-            st.rerun() # 强制刷新以确保状态同步
-        except Exception as e:
-            st.error(f"保存失败: {e}")
-
-    # 自动兜底保存逻辑 (Keep this as fallback)
-    remember_api_key = bool(st.session_state.remember_api_key)
-    persisted_api_key = st.session_state.api_key if remember_api_key else ""
-    current_settings = {
-        "api_key": persisted_api_key,
-        "base_url": st.session_state.base_url,
-        "model": st.session_state.model,
-        "proxy": st.session_state.proxy,
-        "remember_api_key": remember_api_key,
-    }
-    if st.session_state.last_saved_settings != current_settings:
-        update_settings_partial(current_settings)
-        if isinstance(st.session_state.settings, dict):
-            st.session_state.settings.update(current_settings)
-        st.session_state.last_saved_settings = dict(current_settings)
+st.session_state.proxy = proxy_input
+st.session_state.api_key = api_key
+st.session_state.base_url = base_url
+st.session_state.model = model_selected
 
 
 

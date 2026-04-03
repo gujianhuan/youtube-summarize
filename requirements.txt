@@ -5,3 +5,4 @@ yt-dlp
 imageio-ffmpeg
 openai
 duckduckgo-search
+faster-whisper

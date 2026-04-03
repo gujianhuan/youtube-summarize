@@ -27,8 +27,8 @@ def _background_worker(video_url, task_id, model_selected, proxy_input, use_syst
         eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
         api = build_api(eff_proxy, 60.0, use_system_proxy, 1)
         
-        # 解析 URL
-        video_id, langs_list, v_url = get_transcript_from_input(video_url, ["zh-Hans", "zh-Hant", "zh-TW", "zh", "en", "ja", "ko"])
+        # 解析 URL，这里 languages 必须传字符串，比如 "zh-Hans,zh-Hant,zh-TW,zh,en,ja,ko"
+        video_id, langs_list, v_url = get_transcript_from_input(video_url, "zh-Hans,zh-Hant,zh-TW,zh,en,ja,ko")
         
         # 抓取文本
         text = get_video_transcript(api, video_id, video_url=v_url, languages=langs_list)
