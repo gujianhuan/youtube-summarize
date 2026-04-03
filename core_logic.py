@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import random
 import hashlib
+import base64
 import requests
 import platform
 from pathlib import Path
@@ -95,6 +96,42 @@ except ImportError:
     print("未安装 imageio-ffmpeg，无法自动配置 ffmpeg 环境。")
 except Exception as e:
     print(f"自动配置环境失败: {e}")
+
+
+def resolve_cookie_file(
+    cookies_file: str = "",
+    cookies_content: str = "",
+    cookies_content_b64: str = "",
+) -> str:
+    """
+    解析可供 yt-dlp 使用的 cookies 文件路径。
+
+    支持三种输入方式：
+    1. 直接传入现成的 cookies 文件路径
+    2. 传入 Netscape cookies 文本内容
+    3. 传入 Base64 编码后的 cookies 文本
+    """
+    file_path = (cookies_file or "").strip()
+    if file_path:
+        return file_path
+
+    raw_content = (cookies_content or "").strip()
+    if not raw_content and (cookies_content_b64 or "").strip():
+        try:
+            raw_content = base64.b64decode(cookies_content_b64).decode("utf-8")
+        except Exception as e:
+            raise RuntimeError(f"Cookies Base64 内容无效：{e}") from e
+
+    if not raw_content:
+        return ""
+
+    runtime_dir = Path(tempfile.gettempdir()) / "youtube_summarizer_cookies"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    content_hash = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()[:16]
+    cookie_path = runtime_dir / f"cookies_{content_hash}.txt"
+    if not cookie_path.exists():
+        cookie_path.write_text(raw_content, encoding="utf-8")
+    return str(cookie_path)
 
 
 class TimeoutSession(requests.Session):
@@ -2714,7 +2751,11 @@ def get_video_transcript(
         proxy_url = str(getattr(api, "_effective_proxy", "") or "")
         timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
         retries = int(getattr(api, "_retries", 2) or 2)
-        cookies_file = str(getattr(api, "_cookies_file", "") or "")
+        cookies_file = resolve_cookie_file(
+            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
+            cookies_content=str(getattr(api, "_cookies_content", "") or ""),
+            cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
+        )
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
         asr_enabled = bool(getattr(api, "_asr_enabled", False))
         asr_model = str(getattr(api, "_asr_model", "") or "")
@@ -2793,7 +2834,11 @@ def get_video_transcript(
         proxy_url = str(getattr(api, "_effective_proxy", "") or "")
         timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
         retries = int(getattr(api, "_retries", 2) or 2)
-        cookies_file = str(getattr(api, "_cookies_file", "") or "")
+        cookies_file = resolve_cookie_file(
+            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
+            cookies_content=str(getattr(api, "_cookies_content", "") or ""),
+            cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
+        )
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
         try:
             label, text = fetch_subtitles_with_ytdlp(

@@ -715,8 +715,11 @@ if "last_saved_settings" not in st.session_state:
 proxy_input = os.environ.get("PROXY_URL", st.session_state.settings.get("proxy", ""))
 use_system_proxy = False
 languages = "zh-Hans,zh-Hant,zh-TW,zh,en,ja,ko"
-cookies_browser = "auto"
-auto_cookies = False
+cookies_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+cookies_content = os.environ.get("YTDLP_COOKIES_CONTENT", "")
+cookies_content_b64 = os.environ.get("YTDLP_COOKIES_CONTENT_B64", "").strip()
+cookies_browser = os.environ.get("YTDLP_COOKIES_BROWSER", "").strip().lower()
+auto_cookies = bool(cookies_browser)
 timeout = 60
 retries = 3
 
@@ -770,7 +773,9 @@ def internal_fetch_transcript(video_url, progress_callback=None):
             retries=int(retries),
         )
         # 注入私有属性
-        setattr(api, "_cookies_file", "")
+        setattr(api, "_cookies_file", cookies_file)
+        setattr(api, "_cookies_content", cookies_content)
+        setattr(api, "_cookies_content_b64", cookies_content_b64)
         setattr(api, "_cookies_from_browser", cookies_browser if auto_cookies else "")
         setattr(api, "_asr_enabled", asr_enabled)
         setattr(api, "_asr_model", asr_model) # 传递用户选择的 model

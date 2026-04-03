@@ -2,6 +2,7 @@ import threading
 import time
 import logging
 import uuid
+import os
 
 # 修改导入，不从 app 依赖未抽离的 internal 函数，而是直接调 core_logic
 from core_logic import get_transcript_from_input, get_video_transcript, is_html_like_text, summarize_text, build_api, get_effective_proxy
@@ -26,6 +27,10 @@ def _background_worker(video_url, task_id, model_selected, proxy_input, use_syst
         
         eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
         api = build_api(eff_proxy, 60.0, use_system_proxy, 1)
+        setattr(api, "_cookies_file", os.environ.get("YTDLP_COOKIES_FILE", "").strip())
+        setattr(api, "_cookies_content", os.environ.get("YTDLP_COOKIES_CONTENT", ""))
+        setattr(api, "_cookies_content_b64", os.environ.get("YTDLP_COOKIES_CONTENT_B64", "").strip())
+        setattr(api, "_cookies_from_browser", os.environ.get("YTDLP_COOKIES_BROWSER", "").strip().lower())
         
         # get_transcript_from_input 返回顺序为: (video_id, video_url, languages_csv)
         video_id, v_url, languages_csv = get_transcript_from_input(
