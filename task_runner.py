@@ -3,8 +3,8 @@ import time
 import logging
 import uuid
 
-# 假设这里会用到你的核心逻辑
-from core_logic import get_effective_proxy, check_network, internal_fetch_transcript, internal_summarize
+# 修改导入，不从 app 依赖未抽离的 internal 函数，而是直接调 core_logic
+from core_logic import get_transcript_from_input, get_video_transcript, is_html_like_text, summarize_text, build_api, get_effective_proxy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -21,34 +21,37 @@ def _background_worker(video_url, task_id, model_selected, proxy_input, use_syst
     TASK_STATUS_DB[task_id]["status"] = "running"
     
     try:
-        # 1. 抓取阶段
+        # --- 1. 抓取阶段 (复刻 app.py 里的 internal_fetch_transcript 逻辑) ---
         logger.info(f"[Task {task_id}] 正在抓取字幕...")
-        text, err = internal_fetch_transcript(video_url, progress_callback=None)
         
-        if err:
-            logger.error(f"[Task {task_id}] 抓取失败: {err}")
-            TASK_STATUS_DB[task_id]["status"] = "failed"
-            TASK_STATUS_DB[task_id]["error"] = f"抓取失败: {err}"
-            return
+        eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
+        api = build_api(eff_proxy, 60.0, use_system_proxy, 1)
+        
+        # 解析 URL
+        video_id, langs_list, v_url = get_transcript_from_input(video_url, ["zh-Hans", "zh-Hant", "zh-TW", "zh", "en", "ja", "ko"])
+        
+        # 抓取文本
+        text = get_video_transcript(api, video_id, video_url=v_url, languages=langs_list)
+        if is_html_like_text(text):
+            raise Exception("检测到返回内容为 HTML 页面源码，无法用于总结。请确认视频可访问，或更换网络/代理后重试。")
             
         if not text:
-             logger.error(f"[Task {task_id}] 未获取到字幕内容")
-             TASK_STATUS_DB[task_id]["status"] = "failed"
-             TASK_STATUS_DB[task_id]["error"] = "未获取到字幕内容"
-             return
+             raise Exception("未获取到字幕内容")
 
-        # 2. 总结阶段
+        # --- 2. 总结阶段 (复刻 app.py 里的 internal_summarize 逻辑) ---
         logger.info(f"[Task {task_id}] 抓取成功，开始 AI 总结...")
         
-        # 为了兼容 core_logic 的 summarize_text，可能需要处理流式或非流式
-        # 简单起见，这里假设 internal_summarize 支持非流式调用
-        summary, err_sum = internal_summarize(text, model_selected, api_key, base_url, proxy_input)
-        
-        if err_sum:
-            logger.error(f"[Task {task_id}] 总结失败: {err_sum}")
-            TASK_STATUS_DB[task_id]["status"] = "failed"
-            TASK_STATUS_DB[task_id]["error"] = f"总结失败: {err_sum}"
-            return
+        if not api_key:
+            raise Exception("未提供 API Key")
+            
+        summary = summarize_text(
+            text,
+            api_key,
+            base_url,
+            model_name=model_selected,
+            proxy_url=eff_proxy,
+            stream=False  # 后台任务默认不使用流式
+        )
 
         logger.info(f"[Task {task_id}] 处理成功!")
         TASK_STATUS_DB[task_id]["status"] = "success"
