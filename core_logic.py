@@ -2057,7 +2057,7 @@ def transcribe_video_audio_with_ytdlp(
 
                         try:
                             with YoutubeDL(opts) as ydl:
-                                def pick_audio_format(info: dict, prefer_worst: bool, preferred_ext: str | None = None) -> str | None:
+                                def pick_audio_format_entry(info: dict, prefer_worst: bool, preferred_ext: str | None = None) -> dict | None:
                                     formats = info.get("formats") if isinstance(info, dict) else None
                                     if not formats:
                                         return None
@@ -2083,12 +2083,53 @@ def transcribe_video_audio_with_ytdlp(
                                                 return float(val)
                                         return 0.0
 
-                                    picked = min(audio_formats, key=score) if prefer_worst else max(audio_formats, key=score)
-                                    fid = picked.get("format_id")
+                                    return min(audio_formats, key=score) if prefer_worst else max(audio_formats, key=score)
+
+                                def pick_audio_format(info: dict, prefer_worst: bool, preferred_ext: str | None = None) -> str | None:
+                                    picked = pick_audio_format_entry(info, prefer_worst, preferred_ext)
+                                    fid = picked.get("format_id") if isinstance(picked, dict) else None
                                     return str(fid) if fid else None
 
                                 def has_audio_format(info: dict) -> bool:
                                     return pick_audio_format(info, False, None) is not None or pick_audio_format(info, True, None) is not None
+
+                                def direct_download_audio(format_info: dict | None, output_dir: str) -> Path | None:
+                                    """在 yt-dlp 没有落地产物时，直接下载可访问的音频流。"""
+                                    if not isinstance(format_info, dict):
+                                        return None
+                                    audio_url = str(format_info.get("url") or "").strip()
+                                    if not audio_url:
+                                        return None
+                                    protocol = str(format_info.get("protocol") or "").lower()
+                                    if "m3u8" in protocol or "dash" in protocol:
+                                        return None
+
+                                    ext = str(format_info.get("ext") or "bin").lower() or "bin"
+                                    format_id = str(format_info.get("format_id") or "direct")
+                                    base_name = last_video_id or "audio"
+                                    target_path = Path(output_dir) / f"{base_name}.{format_id}.{ext}"
+
+                                    session = TimeoutSession(timeout_seconds=max(5.0, float(timeout_seconds)))
+                                    session.trust_env = True
+                                    if proxy_url:
+                                        session.trust_env = False
+                                        session.proxies = {"http": proxy_url, "https": proxy_url}
+
+                                    headers = dict(opts.get("http_headers") or {})
+                                    headers["Referer"] = video_url
+
+                                    try:
+                                        with session.get(audio_url, headers=headers, stream=True, timeout=max(5.0, float(timeout_seconds))) as resp:
+                                            resp.raise_for_status()
+                                            with open(target_path, "wb") as fp:
+                                                for chunk in resp.iter_content(chunk_size=1024 * 512):
+                                                    if chunk:
+                                                        fp.write(chunk)
+                                        if target_path.exists() and target_path.stat().st_size > 16 * 1024:
+                                            return target_path
+                                    except Exception as e:
+                                        logger.warning(f"Direct media download fallback failed: {e}")
+                                    return None
 
                                 try:
                                     if client_set and any(c in disabled_clients_reason for c in client_set):
@@ -2177,9 +2218,11 @@ def transcribe_video_audio_with_ytdlp(
                                         last_debug_lines = logger.lines[-80:]
                                         continue
 
+                                    selected_audio_entry = pick_audio_format_entry(info, False, None)
                                     if fmt:
                                         prefer_worst = fmt in {"worstaudio/worst", "worstaudio", "worst"}
                                         chosen = pick_audio_format(info, prefer_worst, None)
+                                        selected_audio_entry = pick_audio_format_entry(info, prefer_worst, None)
                                         if chosen:
                                             ydl.params["format"] = chosen
                                         else:
@@ -2209,6 +2252,11 @@ def transcribe_video_audio_with_ytdlp(
                                         direct_fp = info.get("filepath")
                                         if direct_fp:
                                             requested_paths.append(Path(str(direct_fp)))
+
+                                    if not requested_paths:
+                                        direct_file = direct_download_audio(selected_audio_entry, tmp)
+                                        if direct_file:
+                                            requested_paths.append(direct_file)
                                     last_err = None
                                 except DownloadError as dl_err:
                                     last_err = dl_err
