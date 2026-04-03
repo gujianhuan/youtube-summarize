@@ -1996,12 +1996,12 @@ def transcribe_video_audio_with_ytdlp(
         force_browser_cookie = False
 
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["android"], ["ios"], ["tv"], ["web_creator"], ["mweb"]] + ([[]] if has_cookie_hint else [])
+        client_strategies = [["android"], ["ios"], ["tv"], ["web_creator"], ["mweb"], []]
 
         if fast_mode:
-            format_candidates = ["worstaudio/worst"]
+            format_candidates = ["worstaudio/worst", "bestaudio/best", None]
         else:
-            format_candidates = ["bestaudio/best"]
+            format_candidates = ["bestaudio/best", "worstaudio/worst", None]
         
         disabled_browsers: set[str] = set()
         disabled_clients_reason: dict[str, str] = {}
@@ -2212,8 +2212,26 @@ def transcribe_video_audio_with_ytdlp(
                                         last_debug_lines = logger.lines[-80:]
                                         continue
                                 info = ydl.extract_info(video_url, download=True)
+                                requested_paths = []
                                 if isinstance(info, dict):
                                     last_video_id = str(info.get("id") or last_video_id)
+                                    requested_downloads = info.get("requested_downloads") or []
+                                    if isinstance(requested_downloads, list):
+                                        for item in requested_downloads:
+                                            if isinstance(item, dict):
+                                                fp = item.get("filepath")
+                                                if fp:
+                                                    requested_paths.append(Path(str(fp)))
+                                    requested_formats = info.get("requested_formats") or []
+                                    if isinstance(requested_formats, list):
+                                        for item in requested_formats:
+                                            if isinstance(item, dict):
+                                                fp = item.get("filepath")
+                                                if fp:
+                                                    requested_paths.append(Path(str(fp)))
+                                    direct_fp = info.get("filepath")
+                                    if direct_fp:
+                                        requested_paths.append(Path(str(direct_fp)))
                                 last_err = None
                             except DownloadError as dl_err:
                                 if "requested format not available" in strip_ansi(str(dl_err)).lower():
@@ -2299,6 +2317,13 @@ def transcribe_video_audio_with_ytdlp(
                     if ext in {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg"}:
                         candidates.append(p)
                 if not candidates:
+                    for p in requested_paths:
+                        try:
+                            if p.is_file() and p.suffix.lower() in {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg"}:
+                                candidates.append(p)
+                        except Exception:
+                            continue
+                if not candidates:
                     detail_lines = []
                     if last_attempt_note:
                         detail_lines.append(f"最近尝试: {last_attempt_note}")
@@ -2319,6 +2344,8 @@ def transcribe_video_audio_with_ytdlp(
                         detail_lines.append("调试日志(尾部):\n" + tail)
                     if temp_outputs:
                         detail_lines.append("临时目录文件:\n" + "\n".join(temp_outputs[:12]))
+                    if requested_paths:
+                        detail_lines.append("yt-dlp 报告的输出路径:\n" + "\n".join(str(p) for p in requested_paths[:12]))
                     detail_text = "\n".join(detail_lines)
                     if last_err and str(last_err).strip().startswith("未下载到音频文件"):
                         pass
