@@ -2017,18 +2017,18 @@ def transcribe_video_audio_with_ytdlp(
                     for fmt in format_candidates:
                         client_label = ",".join(client_set) if client_set else "default"
                         attempt_note = f"client={client_label} fmt={(fmt or 'default')} cookie={'file' if cookiefile else ('browser' if cfb else 'none')}"
-                    
-                    def progress_hook(d):
-                        if status_callback:
-                            if d['status'] == 'downloading':
-                                p = strip_ansi(str(d.get('_percent_str') or '')).replace('%','')
-                                e = strip_ansi(str(d.get('_eta_str') or ''))
-                                status_callback(f"Downloading audio: {p}% (ETA: {e})")
-                            elif d['status'] == 'finished':
-                                status_callback("Download complete, converting audio...")
 
-                    logger = YdlLogger()
-                    opts: dict = {
+                        def progress_hook(d):
+                            if status_callback:
+                                if d["status"] == "downloading":
+                                    p = strip_ansi(str(d.get("_percent_str") or "")).replace("%", "")
+                                    e = strip_ansi(str(d.get("_eta_str") or ""))
+                                    status_callback(f"Downloading audio: {p}% (ETA: {e})")
+                                elif d["status"] == "finished":
+                                    status_callback("Download complete, preparing transcription...")
+
+                        logger = YdlLogger()
+                        opts: dict = {
                             "progress_hooks": [progress_hook],
                             "outtmpl": outtmpl,
                             "noplaylist": True,
@@ -2043,271 +2043,227 @@ def transcribe_video_audio_with_ytdlp(
                             "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
                             "impersonate": "chrome",
                             "logger": logger,
-                            "postprocessors": [{
-                                "key": "FFmpegExtractAudio",
-                                "preferredcodec": "wav",
-                            }, {
-                                "key": "FFmpegExtractAudio",
-                                "preferredcodec": "wav",
-                                "preferredquality": "16k",
-                            }],
-                            "postprocessor_args": [
-                                "-ac", "1",
-                                "-ar", "16000"
-                            ],
                         }
-                    if client_set:
-                        opts["extractor_args"] = {"youtube": {"player_client": client_set}}
-                    if ffmpeg_binary_path:
-                        opts["ffmpeg_location"] = ffmpeg_binary_path
+                        if client_set:
+                            opts["extractor_args"] = {"youtube": {"player_client": client_set}}
+                        if ffmpeg_binary_path:
+                            opts["ffmpeg_location"] = ffmpeg_binary_path
+                        if proxy_url:
+                            opts["proxy"] = proxy_url
+                        if cookiefile:
+                            opts["cookiefile"] = cookiefile
+                        elif cfb:
+                            opts["cookiesfrombrowser"] = (cfb,)
 
-                    if proxy_url:
-                        opts["proxy"] = proxy_url
-                    if cookiefile:
-                        opts["cookiefile"] = cookiefile
-                    elif cfb:
-                        opts["cookiesfrombrowser"] = (cfb,)
-
-                    try:
-                        with YoutubeDL(opts) as ydl:
-                            def pick_audio_format(info: dict, prefer_worst: bool, preferred_ext: str | None = None) -> str | None:
-                                formats = info.get("formats") if isinstance(info, dict) else None
-                                if not formats:
-                                    return None
-                                audio_formats = []
-                                for f in formats:
-                                    if not isinstance(f, dict):
-                                        continue
-                                    acodec = f.get("acodec")
-                                    if not acodec or acodec == "none":
-                                        continue
-                                    if preferred_ext:
-                                        ext = str(f.get("ext") or "").lower()
-                                        if ext != preferred_ext.lower():
+                        try:
+                            with YoutubeDL(opts) as ydl:
+                                def pick_audio_format(info: dict, prefer_worst: bool, preferred_ext: str | None = None) -> str | None:
+                                    formats = info.get("formats") if isinstance(info, dict) else None
+                                    if not formats:
+                                        return None
+                                    audio_formats = []
+                                    for item in formats:
+                                        if not isinstance(item, dict):
                                             continue
-                                    audio_formats.append(f)
-                                if not audio_formats:
-                                    return None
-                                def score(f: dict) -> float:
-                                    for k in ("abr", "tbr"):
-                                        v = f.get(k)
-                                        if isinstance(v, (int, float)):
-                                            return float(v)
-                                    return 0.0
-                                picked = min(audio_formats, key=score) if prefer_worst else max(audio_formats, key=score)
-                                fid = picked.get("format_id")
-                                return str(fid) if fid else None
+                                        acodec = item.get("acodec")
+                                        if not acodec or acodec == "none":
+                                            continue
+                                        if preferred_ext:
+                                            ext = str(item.get("ext") or "").lower()
+                                            if ext != preferred_ext.lower():
+                                                continue
+                                        audio_formats.append(item)
+                                    if not audio_formats:
+                                        return None
 
-                            def has_audio_format(info: dict) -> bool:
-                                return pick_audio_format(info, False, None) is not None or pick_audio_format(info, True, None) is not None
+                                    def score(item: dict) -> float:
+                                        for key in ("abr", "tbr"):
+                                            val = item.get(key)
+                                            if isinstance(val, (int, float)):
+                                                return float(val)
+                                        return 0.0
 
-                            try:
-                                # 如检测到禁用的 client，直接跳过
-                                if client_set and any(c in disabled_clients_reason for c in client_set):
-                                    reason = next((disabled_clients_reason.get(c) for c in client_set if c in disabled_clients_reason), "Client disabled")
-                                    if last_err is None:
-                                        last_err = RuntimeError(reason)
-                                    continue
-                                
-                                # 优化：针对 web_safari 和 web 客户端，如果未提供 cookies，大概率会失败，可以考虑跳过或降级
-                                # 但为了保险，我们只在出现特定错误后禁用
-                                
-                                info = ydl.extract_info(video_url, download=False)
-                            except DownloadError as e:
-                                msg = strip_ansi(str(e))
-                                has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
-                                if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
-                                    last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
-                                    if cfb:
-                                        disabled_browsers.add(cfb)
-                                    continue
+                                    picked = min(audio_formats, key=score) if prefer_worst else max(audio_formats, key=score)
+                                    fid = picked.get("format_id")
+                                    return str(fid) if fid else None
 
-                                # 针对 "missing a URL" 或 "SABR streaming" 错误，这是 web_safari 客户端的已知问题
-                                if "missing a URL" in msg or "SABR streaming" in msg:
-                                    if "web_safari" in client_set:
-                                        disabled_clients_reason["web_safari"] = "Web Safari 客户端不兼容 (SABR/Missing URL)。"
-                                    last_err = RuntimeError("Web Safari 客户端不兼容。")
-                                    last_attempt_note = attempt_note + " (web_safari issue)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                if "po token" in msg.lower() or "challenge solving failed" in msg.lower() or "only images are available" in msg.lower():
-                                    force_browser_cookie = True
-                                    last_err = RuntimeError("YouTube 触发挑战校验（PO Token/JS Challenge）。已自动切换为浏览器 Cookie 方案重试。")
-                                    last_attempt_note = attempt_note + " (challenge/po token)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                
-                                if has_login_required([], msg):
-                                    force_browser_cookie = True
-                                    for c in client_set:
-                                        if c in {"tv", "tv_embedded"}:
-                                            disabled_clients_reason[c] = "需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。"
-                                    last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
-                                    last_attempt_note = attempt_note + " (login required)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                if "requested format not available" in strip_ansi(str(e)).lower():
-                                    last_err = e
-                                    continue # Skip current iteration and try next client/format
-                                
-                                # 针对 "DRM protected" 错误，直接跳过当前 client
-                                if "drm protected" in msg.lower():
-                                    if "tv" in client_set:
-                                        disabled_clients_reason["tv"] = "TV 客户端遭遇 DRM 保护限制。"
-                                    last_err = RuntimeError("当前客户端遭遇 DRM 保护限制。")
-                                    last_attempt_note = attempt_note + " (DRM protected)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                    
-                                raise e
+                                def has_audio_format(info: dict) -> bool:
+                                    return pick_audio_format(info, False, None) is not None or pick_audio_format(info, True, None) is not None
 
-                            try:
-                                if has_login_required(logger.lines):
-                                    force_browser_cookie = True
-                                    for c in client_set:
-                                        if c in {"tv", "tv_embedded"}:
-                                            disabled_clients_reason[c] = "需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。"
-                                    last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
-                                    last_attempt_note = attempt_note + " (login required)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                if has_po_token_required(logger.lines) and any(c in {"android", "ios", "mweb"} for c in client_set):
-                                    force_browser_cookie = True
-                                    for c in client_set:
-                                        if c in {"android", "ios", "mweb"}:
-                                            disabled_clients_reason[c] = "该客户端需要 PO Token，已降级到其他客户端。"
-                                    last_err = RuntimeError("该客户端需要 PO Token，已降级到其他客户端。")
-                                    last_attempt_note = attempt_note + " (po token required)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                if has_js_challenge_failure(logger.lines):
-                                    force_browser_cookie = True
-                                    if "web" in client_set:
-                                        disabled_clients_reason["web"] = "JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。"
-                                    last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
-                                    last_attempt_note = attempt_note + " (js challenge failed)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                if not has_audio_format(info):
-                                    if "web" in client_set:
-                                        disabled_clients_reason["web"] = "未检测到可用音频格式。建议升级 yt-dlp 或更换网络。"
-                                    last_err = RuntimeError("未检测到可用音频格式。建议升级 yt-dlp 或更换网络。")
-                                    last_attempt_note = attempt_note + " (no audio formats)"
-                                    last_debug_lines = logger.lines[-80:]
-                                    continue
-                                if fmt:
-                                    prefer_worst = fmt == "worstaudio/worst" or fmt == "worstaudio" or fmt == "worst"
-                                    preferred_ext = None
-                                    if "ext=m4a" in fmt:
-                                        preferred_ext = "m4a"
-                                    elif "ext=webm" in fmt:
-                                        preferred_ext = "webm"
-                                    elif "ext=opus" in fmt:
-                                        preferred_ext = "opus"
-                                    chosen = pick_audio_format(info, prefer_worst, preferred_ext)
-                                    if chosen:
-                                        ydl.params["format"] = chosen
-                                    else:
-                                        last_err = RuntimeError("Requested format is not available")
+                                try:
+                                    if client_set and any(c in disabled_clients_reason for c in client_set):
+                                        reason = next((disabled_clients_reason.get(c) for c in client_set if c in disabled_clients_reason), "Client disabled")
+                                        if last_err is None:
+                                            last_err = RuntimeError(reason)
+                                        continue
+
+                                    info = ydl.extract_info(video_url, download=False)
+                                except DownloadError as e:
+                                    msg = strip_ansi(str(e))
+                                    has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
+                                    if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
+                                        last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
+                                        if cfb:
+                                            disabled_browsers.add(cfb)
+                                        continue
+                                    if "missing a URL" in msg or "SABR streaming" in msg:
+                                        if "web_safari" in client_set:
+                                            disabled_clients_reason["web_safari"] = "Web Safari 客户端不兼容 (SABR/Missing URL)。"
+                                        last_err = RuntimeError("Web Safari 客户端不兼容。")
+                                        last_attempt_note = attempt_note + " (web_safari issue)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    if "po token" in msg.lower() or "challenge solving failed" in msg.lower() or "only images are available" in msg.lower():
+                                        force_browser_cookie = True
+                                        last_err = RuntimeError("YouTube 触发挑战校验（PO Token/JS Challenge）。已自动切换为浏览器 Cookie 方案重试。")
+                                        last_attempt_note = attempt_note + " (challenge/po token)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    if has_login_required([], msg):
+                                        force_browser_cookie = True
+                                        for c in client_set:
+                                            if c in {"tv", "tv_embedded"}:
+                                                disabled_clients_reason[c] = "需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。"
+                                        last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
+                                        last_attempt_note = attempt_note + " (login required)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    if "requested format not available" in msg.lower():
+                                        last_err = e
                                         last_attempt_note = attempt_note
                                         last_debug_lines = logger.lines[-80:]
                                         continue
-                                info = ydl.extract_info(video_url, download=True)
-                                requested_paths = []
-                                if isinstance(info, dict):
-                                    last_video_id = str(info.get("id") or last_video_id)
-                                    requested_downloads = info.get("requested_downloads") or []
-                                    if isinstance(requested_downloads, list):
-                                        for item in requested_downloads:
-                                            if isinstance(item, dict):
-                                                fp = item.get("filepath")
-                                                if fp:
-                                                    requested_paths.append(Path(str(fp)))
-                                    requested_formats = info.get("requested_formats") or []
-                                    if isinstance(requested_formats, list):
-                                        for item in requested_formats:
-                                            if isinstance(item, dict):
-                                                fp = item.get("filepath")
-                                                if fp:
-                                                    requested_paths.append(Path(str(fp)))
-                                    direct_fp = info.get("filepath")
-                                    if direct_fp:
-                                        requested_paths.append(Path(str(direct_fp)))
-                                last_err = None
-                            except DownloadError as dl_err:
-                                if "requested format not available" in strip_ansi(str(dl_err)).lower():
+                                    if "drm protected" in msg.lower():
+                                        if "tv" in client_set:
+                                            disabled_clients_reason["tv"] = "TV 客户端遭遇 DRM 保护限制。"
+                                        last_err = RuntimeError("当前客户端遭遇 DRM 保护限制。")
+                                        last_attempt_note = attempt_note + " (DRM protected)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    raise e
+
+                                try:
+                                    if has_login_required(logger.lines):
+                                        force_browser_cookie = True
+                                        for c in client_set:
+                                            if c in {"tv", "tv_embedded"}:
+                                                disabled_clients_reason[c] = "需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。"
+                                        last_err = RuntimeError("需要登录或验证（可能触发人机校验）。已尝试自动读取浏览器 Cookie；如仍失败请手动开启或提供 cookies 文件。")
+                                        last_attempt_note = attempt_note + " (login required)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    if has_po_token_required(logger.lines) and any(c in {"android", "ios", "mweb"} for c in client_set):
+                                        force_browser_cookie = True
+                                        for c in client_set:
+                                            if c in {"android", "ios", "mweb"}:
+                                                disabled_clients_reason[c] = "该客户端需要 PO Token，已降级到其他客户端。"
+                                        last_err = RuntimeError("该客户端需要 PO Token，已降级到其他客户端。")
+                                        last_attempt_note = attempt_note + " (po token required)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    if has_js_challenge_failure(logger.lines):
+                                        force_browser_cookie = True
+                                        if "web" in client_set:
+                                            disabled_clients_reason["web"] = "JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。"
+                                        last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
+                                        last_attempt_note = attempt_note + " (js challenge failed)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+                                    if not has_audio_format(info):
+                                        if "web" in client_set:
+                                            disabled_clients_reason["web"] = "未检测到可用音频格式。建议升级 yt-dlp 或更换网络。"
+                                        last_err = RuntimeError("未检测到可用音频格式。建议升级 yt-dlp 或更换网络。")
+                                        last_attempt_note = attempt_note + " (no audio formats)"
+                                        last_debug_lines = logger.lines[-80:]
+                                        continue
+
+                                    if fmt:
+                                        prefer_worst = fmt in {"worstaudio/worst", "worstaudio", "worst"}
+                                        chosen = pick_audio_format(info, prefer_worst, None)
+                                        if chosen:
+                                            ydl.params["format"] = chosen
+                                        else:
+                                            last_err = RuntimeError("Requested format is not available")
+                                            last_attempt_note = attempt_note
+                                            last_debug_lines = logger.lines[-80:]
+                                            continue
+
+                                    info = ydl.extract_info(video_url, download=True)
+                                    requested_paths = []
+                                    if isinstance(info, dict):
+                                        last_video_id = str(info.get("id") or last_video_id)
+                                        requested_downloads = info.get("requested_downloads") or []
+                                        if isinstance(requested_downloads, list):
+                                            for item in requested_downloads:
+                                                if isinstance(item, dict):
+                                                    fp = item.get("filepath")
+                                                    if fp:
+                                                        requested_paths.append(Path(str(fp)))
+                                        requested_formats = info.get("requested_formats") or []
+                                        if isinstance(requested_formats, list):
+                                            for item in requested_formats:
+                                                if isinstance(item, dict):
+                                                    fp = item.get("filepath")
+                                                    if fp:
+                                                        requested_paths.append(Path(str(fp)))
+                                        direct_fp = info.get("filepath")
+                                        if direct_fp:
+                                            requested_paths.append(Path(str(direct_fp)))
+                                    last_err = None
+                                except DownloadError as dl_err:
+                                    last_err = dl_err
+                                    last_attempt_note = attempt_note
+                                    last_debug_lines = logger.lines[-80:]
+                                    if "HTTP Error 429" in strip_ansi(str(dl_err)):
+                                        time.sleep(2.0 * (attempt + 1))
+                                    continue
+                                except Exception as dl_err:
                                     last_err = dl_err
                                     last_attempt_note = attempt_note
                                     last_debug_lines = logger.lines[-80:]
                                     continue
-                                last_err = dl_err
-                                last_attempt_note = attempt_note
-                                last_debug_lines = logger.lines[-80:]
-                                break
-                            except Exception as dl_err:
-                                last_err = dl_err
-                                last_attempt_note = attempt_note
-                                last_debug_lines = logger.lines[-80:]
-                                break
-                                
-                    except DownloadError as e:
-                        msg = strip_ansi(str(e))
-                        
-                        has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
-                        if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
-                            last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
-                            if cfb:
-                                disabled_browsers.add(cfb)
-                            continue
 
-                        if "requested format not available" in msg.lower():
-                            last_err = e
+                        except DownloadError as e:
+                            msg = strip_ansi(str(e))
+                            has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
+                            if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
+                                last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
+                                if cfb:
+                                    disabled_browsers.add(cfb)
+                                continue
+                            if ("ejs" in msg.lower()) or ("challenge solving failed" in msg.lower()) or ("js runtimes: none" in msg.lower()) or ("only images are available" in msg.lower()):
+                                disabled_clients_reason["web"] = "Web 客户端挑战失败，已禁用。"
+                                last_attempt_note = attempt_note + " (EJS/JS runtime issue, web disabled)"
+                                last_debug_lines = logger.lines[-80:]
+                                continue
+                            if not cookiefile and not cfb:
+                                no_cookie_error = e
+                                last_err = e
+                            else:
+                                last_err = no_cookie_error if no_cookie_error else e
+                            last_attempt_note = attempt_note
+                            last_debug_lines = logger.lines[-80:]
+                            if "HTTP Error 429" in msg or "429" in msg:
+                                time.sleep(2.0 * (attempt + 1))
+                            continue
+                        except Exception as e:
+                            if not cookiefile and not cfb:
+                                no_cookie_error = e
+                                last_err = e
+                            else:
+                                if no_cookie_error:
+                                    last_err = no_cookie_error
+                                elif not CookieManager.is_cookie_error(str(e)):
+                                    last_err = e
                             last_attempt_note = attempt_note
                             last_debug_lines = logger.lines[-80:]
                             continue
-                        
-                        # 检测 EJS 挑战失败或缺少 JS runtime，禁用 web client
-                        if ("ejs" in msg.lower()) or ("challenge solving failed" in msg.lower()) or ("js runtimes: none" in msg.lower()) or ("only images are available" in msg.lower()):
-                            disabled_clients_reason["web"] = "Web 客户端挑战失败，已禁用。"
-                            last_attempt_note = attempt_note + " (EJS/JS runtime issue, web disabled)"
-                            last_debug_lines = logger.lines[-80:]
-                            continue
-
-                        if not cookiefile and not cfb:
-                            no_cookie_error = e
-                            last_err = e
-                        else:
-                            if no_cookie_error:
-                                last_err = no_cookie_error
-                            else:
-                                last_err = e
-                        last_attempt_note = attempt_note
-                        last_debug_lines = logger.lines[-80:]
-
-                        if "HTTP Error 429" in msg or "429" in msg:
-                            time.sleep(2.0 * (attempt + 1))
-                            continue
-                        continue
-                    except Exception as e:
-                        if not cookiefile and not cfb:
-                            no_cookie_error = e
-                            last_err = e
-                        else:
-                            if no_cookie_error:
-                                last_err = no_cookie_error
-                            elif CookieManager.is_cookie_error(str(e)):
-                                if no_cookie_error:
-                                    last_err = no_cookie_error
-                            else:
-                                last_err = e
-                        last_attempt_note = attempt_note
-                        last_debug_lines = logger.lines[-80:]
-                        continue
 
                 if last_err is None:
                     # 成功获取到信息（且下载成功），不需要再重试其他 client
                     pass
 
+                media_suffixes = {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg", ".mp4", ".mkv", ".mov", ".m4v", ".ts", ".m4s"}
                 candidates = []
                 temp_outputs = []
                 for p in Path(tmp).rglob("*"):
@@ -2315,12 +2271,12 @@ def transcribe_video_audio_with_ytdlp(
                         continue
                     temp_outputs.append(f"{p.name} ({p.stat().st_size} bytes)")
                     ext = p.suffix.lower()
-                    if ext in {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg"}:
+                    if ext in media_suffixes:
                         candidates.append(p)
                 if not candidates:
                     for p in requested_paths:
                         try:
-                            if p.is_file() and p.suffix.lower() in {".m4a", ".webm", ".mp3", ".wav", ".opus", ".aac", ".flac", ".ogg"}:
+                            if p.is_file() and p.suffix.lower() in media_suffixes:
                                 candidates.append(p)
                         except Exception:
                             continue
