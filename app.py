@@ -992,24 +992,81 @@ def internal_fetch_transcript(video_url, progress_callback=None):
     except Exception as e:
         return None, format_error(e)
 
-def internal_summarize(text, model_name):
-    """
-    核心总结逻辑，返回 (summary_text, error_msg)
-    """
-    if not api_key:
-        return None, "请在侧边栏填写 API Key"
-    try:
-        summary = summarize_text(
-            text,
-            api_key,
-            base_url,
-            model_name,
-            proxy_input
-        )
-        return summary, None
-    except Exception as e:
-        return None, str(e)
+def internal_summarize(text, model_name, api_key_override=None, base_url_override=None, proxy_override=None):
+        """
+        核心总结逻辑，返回 (summary_text, error_msg)
+        支持外部传入凭证（用于后台线程）
+        """
+        eff_api_key = api_key_override or api_key
+        eff_base_url = base_url_override or base_url
+        eff_proxy = proxy_override or proxy_input
+        
+        if not eff_api_key:
+            return None, "请在侧边栏填写 API Key"
+        try:
+            summary = summarize_text(
+                text,
+                eff_api_key,
+                eff_base_url,
+                model_name,
+                eff_proxy,
+                stream=False  # 后台任务默认不使用流式
+            )
+            return summary, None
+        except Exception as e:
+            return None, str(e)
 
+
+# ==========================
+# ====== 新增：后台任务状态轮询 ======
+# ==========================
+import time
+from task_runner import submit_task, get_task_status
+
+if "bg_task_id" not in st.session_state:
+    st.session_state.bg_task_id = None
+
+# 如果有后台任务正在跑，展示进度条并自动刷新
+if st.session_state.bg_task_id:
+    task_id = st.session_state.bg_task_id
+    status_info = get_task_status(task_id)
+    
+    st.info(f"⏳ 后台任务进行中... (ID: {task_id[:8]})")
+    status_col1, status_col2 = st.columns([3, 1])
+    
+    with status_col1:
+        if status_info["status"] == "queued":
+            st.warning("🔄 任务排队中...")
+        elif status_info["status"] == "running":
+            with st.spinner("🚀 正在抓取和总结中，请稍候..."):
+                time.sleep(2)  # 给前端一点喘息时间
+        elif status_info["status"] == "success":
+            st.success("✅ 任务完成！")
+            st.markdown("### 总结结果")
+            st.write(status_info.get("result", "无内容返回"))
+            # 完成后清空 task_id 允许提交新任务
+            if st.button("清理状态并开启新任务"):
+                st.session_state.bg_task_id = None
+                st.rerun()
+        elif status_info["status"] == "failed":
+            st.error(f"❌ 任务失败: {status_info.get('error', '未知错误')}")
+            if st.button("清理状态并重试"):
+                st.session_state.bg_task_id = None
+                st.rerun()
+    
+    with status_col2:
+        if status_info["status"] in ["queued", "running"]:
+            if st.button("刷新进度"):
+                st.rerun()
+                
+    # 只要还在跑，就自动触发重新执行页面（模拟轮询）
+    if status_info["status"] in ["queued", "running"]:
+        time.sleep(3)
+        st.rerun()
+        
+    # 如果有后台任务在跑，就不要展示下面的输入框了，避免冲突
+    st.stop()
+# ====== 新增结束 ======
 
 # ==========================
 # Tab 1: 单视频处理
@@ -1022,10 +1079,21 @@ with tab_single:
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         fetch_btn = st.button("🚀 一键抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
+        # --- 新增后台任务提交按钮 ---
+        bg_fetch_btn = st.button("后台异步处理 (防超时)", type="secondary", use_container_width=True)
     with col2:
         summary_btn = st.button("🤖 仅重新生成总结", use_container_width=True, key="btn_single_sum")
     with col3:
         check_btn = st.button("🔍 检测可用字幕", use_container_width=True, key="btn_single_check")
+
+    # --- 新增异步任务触发逻辑 ---
+    if bg_fetch_btn:
+        if not url:
+            st.warning("请输入视频链接")
+        else:
+            task_id = submit_task(url, model_selected, proxy_input, use_system_proxy, api_key, base_url, settings)
+            st.session_state.bg_task_id = task_id
+            st.rerun()
 
     def do_fetch_single():
         if not url:
