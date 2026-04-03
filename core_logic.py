@@ -2007,6 +2007,7 @@ def transcribe_video_audio_with_ytdlp(
         disabled_clients_reason: dict[str, str] = {}
         
         start_time = time.time()
+        requested_paths: list[Path] = []
         
         for client_set in client_strategies:
             for attempt in range(max(1, int(retries)) + 1):
