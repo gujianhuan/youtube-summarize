@@ -12,6 +12,7 @@ import shutil
 import random
 import hashlib
 import base64
+import subprocess
 import requests
 import platform
 from pathlib import Path
@@ -2140,8 +2141,6 @@ def transcribe_video_audio_with_ytdlp(
                                     if not audio_url:
                                         return None
                                     protocol = str(format_info.get("protocol") or "").lower()
-                                    if "m3u8" in protocol or "dash" in protocol:
-                                        return None
 
                                     ext = str(format_info.get("ext") or "bin").lower() or "bin"
                                     format_id = str(format_info.get("format_id") or "direct")
@@ -2156,6 +2155,49 @@ def transcribe_video_audio_with_ytdlp(
 
                                     headers = dict(opts.get("http_headers") or {})
                                     headers["Referer"] = video_url
+
+                                    if "m3u8" in protocol or "dash" in protocol:
+                                        if not ffmpeg_binary_path or not os.path.exists(ffmpeg_binary_path):
+                                            logger.warning("Direct media download fallback skipped: ffmpeg binary is unavailable for streaming protocol")
+                                            return None
+                                        ffmpeg_output = Path(output_dir) / f"{base_name}.{format_id}.m4a"
+                                        ffmpeg_cmd = [
+                                            ffmpeg_binary_path,
+                                            "-y",
+                                            "-nostdin",
+                                            "-loglevel",
+                                            "error",
+                                        ]
+                                        user_agent = str(headers.get("User-Agent") or "").strip()
+                                        referer = str(headers.get("Referer") or "").strip()
+                                        if user_agent:
+                                            ffmpeg_cmd.extend(["-user_agent", user_agent])
+                                        if referer:
+                                            ffmpeg_cmd.extend(["-headers", f"Referer: {referer}\r\n"])
+                                        ffmpeg_cmd.extend([
+                                            "-i",
+                                            audio_url,
+                                            "-vn",
+                                            "-acodec",
+                                            "copy",
+                                            str(ffmpeg_output),
+                                        ])
+                                        try:
+                                            completed = subprocess.run(
+                                                ffmpeg_cmd,
+                                                capture_output=True,
+                                                text=True,
+                                                timeout=max(30, int(float(timeout_seconds) * 2)),
+                                                check=False,
+                                            )
+                                            if completed.returncode == 0 and ffmpeg_output.exists() and ffmpeg_output.stat().st_size > 16 * 1024:
+                                                logger.info("Direct media download fallback succeeded via ffmpeg streaming capture")
+                                                return ffmpeg_output
+                                            stderr_tail = (completed.stderr or "").strip()[-500:]
+                                            logger.warning(f"Direct media download fallback via ffmpeg failed: {stderr_tail}")
+                                        except Exception as e:
+                                            logger.warning(f"Direct media download fallback via ffmpeg failed: {e}")
+                                        return None
 
                                     try:
                                         with session.get(audio_url, headers=headers, stream=True, timeout=max(5.0, float(timeout_seconds))) as resp:
@@ -2302,6 +2344,13 @@ def transcribe_video_audio_with_ytdlp(
                                         direct_file = direct_download_audio(selected_audio_entry, tmp)
                                         if direct_file:
                                             requested_paths.append(direct_file)
+                                        elif isinstance(selected_audio_entry, dict):
+                                            selected_protocol = str(selected_audio_entry.get("protocol") or "").lower() or "unknown"
+                                            selected_ext = str(selected_audio_entry.get("ext") or "").lower() or "unknown"
+                                            last_err = RuntimeError(f"直链下载兜底失败（protocol={selected_protocol}, ext={selected_ext}）")
+                                            last_attempt_note = attempt_note + " (direct media fallback failed)"
+                                            last_debug_lines = logger.lines[-80:]
+                                            continue
                                     last_err = None
                                 except DownloadError as dl_err:
                                     last_err = dl_err
