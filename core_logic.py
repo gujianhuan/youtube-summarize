@@ -184,6 +184,19 @@ def build_cookie_runtime_diagnostics(
     return "; ".join(parts)
 
 
+def build_runtime_version_diagnostics() -> str:
+    """输出当前运行实例的版本信息，便于确认 Render 是否部署到最新提交。"""
+    render_commit = str(os.environ.get("RENDER_GIT_COMMIT", "") or "").strip()
+    render_service = str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip()
+    render_instance = str(os.environ.get("RENDER_INSTANCE_ID", "") or "").strip()
+    app_expected_commit = "2d3eaa6"
+    parts = [f"expected_commit={app_expected_commit}"]
+    parts.append(f"render_commit={render_commit or 'unknown'}")
+    parts.append(f"render_service={'set' if render_service else 'unknown'}")
+    parts.append(f"render_instance={'set' if render_instance else 'unknown'}")
+    return "; ".join(parts)
+
+
 class TimeoutSession(requests.Session):
     def __init__(self, timeout_seconds: float):
         super().__init__()
@@ -2103,6 +2116,7 @@ def transcribe_video_audio_with_ytdlp(
             f"input_browser={cookies_from_browser or 'none'}"
         )
         selected_audio_summary = ""
+        runtime_version_summary = build_runtime_version_diagnostics()
         
         start_time = time.time()
         requested_paths: list[Path] = []
@@ -2546,6 +2560,7 @@ def transcribe_video_audio_with_ytdlp(
                     if cookie_debug_summary:
                         detail_lines.append("Cookies 运行时诊断:\n" + cookie_debug_summary)
                     detail_lines.append("Cookies 传参诊断:\n" + cookie_runtime_hint)
+                    detail_lines.append("运行版本诊断:\n" + runtime_version_summary)
                     detail_text = "\n".join(detail_lines)
                     if last_err and str(last_err).strip().startswith("未下载到音频文件"):
                         pass
