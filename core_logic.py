@@ -2102,6 +2102,7 @@ def transcribe_video_audio_with_ytdlp(
             f"input_cookie_exists={'yes' if cookie_file_exists else 'no'}; "
             f"input_browser={cookies_from_browser or 'none'}"
         )
+        selected_audio_summary = ""
         
         start_time = time.time()
         requested_paths: list[Path] = []
@@ -2193,6 +2194,22 @@ def transcribe_video_audio_with_ytdlp(
 
                                 def has_audio_format(info: dict) -> bool:
                                     return pick_audio_format(info, False, None) is not None or pick_audio_format(info, True, None) is not None
+
+                                def summarize_audio_entry(info: dict, chosen_entry: dict | None) -> str:
+                                    formats = info.get("formats") if isinstance(info, dict) else None
+                                    audio_count = 0
+                                    if isinstance(formats, list):
+                                        for item in formats:
+                                            if isinstance(item, dict) and item.get("acodec") not in (None, "", "none"):
+                                                audio_count += 1
+                                    if not isinstance(chosen_entry, dict):
+                                        return f"audio_format_count={audio_count}; selected=none"
+                                    return (
+                                        f"audio_format_count={audio_count}; "
+                                        f"selected_format_id={chosen_entry.get('format_id') or 'unknown'}; "
+                                        f"selected_ext={chosen_entry.get('ext') or 'unknown'}; "
+                                        f"selected_protocol={chosen_entry.get('protocol') or 'unknown'}"
+                                    )
 
                                 def direct_download_audio(format_info: dict | None, output_dir: str) -> Path | None:
                                     """在 yt-dlp 没有落地产物时，直接下载可访问的音频流。"""
@@ -2367,10 +2384,12 @@ def transcribe_video_audio_with_ytdlp(
                                         continue
 
                                     selected_audio_entry = pick_audio_format_entry(info, False, None)
+                                    selected_audio_summary = summarize_audio_entry(info, selected_audio_entry)
                                     if fmt:
                                         prefer_worst = fmt in {"worstaudio/worst", "worstaudio", "worst"}
                                         chosen = pick_audio_format(info, prefer_worst, None)
                                         selected_audio_entry = pick_audio_format_entry(info, prefer_worst, None)
+                                        selected_audio_summary = summarize_audio_entry(info, selected_audio_entry)
                                         if chosen:
                                             ydl.params["format"] = chosen
                                         else:
@@ -2410,6 +2429,11 @@ def transcribe_video_audio_with_ytdlp(
                                             selected_ext = str(selected_audio_entry.get("ext") or "").lower() or "unknown"
                                             last_err = RuntimeError(f"直链下载兜底失败（protocol={selected_protocol}, ext={selected_ext}）")
                                             last_attempt_note = attempt_note + " (direct media fallback failed)"
+                                            last_debug_lines = logger.lines[-80:]
+                                            continue
+                                        else:
+                                            last_err = RuntimeError("yt-dlp 未返回可用音频入口摘要，无法执行直链下载兜底。")
+                                            last_attempt_note = attempt_note + " (no selected audio entry)"
                                             last_debug_lines = logger.lines[-80:]
                                             continue
                                     last_err = None
@@ -2517,6 +2541,8 @@ def transcribe_video_audio_with_ytdlp(
                         detail_lines.append("临时目录文件:\n" + "\n".join(temp_outputs[:12]))
                     if requested_paths:
                         detail_lines.append("yt-dlp 报告的输出路径:\n" + "\n".join(str(p) for p in requested_paths[:12]))
+                    if selected_audio_summary:
+                        detail_lines.append("音频格式诊断:\n" + selected_audio_summary)
                     if cookie_debug_summary:
                         detail_lines.append("Cookies 运行时诊断:\n" + cookie_debug_summary)
                     detail_lines.append("Cookies 传参诊断:\n" + cookie_runtime_hint)
