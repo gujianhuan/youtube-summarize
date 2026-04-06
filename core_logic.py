@@ -135,6 +135,55 @@ def resolve_cookie_file(
     return str(cookie_path)
 
 
+def build_cookie_runtime_diagnostics(
+    api=None,
+    *,
+    cookies_file: str = "",
+    cookies_from_browser: str = "",
+    resolved_cookie_file: str = "",
+    resolve_error: str = "",
+) -> str:
+    """
+    生成 cookies 运行时诊断信息。
+
+    只输出来源、长度、文件存在性等元数据，不泄露真实 cookie 内容。
+    """
+    raw_file = str(cookies_file or getattr(api, "_cookies_file", "") or "").strip()
+    raw_content = str(getattr(api, "_cookies_content", "") or "").strip()
+    raw_b64 = str(getattr(api, "_cookies_content_b64", "") or "").strip()
+    browser = str(cookies_from_browser or getattr(api, "_cookies_from_browser", "") or "").strip().lower()
+
+    parts = [
+        f"input_file={'yes' if raw_file else 'no'}",
+        f"input_content={'yes' if raw_content else 'no'}",
+        f"input_b64={'yes' if raw_b64 else 'no'}",
+        f"browser={browser or 'none'}",
+    ]
+    if raw_b64:
+        parts.append(f"b64_len={len(raw_b64)}")
+    if resolve_error:
+        parts.append(f"resolve_error={resolve_error}")
+
+    resolved_path = str(resolved_cookie_file or "").strip()
+    if resolved_path:
+        try:
+            cookie_path = Path(resolved_path)
+            exists = cookie_path.exists()
+            parts.append(f"resolved_file={'yes' if exists else 'no'}")
+            parts.append(f"resolved_name={cookie_path.name}")
+            if exists:
+                parts.append(f"resolved_size={cookie_path.stat().st_size}")
+                first_line = cookie_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                first_line_text = first_line[0].strip() if first_line else ""
+                parts.append(f"netscape_header={'yes' if first_line_text.startswith('# Netscape HTTP Cookie File') else 'no'}")
+        except Exception as e:
+            parts.append(f"resolved_check_error={type(e).__name__}:{e}")
+    else:
+        parts.append("resolved_file=no")
+
+    return "; ".join(parts)
+
+
 class TimeoutSession(requests.Session):
     def __init__(self, timeout_seconds: float):
         super().__init__()
@@ -1971,7 +2020,8 @@ def transcribe_video_audio_with_ytdlp(
     model_name: str,
     language: str,
     status_callback=None,
-    fast_mode: bool = False
+    fast_mode: bool = False,
+    cookie_debug_summary: str = "",
 ) -> tuple[str, str]:
     class YdlLogger:
         def __init__(self) -> None:
@@ -2451,6 +2501,8 @@ def transcribe_video_audio_with_ytdlp(
                         detail_lines.append("临时目录文件:\n" + "\n".join(temp_outputs[:12]))
                     if requested_paths:
                         detail_lines.append("yt-dlp 报告的输出路径:\n" + "\n".join(str(p) for p in requested_paths[:12]))
+                    if cookie_debug_summary:
+                        detail_lines.append("Cookies 运行时诊断:\n" + cookie_debug_summary)
                     detail_text = "\n".join(detail_lines)
                     if last_err and str(last_err).strip().startswith("未下载到音频文件"):
                         pass
@@ -2814,12 +2866,24 @@ def get_video_transcript(
         proxy_url = str(getattr(api, "_effective_proxy", "") or "")
         timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
         retries = int(getattr(api, "_retries", 2) or 2)
-        cookies_file = resolve_cookie_file(
-            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
-            cookies_content=str(getattr(api, "_cookies_content", "") or ""),
-            cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
-        )
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
+        cookie_resolve_error = ""
+        try:
+            cookies_file = resolve_cookie_file(
+                cookies_file=str(getattr(api, "_cookies_file", "") or ""),
+                cookies_content=str(getattr(api, "_cookies_content", "") or ""),
+                cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
+            )
+        except Exception as e:
+            cookie_resolve_error = f"{type(e).__name__}:{e}"
+            cookies_file = ""
+        cookie_debug_summary = build_cookie_runtime_diagnostics(
+            api,
+            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
+            cookies_from_browser=cookies_from_browser,
+            resolved_cookie_file=cookies_file,
+            resolve_error=cookie_resolve_error,
+        )
         asr_enabled = bool(getattr(api, "_asr_enabled", False))
         asr_model = str(getattr(api, "_asr_model", "") or "")
         asr_language = str(getattr(api, "_asr_language", "") or "")
@@ -2857,11 +2921,12 @@ def get_video_transcript(
                     model_name=asr_model,
                     language=asr_language,
                     status_callback=status_cb,
-                    fast_mode=asr_fast_mode
+                    fast_mode=asr_fast_mode,
+                    cookie_debug_summary=cookie_debug_summary,
                 )
                 return f"[bilibili-whisper | {label}]\n\n{text}"
             except Exception as e:
-                raise RuntimeError(f"Bilibili 视频转写失败: {e}")
+                raise RuntimeError(f"Bilibili 视频转写失败: {e}\nCookies 运行时诊断: {cookie_debug_summary}")
         
         raise RuntimeError("Bilibili 视频未找到字幕，且未启用音频转写 (Whisper)。")
 
@@ -2897,12 +2962,24 @@ def get_video_transcript(
         proxy_url = str(getattr(api, "_effective_proxy", "") or "")
         timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
         retries = int(getattr(api, "_retries", 2) or 2)
-        cookies_file = resolve_cookie_file(
-            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
-            cookies_content=str(getattr(api, "_cookies_content", "") or ""),
-            cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
-        )
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
+        cookie_resolve_error = ""
+        try:
+            cookies_file = resolve_cookie_file(
+                cookies_file=str(getattr(api, "_cookies_file", "") or ""),
+                cookies_content=str(getattr(api, "_cookies_content", "") or ""),
+                cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
+            )
+        except Exception as resolve_exc:
+            cookie_resolve_error = f"{type(resolve_exc).__name__}:{resolve_exc}"
+            cookies_file = ""
+        cookie_debug_summary = build_cookie_runtime_diagnostics(
+            api,
+            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
+            cookies_from_browser=cookies_from_browser,
+            resolved_cookie_file=cookies_file,
+            resolve_error=cookie_resolve_error,
+        )
         try:
             label, text = fetch_subtitles_with_ytdlp(
                 video_url,
@@ -2933,10 +3010,13 @@ def get_video_transcript(
                 model_name=asr_model,
                 language=asr_language,
                 status_callback=status_cb,
-                fast_mode=asr_fast_mode
+                fast_mode=asr_fast_mode,
+                cookie_debug_summary=cookie_debug_summary,
             )
             return f"[asr | {label}]\n\n{text}"
 
+        if cookie_debug_summary:
+            raise RuntimeError(f"{e}\nCookies 运行时诊断: {cookie_debug_summary}")
         raise e
 
 
