@@ -358,10 +358,11 @@ class CookieManager:
         file_path = (cookies_file or "").strip()
         browser_name = (cookies_from_browser or "").strip().lower()
         
-        if file_path and os.path.exists(file_path):
-            return [(file_path, ""), ("", "")]
-            
         sources: list[tuple[str, str]] = []
+        if file_path:
+            # 只要上层已提供 cookies 文件路径，就优先尝试文件模式。
+            # 不在这里强依赖 exists 判断，避免云端时序/挂载差异导致错误退化为 cookie=none。
+            sources.append((file_path, ""))
         
         # 确定浏览器候选列表
         candidates = []
@@ -2094,6 +2095,12 @@ def transcribe_video_audio_with_ytdlp(
         disabled_browsers: set[str] = set()
         disabled_clients_reason: dict[str, str] = {}
         impersonate_available = True
+        cookie_file_exists = bool((cookies_file or "").strip()) and os.path.exists((cookies_file or "").strip())
+        cookie_runtime_hint = (
+            f"input_cookie_file={'yes' if (cookies_file or '').strip() else 'no'}; "
+            f"input_cookie_exists={'yes' if cookie_file_exists else 'no'}; "
+            f"input_browser={cookies_from_browser or 'none'}"
+        )
         
         start_time = time.time()
         requested_paths: list[Path] = []
@@ -2503,6 +2510,7 @@ def transcribe_video_audio_with_ytdlp(
                         detail_lines.append("yt-dlp 报告的输出路径:\n" + "\n".join(str(p) for p in requested_paths[:12]))
                     if cookie_debug_summary:
                         detail_lines.append("Cookies 运行时诊断:\n" + cookie_debug_summary)
+                    detail_lines.append("Cookies 传参诊断:\n" + cookie_runtime_hint)
                     detail_text = "\n".join(detail_lines)
                     if last_err and str(last_err).strip().startswith("未下载到音频文件"):
                         pass
