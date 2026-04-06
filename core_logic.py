@@ -2105,6 +2105,7 @@ def transcribe_video_audio_with_ytdlp(
         
         start_time = time.time()
         requested_paths: list[Path] = []
+        download_ready = False
         
         for client_set in client_strategies:
             for attempt in range(max(1, int(retries)) + 1):
@@ -2112,6 +2113,8 @@ def transcribe_video_audio_with_ytdlp(
                     if cfb and cfb in disabled_browsers:
                         continue
                     for fmt in format_candidates:
+                        if download_ready:
+                            break
                         client_label = ",".join(client_set) if client_set else "default"
                         attempt_note = f"client={client_label} fmt={(fmt or 'default')} cookie={'file' if cookiefile else ('browser' if cfb else 'none')}"
 
@@ -2410,6 +2413,8 @@ def transcribe_video_audio_with_ytdlp(
                                             last_debug_lines = logger.lines[-80:]
                                             continue
                                     last_err = None
+                                    download_ready = True
+                                    break
                                 except DownloadError as dl_err:
                                     last_err = dl_err
                                     last_attempt_note = attempt_note
@@ -2464,6 +2469,9 @@ def transcribe_video_audio_with_ytdlp(
                             last_attempt_note = attempt_note
                             last_debug_lines = logger.lines[-80:]
                             continue
+
+                    if download_ready:
+                        break
 
                 if last_err is None:
                     # 成功获取到信息（且下载成功），不需要再重试其他 client
