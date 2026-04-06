@@ -363,6 +363,7 @@ class CookieManager:
             # 只要上层已提供 cookies 文件路径，就优先尝试文件模式。
             # 不在这里强依赖 exists 判断，避免云端时序/挂载差异导致错误退化为 cookie=none。
             sources.append((file_path, ""))
+            return sources
         
         # 确定浏览器候选列表
         candidates = []
