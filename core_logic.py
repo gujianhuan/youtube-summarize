@@ -2121,6 +2121,7 @@ def transcribe_video_audio_with_ytdlp(
         start_time = time.time()
         requested_paths: list[Path] = []
         download_ready = False
+        last_err_type = ""
         
         for client_set in client_strategies:
             for attempt in range(max(1, int(retries)) + 1):
@@ -2442,11 +2443,13 @@ def transcribe_video_audio_with_ytdlp(
                                             selected_protocol = str(selected_audio_entry.get("protocol") or "").lower() or "unknown"
                                             selected_ext = str(selected_audio_entry.get("ext") or "").lower() or "unknown"
                                             last_err = RuntimeError(f"直链下载兜底失败（protocol={selected_protocol}, ext={selected_ext}）")
+                                            last_err_type = type(last_err).__name__
                                             last_attempt_note = attempt_note + " (direct media fallback failed)"
                                             last_debug_lines = logger.lines[-80:]
                                             continue
                                         else:
                                             last_err = RuntimeError("yt-dlp 未返回可用音频入口摘要，无法执行直链下载兜底。")
+                                            last_err_type = type(last_err).__name__
                                             last_attempt_note = attempt_note + " (no selected audio entry)"
                                             last_debug_lines = logger.lines[-80:]
                                             continue
@@ -2455,6 +2458,7 @@ def transcribe_video_audio_with_ytdlp(
                                     break
                                 except DownloadError as dl_err:
                                     last_err = dl_err
+                                    last_err_type = type(dl_err).__name__
                                     last_attempt_note = attempt_note
                                     last_debug_lines = logger.lines[-80:]
                                     if "HTTP Error 429" in strip_ansi(str(dl_err)):
@@ -2462,6 +2466,7 @@ def transcribe_video_audio_with_ytdlp(
                                     continue
                                 except Exception as dl_err:
                                     last_err = dl_err
+                                    last_err_type = type(dl_err).__name__
                                     last_attempt_note = attempt_note
                                     last_debug_lines = logger.lines[-80:]
                                     continue
@@ -2471,6 +2476,7 @@ def transcribe_video_audio_with_ytdlp(
                             if "impersonate target" in msg.lower() and "not available" in msg.lower():
                                 impersonate_available = False
                                 last_err = RuntimeError("当前环境不支持 impersonate=chrome，已自动降级为普通请求模式重试。")
+                                last_err_type = type(last_err).__name__
                                 last_attempt_note = attempt_note + " (impersonate unavailable)"
                                 last_debug_lines = logger.lines[-80:]
                                 continue
@@ -2490,6 +2496,7 @@ def transcribe_video_audio_with_ytdlp(
                                 last_err = e
                             else:
                                 last_err = no_cookie_error if no_cookie_error else e
+                            last_err_type = type(last_err).__name__ if last_err else ""
                             last_attempt_note = attempt_note
                             last_debug_lines = logger.lines[-80:]
                             if "HTTP Error 429" in msg or "429" in msg:
@@ -2504,6 +2511,7 @@ def transcribe_video_audio_with_ytdlp(
                                     last_err = no_cookie_error
                                 elif not CookieManager.is_cookie_error(str(e)):
                                     last_err = e
+                            last_err_type = type(last_err).__name__ if last_err else ""
                             last_attempt_note = attempt_note
                             last_debug_lines = logger.lines[-80:]
                             continue
@@ -2537,11 +2545,15 @@ def transcribe_video_audio_with_ytdlp(
                     if last_attempt_note:
                         detail_lines.append(f"最近尝试: {last_attempt_note}")
                     if last_err:
-                        detail_lines.append(f"上一次错误: {strip_ansi(str(last_err))}")
+                        err_text = strip_ansi(str(last_err))
+                        if err_text:
+                            detail_lines.append(f"上一次错误: {err_text}")
+                        else:
+                            detail_lines.append(f"上一次错误: <empty message>; type={last_err_type or type(last_err).__name__}; repr={repr(last_err)}")
                     if last_debug_lines:
                         debug_seen: set[str] = set()
                         debug_tail: list[str] = []
-                        for item in last_debug_lines[-60:]:
+                        for item in reversed(last_debug_lines[-80:]):
                             k = item.strip().lower()
                             if not k or k in debug_seen:
                                 continue
@@ -2549,6 +2561,7 @@ def transcribe_video_audio_with_ytdlp(
                             debug_tail.append(item.strip())
                             if len(debug_tail) >= 12:
                                 break
+                        debug_tail.reverse()
                         tail = "\n".join(debug_tail)
                         detail_lines.append("调试日志(尾部):\n" + tail)
                     if temp_outputs:
