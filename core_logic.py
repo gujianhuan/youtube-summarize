@@ -2111,7 +2111,9 @@ def transcribe_video_audio_with_ytdlp(
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
         web_clients_enabled = bool(js_runtime_available and not running_on_render)
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["tv"], ["android"], ["ios"], ["mweb"]]
+        client_strategies = [["tv"], ["android"], ["ios"]]
+        if not running_on_render:
+            client_strategies.append(["mweb"])
         if web_clients_enabled:
             client_strategies.extend([["web_creator"], []])
 
