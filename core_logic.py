@@ -553,6 +553,14 @@ def has_po_token_required(lines: list[str]) -> bool:
         or ("gvs po token" in tail)
     )
 
+
+def detect_js_runtime() -> tuple[bool, str]:
+    runtimes = []
+    for name in ("node", "deno", "bun", "quickjs", "qjs"):
+        if shutil.which(name):
+            runtimes.append(name)
+    return bool(runtimes), ",".join(runtimes) if runtimes else "none"
+
 def has_login_required(lines: list[str], msg: str = "") -> bool:
     tail = "\n".join(lines[-160:]).lower()
     m = (msg or "").lower()
@@ -2099,8 +2107,11 @@ def transcribe_video_audio_with_ytdlp(
         no_cookie_error: Exception | None = None
         force_browser_cookie = False
 
+        js_runtime_available, js_runtime_name = detect_js_runtime()
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["android"], ["ios"], ["tv"], ["web_creator"], ["mweb"], []]
+        client_strategies = [["tv"], ["android"], ["ios"], ["mweb"]]
+        if js_runtime_available:
+            client_strategies.extend([["web_creator"], []])
 
         if fast_mode:
             format_candidates = ["worstaudio/worst", "bestaudio/best", None]
@@ -2113,7 +2124,9 @@ def transcribe_video_audio_with_ytdlp(
         cookie_runtime_hint = (
             f"input_cookie_file={'yes' if (cookies_file or '').strip() else 'no'}; "
             f"input_cookie_exists={'yes' if cookie_file_exists else 'no'}; "
-            f"input_browser={cookies_from_browser or 'none'}"
+            f"input_browser={cookies_from_browser or 'none'}; "
+            f"js_runtime_available={'yes' if js_runtime_available else 'no'}; "
+            f"js_runtime={js_runtime_name}"
         )
         selected_audio_summary = ""
         runtime_version_summary = build_runtime_version_diagnostics()
@@ -2376,13 +2389,15 @@ def transcribe_video_audio_with_ytdlp(
                                         last_debug_lines = logger.lines[-80:]
                                         continue
                                     if has_js_challenge_failure(logger.lines):
-                                        force_browser_cookie = True
-                                        if "web" in client_set:
-                                            disabled_clients_reason["web"] = "JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。"
-                                        last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
-                                        last_attempt_note = attempt_note + " (js challenge failed)"
-                                        last_debug_lines = logger.lines[-80:]
-                                        continue
+                                        web_like_client = (not client_set) or any(c in {"web", "web_creator", "web_safari"} for c in client_set)
+                                        if web_like_client:
+                                            force_browser_cookie = True
+                                            if "web" in client_set or "web_creator" in client_set:
+                                                disabled_clients_reason["web"] = "JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。"
+                                            last_err = RuntimeError("JS challenge 失败，可能导致格式缺失。建议升级 yt-dlp 或更换网络。")
+                                            last_attempt_note = attempt_note + " (js challenge failed)"
+                                            last_debug_lines = logger.lines[-80:]
+                                            continue
                                     if not has_audio_format(info):
                                         if "web" in client_set:
                                             disabled_clients_reason["web"] = "未检测到可用音频格式。建议升级 yt-dlp 或更换网络。"
