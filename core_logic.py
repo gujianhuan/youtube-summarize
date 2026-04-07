@@ -2111,11 +2111,14 @@ def transcribe_video_audio_with_ytdlp(
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
         web_clients_enabled = bool(js_runtime_available and not running_on_render)
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["tv"], ["android"], ["ios"]]
+        client_strategies = [["tv"], ["android"]]
+        if not has_cookie_hint:
+            client_strategies.append(["ios"])
         if not running_on_render:
             client_strategies.append(["mweb"])
         if web_clients_enabled:
             client_strategies.extend([["web_creator"], []])
+        client_plan = ", ".join("+".join(cs) if cs else "default" for cs in client_strategies)
 
         if fast_mode:
             format_candidates = ["worstaudio/worst", "bestaudio/best", None]
@@ -2132,7 +2135,8 @@ def transcribe_video_audio_with_ytdlp(
             f"js_runtime_available={'yes' if js_runtime_available else 'no'}; "
             f"js_runtime={js_runtime_name}; "
             f"running_on_render={'yes' if running_on_render else 'no'}; "
-            f"web_clients_enabled={'yes' if web_clients_enabled else 'no'}"
+            f"web_clients_enabled={'yes' if web_clients_enabled else 'no'}; "
+            f"client_plan={client_plan}"
         )
         selected_audio_summary = ""
         runtime_version_summary = build_runtime_version_diagnostics()
