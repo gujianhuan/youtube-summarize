@@ -762,7 +762,7 @@ def fetch_subtitles_with_ytdlp(
                     ydl_opts.pop("format", None)
                 try:
                     with YoutubeDL(ydl_opts) as ydl:
-                        return ydl.extract_info(video_url, download=False)
+                        return ydl.extract_info(video_url, download=False, process=False)
                 except DownloadError as e:
                     msg = strip_ansi(str(e))
                     if "Requested format is not available" in msg:
@@ -2311,7 +2311,7 @@ def transcribe_video_audio_with_ytdlp(
                                             last_err = RuntimeError(reason)
                                         continue
 
-                                    info = ydl.extract_info(video_url, download=False)
+                                    info = ydl.extract_info(video_url, download=False, process=False)
                                 except DownloadError as e:
                                     msg = strip_ansi(str(e))
                                     has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
