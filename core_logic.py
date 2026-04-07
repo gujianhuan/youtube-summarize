@@ -13,6 +13,7 @@ import random
 import hashlib
 import base64
 import subprocess
+import traceback
 import requests
 import platform
 from pathlib import Path
@@ -2122,6 +2123,7 @@ def transcribe_video_audio_with_ytdlp(
         requested_paths: list[Path] = []
         download_ready = False
         last_err_type = ""
+        last_traceback_text = ""
         
         for client_set in client_strategies:
             for attempt in range(max(1, int(retries)) + 1):
@@ -2413,52 +2415,58 @@ def transcribe_video_audio_with_ytdlp(
                                             last_debug_lines = logger.lines[-80:]
                                             continue
 
-                                    info = ydl.extract_info(video_url, download=True)
                                     requested_paths = []
-                                    if isinstance(info, dict):
-                                        last_video_id = str(info.get("id") or last_video_id)
-                                        requested_downloads = info.get("requested_downloads") or []
-                                        if isinstance(requested_downloads, list):
-                                            for item in requested_downloads:
-                                                if isinstance(item, dict):
-                                                    fp = item.get("filepath")
-                                                    if fp:
-                                                        requested_paths.append(Path(str(fp)))
-                                        requested_formats = info.get("requested_formats") or []
-                                        if isinstance(requested_formats, list):
-                                            for item in requested_formats:
-                                                if isinstance(item, dict):
-                                                    fp = item.get("filepath")
-                                                    if fp:
-                                                        requested_paths.append(Path(str(fp)))
-                                        direct_fp = info.get("filepath")
-                                        if direct_fp:
-                                            requested_paths.append(Path(str(direct_fp)))
+                                    direct_file = direct_download_audio(selected_audio_entry, tmp)
+                                    if direct_file:
+                                        requested_paths.append(direct_file)
+                                        if isinstance(info, dict):
+                                            last_video_id = str(info.get("id") or last_video_id)
+                                    else:
+                                        info = ydl.extract_info(video_url, download=True)
+                                        if isinstance(info, dict):
+                                            last_video_id = str(info.get("id") or last_video_id)
+                                            requested_downloads = info.get("requested_downloads") or []
+                                            if isinstance(requested_downloads, list):
+                                                for item in requested_downloads:
+                                                    if isinstance(item, dict):
+                                                        fp = item.get("filepath")
+                                                        if fp:
+                                                            requested_paths.append(Path(str(fp)))
+                                            requested_formats = info.get("requested_formats") or []
+                                            if isinstance(requested_formats, list):
+                                                for item in requested_formats:
+                                                    if isinstance(item, dict):
+                                                        fp = item.get("filepath")
+                                                        if fp:
+                                                            requested_paths.append(Path(str(fp)))
+                                            direct_fp = info.get("filepath")
+                                            if direct_fp:
+                                                requested_paths.append(Path(str(direct_fp)))
 
-                                    if not requested_paths:
-                                        direct_file = direct_download_audio(selected_audio_entry, tmp)
-                                        if direct_file:
-                                            requested_paths.append(direct_file)
-                                        elif isinstance(selected_audio_entry, dict):
-                                            selected_protocol = str(selected_audio_entry.get("protocol") or "").lower() or "unknown"
-                                            selected_ext = str(selected_audio_entry.get("ext") or "").lower() or "unknown"
-                                            last_err = RuntimeError(f"直链下载兜底失败（protocol={selected_protocol}, ext={selected_ext}）")
-                                            last_err_type = type(last_err).__name__
-                                            last_attempt_note = attempt_note + " (direct media fallback failed)"
-                                            last_debug_lines = logger.lines[-80:]
-                                            continue
-                                        else:
-                                            last_err = RuntimeError("yt-dlp 未返回可用音频入口摘要，无法执行直链下载兜底。")
-                                            last_err_type = type(last_err).__name__
-                                            last_attempt_note = attempt_note + " (no selected audio entry)"
-                                            last_debug_lines = logger.lines[-80:]
-                                            continue
+                                        if not requested_paths:
+                                            if isinstance(selected_audio_entry, dict):
+                                                selected_protocol = str(selected_audio_entry.get("protocol") or "").lower() or "unknown"
+                                                selected_ext = str(selected_audio_entry.get("ext") or "").lower() or "unknown"
+                                                last_err = RuntimeError(f"直链下载与 yt-dlp 下载均未产出文件（protocol={selected_protocol}, ext={selected_ext}）")
+                                                last_err_type = type(last_err).__name__
+                                                last_attempt_note = attempt_note + " (no output files)"
+                                                last_debug_lines = logger.lines[-80:]
+                                                continue
+                                            else:
+                                                last_err = RuntimeError("yt-dlp 未返回可用音频入口摘要，无法执行下载。")
+                                                last_err_type = type(last_err).__name__
+                                                last_attempt_note = attempt_note + " (no selected audio entry)"
+                                                last_debug_lines = logger.lines[-80:]
+                                                continue
                                     last_err = None
+                                    last_err_type = ""
+                                    last_traceback_text = ""
                                     download_ready = True
                                     break
                                 except DownloadError as dl_err:
                                     last_err = dl_err
                                     last_err_type = type(dl_err).__name__
+                                    last_traceback_text = traceback.format_exc()
                                     last_attempt_note = attempt_note
                                     last_debug_lines = logger.lines[-80:]
                                     if "HTTP Error 429" in strip_ansi(str(dl_err)):
@@ -2467,6 +2475,7 @@ def transcribe_video_audio_with_ytdlp(
                                 except Exception as dl_err:
                                     last_err = dl_err
                                     last_err_type = type(dl_err).__name__
+                                    last_traceback_text = traceback.format_exc()
                                     last_attempt_note = attempt_note
                                     last_debug_lines = logger.lines[-80:]
                                     continue
@@ -2477,6 +2486,7 @@ def transcribe_video_audio_with_ytdlp(
                                 impersonate_available = False
                                 last_err = RuntimeError("当前环境不支持 impersonate=chrome，已自动降级为普通请求模式重试。")
                                 last_err_type = type(last_err).__name__
+                                last_traceback_text = traceback.format_exc()
                                 last_attempt_note = attempt_note + " (impersonate unavailable)"
                                 last_debug_lines = logger.lines[-80:]
                                 continue
@@ -2497,6 +2507,7 @@ def transcribe_video_audio_with_ytdlp(
                             else:
                                 last_err = no_cookie_error if no_cookie_error else e
                             last_err_type = type(last_err).__name__ if last_err else ""
+                            last_traceback_text = traceback.format_exc()
                             last_attempt_note = attempt_note
                             last_debug_lines = logger.lines[-80:]
                             if "HTTP Error 429" in msg or "429" in msg:
@@ -2512,6 +2523,7 @@ def transcribe_video_audio_with_ytdlp(
                                 elif not CookieManager.is_cookie_error(str(e)):
                                     last_err = e
                             last_err_type = type(last_err).__name__ if last_err else ""
+                            last_traceback_text = traceback.format_exc()
                             last_attempt_note = attempt_note
                             last_debug_lines = logger.lines[-80:]
                             continue
@@ -2550,6 +2562,9 @@ def transcribe_video_audio_with_ytdlp(
                             detail_lines.append(f"上一次错误: {err_text}")
                         else:
                             detail_lines.append(f"上一次错误: <empty message>; type={last_err_type or type(last_err).__name__}; repr={repr(last_err)}")
+                    if last_traceback_text:
+                        trace_tail = "\n".join(last_traceback_text.strip().splitlines()[-12:])
+                        detail_lines.append("异常堆栈(尾部):\n" + trace_tail)
                     if last_debug_lines:
                         debug_seen: set[str] = set()
                         debug_tail: list[str] = []
