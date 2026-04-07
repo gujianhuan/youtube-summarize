@@ -190,7 +190,7 @@ def build_runtime_version_diagnostics() -> str:
     render_commit = str(os.environ.get("RENDER_GIT_COMMIT", "") or "").strip()
     render_service = str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip()
     render_instance = str(os.environ.get("RENDER_INSTANCE_ID", "") or "").strip()
-    app_expected_commit = "2d3eaa6"
+    app_expected_commit = "latest-local"
     parts = [f"expected_commit={app_expected_commit}"]
     parts.append(f"render_commit={render_commit or 'unknown'}")
     parts.append(f"render_service={'set' if render_service else 'unknown'}")
@@ -2109,7 +2109,6 @@ def transcribe_video_audio_with_ytdlp(
         
         disabled_browsers: set[str] = set()
         disabled_clients_reason: dict[str, str] = {}
-        impersonate_available = True
         cookie_file_exists = bool((cookies_file or "").strip()) and os.path.exists((cookies_file or "").strip())
         cookie_runtime_hint = (
             f"input_cookie_file={'yes' if (cookies_file or '').strip() else 'no'}; "
@@ -2161,8 +2160,6 @@ def transcribe_video_audio_with_ytdlp(
                             "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
                             "logger": logger,
                         }
-                        if impersonate_available:
-                            opts["impersonate"] = "chrome"
                         if client_set:
                             opts["extractor_args"] = {"youtube": {"player_client": client_set}}
                         if ffmpeg_binary_path:
@@ -2317,12 +2314,6 @@ def transcribe_video_audio_with_ytdlp(
                                     info = ydl.extract_info(video_url, download=False)
                                 except DownloadError as e:
                                     msg = strip_ansi(str(e))
-                                    if "impersonate target" in msg.lower() and "not available" in msg.lower():
-                                        impersonate_available = False
-                                        last_err = RuntimeError("当前环境不支持 impersonate=chrome，已自动降级为普通请求模式重试。")
-                                        last_attempt_note = attempt_note + " (impersonate unavailable)"
-                                        last_debug_lines = logger.lines[-80:]
-                                        continue
                                     has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
                                     if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
                                         last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
@@ -2482,14 +2473,6 @@ def transcribe_video_audio_with_ytdlp(
 
                         except DownloadError as e:
                             msg = strip_ansi(str(e))
-                            if "impersonate target" in msg.lower() and "not available" in msg.lower():
-                                impersonate_available = False
-                                last_err = RuntimeError("当前环境不支持 impersonate=chrome，已自动降级为普通请求模式重试。")
-                                last_err_type = type(last_err).__name__
-                                last_traceback_text = traceback.format_exc()
-                                last_attempt_note = attempt_note + " (impersonate unavailable)"
-                                last_debug_lines = logger.lines[-80:]
-                                continue
                             has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
                             if CookieManager.is_cookie_error(msg) or has_cookie_in_log:
                                 last_cookie_error = RuntimeError(CookieManager.get_fatal_msg(msg, cfb))
