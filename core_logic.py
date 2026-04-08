@@ -216,6 +216,7 @@ def try_fetch_transcript_via_remote_worker(
 
     timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0) if api else 60.0
     worker_timeout_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_TIMEOUT_SECONDS", "95") or "95")
+    poll_interval_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_POLL_INTERVAL_SECONDS", "2.0") or "2.0")
     payload = {
         "video_id": video_id,
         "video_url": video_url,
@@ -234,24 +235,51 @@ def try_fetch_transcript_via_remote_worker(
     if worker_token:
         headers["X-Worker-Token"] = worker_token
 
-    resp = requests.post(
+    submit_resp = requests.post(
         worker_url,
         headers=headers,
         json=payload,
-        timeout=(10.0, max(30.0, timeout_seconds, worker_timeout_seconds)),
+        timeout=(10.0, 20.0),
     )
-    resp.raise_for_status()
-    data = resp.json()
+    submit_resp.raise_for_status()
+    data = submit_resp.json()
     if not isinstance(data, dict):
         raise RuntimeError("本地抓取节点返回格式无效")
     if not data.get("ok"):
         raise RuntimeError(str(data.get("error") or "本地抓取节点执行失败"))
+    task_id = str(data.get("task_id") or "").strip()
+    if not task_id:
+        transcript_text = str(data.get("transcript_text") or "").strip()
+        transcript_label = str(data.get("transcript_label") or "remote-worker").strip()
+        if not transcript_text:
+            raise RuntimeError("本地抓取节点未返回 transcript 文本")
+        return f"[{transcript_label}]\n\n{transcript_text}"
 
-    transcript_text = str(data.get("transcript_text") or "").strip()
-    transcript_label = str(data.get("transcript_label") or "remote-worker").strip()
-    if not transcript_text:
-        raise RuntimeError("本地抓取节点未返回 transcript 文本")
-    return f"[{transcript_label}]\n\n{transcript_text}"
+    status_base = worker_url.rsplit("/fetch-transcript", 1)[0]
+    status_url = f"{status_base}/task/{quote(task_id)}"
+    deadline = time.monotonic() + max(30.0, timeout_seconds, worker_timeout_seconds)
+
+    while time.monotonic() < deadline:
+        time.sleep(max(0.5, poll_interval_seconds))
+        poll_resp = requests.get(status_url, headers=headers, timeout=(10.0, 20.0))
+        poll_resp.raise_for_status()
+        poll_data = poll_resp.json()
+        if not isinstance(poll_data, dict) or not poll_data.get("ok"):
+            raise RuntimeError("本地抓取节点状态查询失败")
+        status = str(poll_data.get("status") or "").strip().lower()
+        if status in {"queued", "running"}:
+            continue
+        if status == "failed":
+            raise RuntimeError(str(poll_data.get("error") or "本地抓取节点执行失败"))
+        if status == "success":
+            transcript_text = str(poll_data.get("transcript_text") or "").strip()
+            transcript_label = str(poll_data.get("transcript_label") or "remote-worker").strip()
+            if not transcript_text:
+                raise RuntimeError("本地抓取节点未返回 transcript 文本")
+            return f"[{transcript_label}]\n\n{transcript_text}"
+        raise RuntimeError(f"本地抓取节点返回未知状态: {status or 'unknown'}")
+
+    raise RuntimeError(f"本地抓取节点处理超时（>{int(max(30.0, timeout_seconds, worker_timeout_seconds))}s）")
 
 
 class TimeoutSession(requests.Session):

@@ -72,5 +72,8 @@ https://xxxx.trycloudflare.com/fetch-transcript
 
 - Render 先尝试自己的字幕/API/yt-dlp 逻辑
 - 当 YouTube 风控导致抓取失败时，Render 会自动调用本地抓取节点
-- 本地抓取节点返回 transcript 文本
+- 本地抓取节点现在是异步任务模式：
+  - `POST /fetch-transcript` 提交任务，立即返回 `task_id`
+  - `GET /task/<task_id>` 查询任务状态
+- 本地抓取节点任务完成后返回 transcript 文本
 - Render 继续调用现有 `summarize_text()` 做总结
