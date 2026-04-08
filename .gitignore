@@ -1,4 +1,4 @@
-﻿venv/
+venv/
 .venv/
 __pycache__/
 *.pyc
@@ -11,6 +11,15 @@ __pycache__/
 *.sqlite
 *.db
 .cache/
+models/
+*.mp4
+*.mp4.part
+*.mkv
+*.webm
+*.wav
+*.flac
+*.aac
+*.ogg
 history.json
 settings.json
 subscriptions.json

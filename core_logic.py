@@ -198,6 +198,61 @@ def build_runtime_version_diagnostics() -> str:
     return "; ".join(parts)
 
 
+def try_fetch_transcript_via_remote_worker(
+    video_id: str,
+    video_url: str,
+    languages: list[str],
+    api=None,
+) -> str:
+    """
+    通过外部抓取节点拉取 transcript 文本。
+
+    仅返回 transcript 文本，不负责总结。
+    """
+    worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+    worker_token = str(os.environ.get("REMOTE_TRANSCRIBE_TOKEN", "") or "").strip()
+    if not worker_url:
+        raise RuntimeError("未配置 REMOTE_TRANSCRIBE_URL")
+
+    timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0) if api else 60.0
+    payload = {
+        "video_id": video_id,
+        "video_url": video_url,
+        "languages": list(languages or []),
+        "cookies_file": str(getattr(api, "_cookies_file", "") or "").strip() if api else "",
+        "cookies_content": str(getattr(api, "_cookies_content", "") or "") if api else "",
+        "cookies_content_b64": str(getattr(api, "_cookies_content_b64", "") or "").strip() if api else "",
+        "cookies_from_browser": str(getattr(api, "_cookies_from_browser", "") or "").strip().lower() if api else "",
+        "asr_enabled": bool(getattr(api, "_asr_enabled", False)) if api else False,
+        "asr_model": str(getattr(api, "_asr_model", "") or "") if api else "",
+        "asr_language": str(getattr(api, "_asr_language", "") or "") if api else "",
+        "asr_fast_mode": bool(getattr(api, "_asr_fast_mode", False)) if api else False,
+        "asr_force_cpu": bool(getattr(api, "_asr_force_cpu", False)) if api else False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if worker_token:
+        headers["X-Worker-Token"] = worker_token
+
+    resp = requests.post(
+        worker_url,
+        headers=headers,
+        json=payload,
+        timeout=max(15.0, timeout_seconds),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("本地抓取节点返回格式无效")
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error") or "本地抓取节点执行失败"))
+
+    transcript_text = str(data.get("transcript_text") or "").strip()
+    transcript_label = str(data.get("transcript_label") or "remote-worker").strip()
+    if not transcript_text:
+        raise RuntimeError("本地抓取节点未返回 transcript 文本")
+    return f"[{transcript_label}]\n\n{transcript_text}"
+
+
 class TimeoutSession(requests.Session):
     def __init__(self, timeout_seconds: float):
         super().__init__()
@@ -3074,6 +3129,24 @@ def get_video_transcript(
             resolved_cookie_file=cookies_file,
             resolve_error=cookie_resolve_error,
         )
+        remote_worker_summary = "disabled"
+        if not str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip():
+            remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+            if remote_worker_url:
+                try:
+                    remote_text = try_fetch_transcript_via_remote_worker(
+                        video_id=video_id,
+                        video_url=video_url,
+                        languages=langs,
+                        api=api,
+                    )
+                    if remote_text and not is_html_like_text(remote_text):
+                        return remote_text
+                except Exception as remote_exc:
+                    remote_worker_summary = f"{type(remote_exc).__name__}: {remote_exc}"
+            else:
+                remote_worker_summary = "not-configured"
+        cookie_debug_summary = cookie_debug_summary + f"\n远程抓取诊断: {remote_worker_summary}"
         try:
             label, text = fetch_subtitles_with_ytdlp(
                 video_url,
