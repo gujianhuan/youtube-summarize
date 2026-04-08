@@ -55,6 +55,7 @@ class FetchHandler(BaseHTTPRequestHandler):
             languages = [str(item).strip() for item in languages if str(item).strip()]
             if not video_url:
                 raise ValueError("video_url is required")
+            print(f"[local-fetch-node] received request: url={video_url} langs={','.join(languages)}")
 
             proxy_url = os.environ.get("PROXY_URL", "").strip()
             timeout_seconds = float(os.environ.get("LOCAL_FETCH_TIMEOUT_SECONDS", "90") or "90")
@@ -73,11 +74,13 @@ class FetchHandler(BaseHTTPRequestHandler):
             setattr(api, "_asr_force_cpu", bool(payload.get("asr_force_cpu", os.environ.get("LOCAL_FETCH_ASR_FORCE_CPU", "0").strip() in {"1", "true", "True"})))
 
             video_id, normalized_url, _ = get_transcript_from_input(video_url, ",".join(languages))
+            print(f"[local-fetch-node] normalized video_id={video_id}")
             transcript = get_video_transcript(api, video_id, video_url=normalized_url, languages=languages)
             if "\n\n" in transcript:
                 label, text = transcript.split("\n\n", 1)
             else:
                 label, text = "remote-worker", transcript
+            print(f"[local-fetch-node] success: label={label.strip().strip('[]')} text_len={len(text)}")
 
             _json_response(
                 self,
@@ -89,6 +92,7 @@ class FetchHandler(BaseHTTPRequestHandler):
                 },
             )
         except Exception as e:
+            print(f"[local-fetch-node] failed: {e}")
             _json_response(self, 500, {"ok": False, "error": format_error(e)})
 
     def log_message(self, format, *args):

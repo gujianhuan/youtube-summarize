@@ -215,6 +215,7 @@ def try_fetch_transcript_via_remote_worker(
         raise RuntimeError("未配置 REMOTE_TRANSCRIBE_URL")
 
     timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0) if api else 60.0
+    worker_timeout_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_TIMEOUT_SECONDS", "95") or "95")
     payload = {
         "video_id": video_id,
         "video_url": video_url,
@@ -237,7 +238,7 @@ def try_fetch_transcript_via_remote_worker(
         worker_url,
         headers=headers,
         json=payload,
-        timeout=max(15.0, timeout_seconds),
+        timeout=(10.0, max(30.0, timeout_seconds, worker_timeout_seconds)),
     )
     resp.raise_for_status()
     data = resp.json()
