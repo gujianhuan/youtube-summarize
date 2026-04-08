@@ -42,6 +42,40 @@ def _get_task(task_id: str) -> dict | None:
         return dict(task) if task else None
 
 
+def _pick_cookie_inputs(payload: dict) -> tuple[dict, str]:
+    prefer_local = str(os.environ.get("LOCAL_FETCH_PREFER_LOCAL_COOKIES", "1") or "1").strip().lower() not in {"0", "false", "no"}
+
+    local_browser_candidates = [
+        str(os.environ.get("LOCAL_FETCH_COOKIES_BROWSER", "") or "").strip().lower(),
+        str(os.environ.get("YTDLP_COOKIES_BROWSER", "") or "").strip().lower(),
+    ]
+    if prefer_local and os.name == "nt":
+        local_browser_candidates.extend(["edge", "chrome"])
+    local_browser_candidates = [item for item in local_browser_candidates if item]
+
+    local_sources = {
+        "cookies_file": str(os.environ.get("LOCAL_FETCH_COOKIES_FILE", "") or os.environ.get("YTDLP_COOKIES_FILE", "")).strip(),
+        "cookies_content": str(os.environ.get("LOCAL_FETCH_COOKIES_CONTENT", "") or os.environ.get("YTDLP_COOKIES_CONTENT", "")),
+        "cookies_content_b64": str(os.environ.get("LOCAL_FETCH_COOKIES_CONTENT_B64", "") or os.environ.get("YTDLP_COOKIES_CONTENT_B64", "")).strip(),
+        "cookies_from_browser": local_browser_candidates[0] if local_browser_candidates else "",
+    }
+    payload_sources = {
+        "cookies_file": str(payload.get("cookies_file") or "").strip(),
+        "cookies_content": str(payload.get("cookies_content") or ""),
+        "cookies_content_b64": str(payload.get("cookies_content_b64") or "").strip(),
+        "cookies_from_browser": str(payload.get("cookies_from_browser") or "").strip().lower(),
+    }
+
+    if prefer_local:
+        if local_sources["cookies_from_browser"]:
+            return local_sources, f"local-browser:{local_sources['cookies_from_browser']}"
+        if local_sources["cookies_file"] or local_sources["cookies_content"] or local_sources["cookies_content_b64"]:
+            return local_sources, "local-cookie-env"
+    if payload_sources["cookies_file"] or payload_sources["cookies_content"] or payload_sources["cookies_content_b64"] or payload_sources["cookies_from_browser"]:
+        return payload_sources, "render-forwarded"
+    return local_sources, "none"
+
+
 def _run_fetch_task(task_id: str, payload: dict) -> None:
     try:
         _set_task(task_id, status="running", started_at=time.time())
@@ -61,10 +95,12 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
         use_system_proxy = False
 
         api = build_api(proxy_url, timeout_seconds, use_system_proxy, retries)
-        setattr(api, "_cookies_file", str(payload.get("cookies_file") or os.environ.get("YTDLP_COOKIES_FILE", "")).strip())
-        setattr(api, "_cookies_content", str(payload.get("cookies_content") or os.environ.get("YTDLP_COOKIES_CONTENT", "")))
-        setattr(api, "_cookies_content_b64", str(payload.get("cookies_content_b64") or os.environ.get("YTDLP_COOKIES_CONTENT_B64", "")).strip())
-        setattr(api, "_cookies_from_browser", str(payload.get("cookies_from_browser") or os.environ.get("YTDLP_COOKIES_BROWSER", "")).strip().lower())
+        cookie_inputs, cookie_source = _pick_cookie_inputs(payload)
+        print(f"[local-fetch-node] cookie source={cookie_source}")
+        setattr(api, "_cookies_file", cookie_inputs["cookies_file"])
+        setattr(api, "_cookies_content", cookie_inputs["cookies_content"])
+        setattr(api, "_cookies_content_b64", cookie_inputs["cookies_content_b64"])
+        setattr(api, "_cookies_from_browser", cookie_inputs["cookies_from_browser"])
         setattr(api, "_asr_enabled", bool(payload.get("asr_enabled", True)))
         setattr(api, "_asr_model", str(payload.get("asr_model") or os.environ.get("LOCAL_FETCH_ASR_MODEL", "base")).strip() or "base")
         setattr(api, "_asr_language", str(payload.get("asr_language") or os.environ.get("LOCAL_FETCH_ASR_LANGUAGE", "")).strip())

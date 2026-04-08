@@ -21,6 +21,12 @@
 
 - `REMOTE_TRANSCRIBE_TOKEN`
   - 必填，必须和 Render 端一致
+- `LOCAL_FETCH_PREFER_LOCAL_COOKIES`
+  - 默认 `1`
+  - 本地抓取节点优先使用本机 cookies，而不是 Render 转发过来的 cookies
+- `LOCAL_FETCH_COOKIES_BROWSER`
+  - 可选，推荐本地设置为 `edge` 或 `chrome`
+  - 如果未设置，在 Windows 下会优先尝试 `edge`，再尝试 `chrome`
 - `LOCAL_FETCH_NODE_HOST`
   - 默认 `127.0.0.1`
 - `LOCAL_FETCH_NODE_PORT`
