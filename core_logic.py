@@ -3175,6 +3175,11 @@ def get_video_transcript(
     asr_language = str(getattr(api, "_asr_language", "") or "")
     asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
     status_cb = getattr(api, "_status_callback", None)
+    local_fetch_node_mode = bool(str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip())
+    local_skip_transcript_api = (
+        local_fetch_node_mode
+        and str(os.environ.get("LOCAL_FETCH_SKIP_TRANSCRIPT_API", "1") or "1").strip().lower() not in {"0", "false", "no"}
+    )
     remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
     prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
     remote_worker_summary = "disabled"
@@ -3199,6 +3204,10 @@ def get_video_transcript(
                         status_cb(f"本地抓取节点失败，回退 Render 直抓: {type(remote_exc).__name__}")
             else:
                 remote_worker_summary = "not-configured"
+        if local_skip_transcript_api:
+            if callable(status_cb):
+                status_cb(f"本地节点跳过 Transcript API，直接尝试 yt-dlp/Whisper: {video_id}")
+            raise RequestBlocked("本地节点跳过 Transcript API")
         if callable(status_cb):
             status_cb(f"尝试 YouTube Transcript API: {video_id}")
         transcript = api.fetch(video_id, languages=langs)
