@@ -3174,20 +3174,33 @@ def get_video_transcript(
     asr_model = str(getattr(api, "_asr_model", "") or "")
     asr_language = str(getattr(api, "_asr_language", "") or "")
     asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
+    status_cb = getattr(api, "_status_callback", None)
     remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
     prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
+    remote_worker_summary = "disabled"
     try:
         if prefer_remote_first and not str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip():
             remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
             if remote_worker_url:
-                remote_text = try_fetch_transcript_via_remote_worker(
-                    video_id=video_id,
-                    video_url=video_url,
-                    languages=langs,
-                    api=api,
-                )
-                if remote_text and not is_html_like_text(remote_text):
-                    return remote_text
+                try:
+                    if callable(status_cb):
+                        status_cb("优先调用本地抓取节点")
+                    remote_text = try_fetch_transcript_via_remote_worker(
+                        video_id=video_id,
+                        video_url=video_url,
+                        languages=langs,
+                        api=api,
+                    )
+                    if remote_text and not is_html_like_text(remote_text):
+                        return remote_text
+                except Exception as remote_exc:
+                    remote_worker_summary = f"{type(remote_exc).__name__}: {remote_exc}"
+                    if callable(status_cb):
+                        status_cb(f"本地抓取节点失败，回退 Render 直抓: {type(remote_exc).__name__}")
+            else:
+                remote_worker_summary = "not-configured"
+        if callable(status_cb):
+            status_cb(f"尝试 YouTube Transcript API: {video_id}")
         transcript = api.fetch(video_id, languages=langs)
         content = "\n".join([entry.text for entry in transcript])
         if is_html_like_text(content):
@@ -3195,6 +3208,8 @@ def get_video_transcript(
         header = f"[{transcript.language_code} | {'自动' if transcript.is_generated else '人工'}] 片段数: {len(transcript)}"
         return header + "\n\n" + content
     except NoTranscriptFound:
+        if callable(status_cb):
+            status_cb(f"Transcript API 未命中，尝试列出可用字幕: {video_id}")
         transcript_list = api.list(video_id)
         chosen = None
         for t in transcript_list:
@@ -3231,8 +3246,7 @@ def get_video_transcript(
             resolved_cookie_file=cookies_file,
             resolve_error=cookie_resolve_error,
         )
-        remote_worker_summary = "disabled"
-        if not str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip():
+        if not prefer_remote_first and not str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip():
             remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
             if remote_worker_url:
                 try:
@@ -3250,6 +3264,8 @@ def get_video_transcript(
                 remote_worker_summary = "not-configured"
         cookie_debug_summary = cookie_debug_summary + f"\n远程抓取诊断: {remote_worker_summary}"
         try:
+            if callable(status_cb):
+                status_cb(f"尝试 yt-dlp 字幕抓取: {video_id}")
             label, text = fetch_subtitles_with_ytdlp(
                 video_url,
                 preferred_langs=langs,
@@ -3266,7 +3282,8 @@ def get_video_transcript(
             pass
 
         if asr_enabled:
-            status_cb = getattr(api, "_status_callback", None)
+            if callable(status_cb):
+                status_cb(f"尝试音频下载与 Whisper 转写: {video_id}")
             # 传递强制CPU标志到内部函数
             setattr(transcribe_video_audio_with_ytdlp, "_force_cpu", asr_force_cpu)
             label, text = transcribe_video_audio_with_ytdlp(
