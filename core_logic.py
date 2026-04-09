@@ -3174,7 +3174,20 @@ def get_video_transcript(
     asr_model = str(getattr(api, "_asr_model", "") or "")
     asr_language = str(getattr(api, "_asr_language", "") or "")
     asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
+    remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
+    prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
     try:
+        if prefer_remote_first and not str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip():
+            remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+            if remote_worker_url:
+                remote_text = try_fetch_transcript_via_remote_worker(
+                    video_id=video_id,
+                    video_url=video_url,
+                    languages=langs,
+                    api=api,
+                )
+                if remote_text and not is_html_like_text(remote_text):
+                    return remote_text
         transcript = api.fetch(video_id, languages=langs)
         content = "\n".join([entry.text for entry in transcript])
         if is_html_like_text(content):

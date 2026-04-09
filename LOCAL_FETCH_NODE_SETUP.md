@@ -11,6 +11,8 @@
 - `REMOTE_TRANSCRIBE_URL`
   - 本地抓取节点的完整地址
   - 例如：`https://your-subdomain.example.com/fetch-transcript`
+- `REMOTE_TRANSCRIBE_MODE`
+  - 可选，设为 `prefer_remote` 时，Render 会优先直接调用本地抓取节点，而不是先自己抓
 - `REMOTE_TRANSCRIBE_TOKEN`
   - Render 调本地抓取节点时的认证 token
 - `REMOTE_TRANSCRIBE_TIMEOUT_SECONDS`

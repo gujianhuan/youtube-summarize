@@ -136,6 +136,13 @@ def _clean_transcript_for_display(text: str) -> str:
     segments = [seg.strip() for seg in punctuated.split("\n") if seg.strip()]
     return "\n\n".join(segments)
 
+
+def _raw_transcript_for_display(text: str) -> str:
+    """保留原始正文，只去掉内部调试标签，便于排查。"""
+    _, cleaned = _extract_whisper_device_info(text or "")
+    cleaned = re.sub(r"\n*\s*<!-- TIMING: .*? -->", "", cleaned)
+    return cleaned.strip()
+
 def update_settings_partial(patch):
     with _get_shared_lock():
         settings = load_settings()
@@ -1135,8 +1142,20 @@ with tab_single:
 
     if st.session_state.transcript_text:
         with st.expander("查看字幕原文", expanded=False):
-            st.caption("已自动清理内部标签，并按更适合阅读的形式展示。")
-            st.text_area("字幕内容", _clean_transcript_for_display(st.session_state.transcript_text), height=360)
+            transcript_view_mode = st.radio(
+                "字幕视图",
+                ["阅读版", "原始版"],
+                horizontal=True,
+                index=0,
+                key="transcript_view_mode",
+            )
+            if transcript_view_mode == "原始版":
+                st.caption("原始版仅移除了内部调试标签，适合排查问题。")
+                display_text = _raw_transcript_for_display(st.session_state.transcript_text)
+            else:
+                st.caption("阅读版已自动清理内部标签，并按更适合阅读的形式展示。")
+                display_text = _clean_transcript_for_display(st.session_state.transcript_text)
+            st.text_area("字幕内容", display_text, height=360)
 
 
 # ==========================
