@@ -15,6 +15,7 @@ PORT = int(os.environ.get("LOCAL_FETCH_NODE_PORT", "8787") or "8787")
 TOKEN = os.environ.get("REMOTE_TRANSCRIBE_TOKEN", "").strip()
 TASKS: dict[str, dict] = {}
 TASKS_LOCK = threading.Lock()
+INFLIGHT_TASKS: dict[str, str] = {}
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -40,6 +41,26 @@ def _get_task(task_id: str) -> dict | None:
     with TASKS_LOCK:
         task = TASKS.get(task_id)
         return dict(task) if task else None
+
+
+def _make_task_key(payload: dict) -> str:
+    video_url = str(payload.get("video_url") or "").strip()
+    languages = payload.get("languages") or []
+    if not isinstance(languages, list):
+        languages = []
+    normalized_langs = ",".join(str(item).strip() for item in languages if str(item).strip())
+    return f"{video_url}||{normalized_langs}"
+
+
+def _set_stage(task_id: str, stage: str, detail: str = "") -> None:
+    _set_task(task_id, stage=stage, stage_detail=detail, updated_at=time.time())
+
+
+def _pop_inflight(task_id: str) -> None:
+    with TASKS_LOCK:
+        stale_keys = [key for key, current_task_id in INFLIGHT_TASKS.items() if current_task_id == task_id]
+        for key in stale_keys:
+            INFLIGHT_TASKS.pop(key, None)
 
 
 def _pick_cookie_inputs(payload: dict) -> tuple[dict, str]:
@@ -79,6 +100,7 @@ def _pick_cookie_inputs(payload: dict) -> tuple[dict, str]:
 def _run_fetch_task(task_id: str, payload: dict) -> None:
     try:
         _set_task(task_id, status="running", started_at=time.time())
+        _set_stage(task_id, "prepare", "初始化请求参数")
 
         video_url = str(payload.get("video_url") or "").strip()
         languages = payload.get("languages") or ["zh-Hans", "zh", "en"]
@@ -94,13 +116,22 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
         retries = int(os.environ.get("LOCAL_FETCH_RETRIES", "1") or "1")
         use_system_proxy = False
 
+        def _status_cb(message: str) -> None:
+            msg = str(message or "").strip()
+            if not msg:
+                return
+            print(f"[local-fetch-node] status: {msg}")
+            _set_stage(task_id, "processing", msg[:500])
+
         api = build_api(proxy_url, timeout_seconds, use_system_proxy, retries)
         cookie_inputs, cookie_source = _pick_cookie_inputs(payload)
         print(f"[local-fetch-node] cookie source={cookie_source}")
+        _set_stage(task_id, "cookie", cookie_source)
         setattr(api, "_cookies_file", cookie_inputs["cookies_file"])
         setattr(api, "_cookies_content", cookie_inputs["cookies_content"])
         setattr(api, "_cookies_content_b64", cookie_inputs["cookies_content_b64"])
         setattr(api, "_cookies_from_browser", cookie_inputs["cookies_from_browser"])
+        setattr(api, "_status_callback", _status_cb)
         setattr(api, "_asr_enabled", bool(payload.get("asr_enabled", True)))
         setattr(api, "_asr_model", str(payload.get("asr_model") or os.environ.get("LOCAL_FETCH_ASR_MODEL", "base")).strip() or "base")
         setattr(api, "_asr_language", str(payload.get("asr_language") or os.environ.get("LOCAL_FETCH_ASR_LANGUAGE", "")).strip())
@@ -109,6 +140,7 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
 
         video_id, normalized_url, _ = get_transcript_from_input(video_url, ",".join(languages))
         print(f"[local-fetch-node] normalized video_id={video_id}")
+        _set_stage(task_id, "fetch", f"video_id={video_id}")
         transcript = get_video_transcript(api, video_id, video_url=normalized_url, languages=languages)
         if "\n\n" in transcript:
             label, text = transcript.split("\n\n", 1)
@@ -119,6 +151,8 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
             task_id,
             status="success",
             finished_at=time.time(),
+            stage="done",
+            stage_detail=f"label={label.strip().strip('[]')}",
             transcript_label=label.strip().strip("[]"),
             transcript_text=text,
         )
@@ -128,8 +162,12 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
             task_id,
             status="failed",
             finished_at=time.time(),
+            stage="failed",
+            stage_detail=str(e)[:500],
             error=format_error(e),
         )
+    finally:
+        _pop_inflight(task_id)
 
 
 class FetchHandler(BaseHTTPRequestHandler):
@@ -166,8 +204,16 @@ class FetchHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw_body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("payload must be an object")
-            task_id = str(uuid.uuid4())
-            _set_task(task_id, status="queued")
+            task_key = _make_task_key(payload)
+            with TASKS_LOCK:
+                existing_task_id = INFLIGHT_TASKS.get(task_key)
+                existing_task = TASKS.get(existing_task_id) if existing_task_id else None
+                if existing_task and str(existing_task.get("status") or "").lower() in {"queued", "running"}:
+                    _json_response(self, 200, {"ok": True, "task_id": existing_task_id, "status": existing_task.get("status"), "reused": True})
+                    return
+                task_id = str(uuid.uuid4())
+                TASKS[task_id] = {"task_id": task_id, "status": "queued", "created_at": time.time(), "stage": "queued", "stage_detail": "等待后台处理"}
+                INFLIGHT_TASKS[task_key] = task_id
             worker = threading.Thread(target=_run_fetch_task, args=(task_id, payload), daemon=True)
             worker.start()
             _json_response(self, 202, {"ok": True, "task_id": task_id, "status": "queued"})

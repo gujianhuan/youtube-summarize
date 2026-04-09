@@ -81,5 +81,6 @@ https://xxxx.trycloudflare.com/fetch-transcript
 - 本地抓取节点现在是异步任务模式：
   - `POST /fetch-transcript` 提交任务，立即返回 `task_id`
   - `GET /task/<task_id>` 查询任务状态
+  - 状态结果里会包含 `stage` 和 `stage_detail`，用于定位卡在抓取、字幕还是转写阶段
 - 本地抓取节点任务完成后返回 transcript 文本
 - Render 继续调用现有 `summarize_text()` 做总结
