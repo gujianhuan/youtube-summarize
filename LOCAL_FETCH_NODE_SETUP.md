@@ -15,7 +15,7 @@
   - Render 调本地抓取节点时的认证 token
 - `REMOTE_TRANSCRIBE_TIMEOUT_SECONDS`
   - 可选，Render 等待本地抓取节点返回的秒数
-  - 建议先设为 `95`
+  - 建议先设为 `180`
 
 ## 本地抓取节点环境变量
 

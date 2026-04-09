@@ -215,7 +215,7 @@ def try_fetch_transcript_via_remote_worker(
         raise RuntimeError("未配置 REMOTE_TRANSCRIBE_URL")
 
     timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0) if api else 60.0
-    worker_timeout_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_TIMEOUT_SECONDS", "95") or "95")
+    worker_timeout_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_TIMEOUT_SECONDS", "180") or "180")
     poll_interval_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_POLL_INTERVAL_SECONDS", "2.0") or "2.0")
     payload = {
         "video_id": video_id,
@@ -258,6 +258,9 @@ def try_fetch_transcript_via_remote_worker(
     status_base = worker_url.rsplit("/fetch-transcript", 1)[0]
     status_url = f"{status_base}/task/{quote(task_id)}"
     deadline = time.monotonic() + max(30.0, timeout_seconds, worker_timeout_seconds)
+    last_stage = ""
+    last_stage_detail = ""
+    last_status = ""
 
     while time.monotonic() < deadline:
         time.sleep(max(0.5, poll_interval_seconds))
@@ -267,6 +270,9 @@ def try_fetch_transcript_via_remote_worker(
         if not isinstance(poll_data, dict) or not poll_data.get("ok"):
             raise RuntimeError("本地抓取节点状态查询失败")
         status = str(poll_data.get("status") or "").strip().lower()
+        last_status = status
+        last_stage = str(poll_data.get("stage") or "").strip()
+        last_stage_detail = str(poll_data.get("stage_detail") or "").strip()
         if status in {"queued", "running"}:
             continue
         if status == "failed":
@@ -279,7 +285,14 @@ def try_fetch_transcript_via_remote_worker(
             return f"[{transcript_label}]\n\n{transcript_text}"
         raise RuntimeError(f"本地抓取节点返回未知状态: {status or 'unknown'}")
 
-    raise RuntimeError(f"本地抓取节点处理超时（>{int(max(30.0, timeout_seconds, worker_timeout_seconds))}s）")
+    timeout_hint = f"本地抓取节点处理超时（>{int(max(30.0, timeout_seconds, worker_timeout_seconds))}s）"
+    if last_status or last_stage or last_stage_detail:
+        timeout_hint += (
+            f"；last_status={last_status or 'unknown'}"
+            f"；stage={last_stage or 'unknown'}"
+            f"；detail={last_stage_detail or 'none'}"
+        )
+    raise RuntimeError(timeout_hint)
 
 
 class TimeoutSession(requests.Session):
