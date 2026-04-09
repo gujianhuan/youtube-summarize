@@ -2842,16 +2842,35 @@ def perform_web_search(queries: list[str], proxy: str = None) -> str:
         ddgs = DDGS(proxy=proxy, timeout=10)
         for q in queries:
             found_something = False
+            seen_links = set()
             try:
-                search_res = ddgs.text(q, max_results=2) 
-                if search_res:
+                results_text.append(f"### 搜索关键字: {q}")
+
+                news_res = []
+                try:
+                    news_res = ddgs.news(q, max_results=3) or []
+                except Exception as news_err:
+                    print(f"News search failed for {q}: {news_err}")
+
+                text_res = []
+                try:
+                    text_res = ddgs.text(q, max_results=5) or []
+                except Exception as text_err:
+                    print(f"Text search failed for {q}: {text_err}")
+
+                merged_res = list(news_res) + list(text_res)
+                for r in merged_res:
+                    title = (r.get('title', '') or '').strip()
+                    href = (r.get('url') or r.get('href') or '').strip()
+                    body = (r.get('body', '') or '').strip()
+                    if not href or href in seen_links:
+                        continue
+                    seen_links.add(href)
                     found_something = True
-                    results_text.append(f"### 搜索关键字: {q}")
-                    for r in search_res:
-                        title = r.get('title', '')
-                        href = r.get('href', '')
-                        body = r.get('body', '')
-                        results_text.append(f"- [{title}]({href}): {body}")
+                    domain = urlparse(href).netloc or "unknown"
+                    results_text.append(f"- [{title}]({href}) ({domain}): {body}")
+
+                if found_something:
                     results_text.append("")
             except Exception as e:
                 print(f"Search failed for {q}: {e}")
@@ -2912,10 +2931,11 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             try:
                 analysis_prompt = (
                     f"当前日期: {current_date}。\n"
-                    "请分析以下文本，提取 3 个最需要进行事实核查的关键新闻事件或声明。\n"
+                    "请分析以下文本，提取 5 个最需要进行事实核查的关键新闻事件、数字声明或政策说法。\n"
                     "请直接输出 JSON 格式，不要包含 Markdown 标记：\n"
-                    "{ \"queries\": [\"搜索关键词1\", \"搜索关键词2\", \"搜索关键词3\"] }\n"
-                    "关键词应包含核心实体和事件，适合搜索引擎检索，以验证其真实性。\n\n"
+                    "{ \"queries\": [\"搜索关键词1\", \"搜索关键词2\", \"搜索关键词3\", \"搜索关键词4\", \"搜索关键词5\"] }\n"
+                    "每条搜索关键词都必须包含核心实体、时间、地点、事件或数字，方便直接搜索到新闻来源。\n"
+                    "优先提取可核查的硬信息，不要提取纯观点表述。\n\n"
                     f"文本内容摘要：{content[:4000]}"
                 )
                 
@@ -2935,7 +2955,11 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                     print(f"Executing search queries: {queries}")
                     search_res_str = perform_web_search(queries, proxy=proxy_url)
                     if search_res_str:
-                        search_context = f"\n\n**【实时搜索结果（用于事实核查）】**\n{search_res_str}\n\n请利用以上搜索结果来填写事实核查表中的“来源/出处”一栏，必须包含具体的 URL 链接。"
+                        search_context = (
+                            f"\n\n**【实时搜索结果（用于事实核查）】**\n{search_res_str}\n\n"
+                            "请优先使用以上搜索结果中的外部来源进行核查。"
+                            "来源/出处必须尽量给出具体 URL 链接，严禁把“视频内容本身”“视频字幕”当作来源。"
+                        )
             except Exception as e:
                 print(f"Search step failed: {e}")
 
@@ -2970,9 +2994,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             "     - 新闻/声明：...\n"
             "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
             "     - 依据：简要说明为什么这样判断\n"
-            "     - 来源/出处：必须给出 1-3 个具体来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
-            "   - 如果视频里没有明确可核查的新闻或声明，就输出：`- 未识别到足够明确、可独立核查的新闻声明。`\n"
-            "   - 严禁编造来源；没有可靠来源时，明确写“需进一步核实”。\n\n"
+            "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
+            "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
+            "   - 不要写“无法独立核实”这种空话。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
+            "   - 如果某条确实找不到可靠来源，也必须给出你已经检索到的候选链接，或明确写出“未检索到可靠外部来源，仅找到如下候选：...”。\n\n"
             "**字幕内容输入：**\n"
             f"{content}"
         )
@@ -2991,7 +3016,8 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "2. `fact_check_markdown`：\n"
                 "   - 必须逐条列出可核查新闻，不要使用表格。\n"
                 "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`来源/出处`。\n"
-                "   - `来源/出处` 必须尽量给出具体 URL。\n\n"
+                "   - `来源/出处` 必须尽量给出具体 URL，禁止把视频本身当作来源。\n"
+                "   - 不要写“无法独立核实”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
             )
@@ -3003,10 +3029,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         response = client.chat.completions.create(
             model=model.strip() or "gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰，事实核查必须逐条列出新闻/声明并给出来源。"},
+                {"role": "system", "content": "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰。事实核查必须逐条列出新闻/声明，并尽可能提供外部来源链接；禁止把视频本身当作来源，也不要输出空泛的“无法独立核实”。"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.35,
+            temperature=0.2,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             stream=stream,
@@ -3053,7 +3079,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             # 或者我们构造一个伪 JSON
             return json.dumps({
                 "summary_markdown": content_str,
-                "fact_check_markdown": "- AI 未能按约定 JSON 返回事实核查结果。\n- 请优先查看左侧总结内容，并对其中可核查新闻逐条补充来源。"
+                "fact_check_markdown": "- AI 未能按约定 JSON 返回事实核查结果。\n- 请重新尝试生成，并重点检查模型是否按要求逐条给出外部来源链接。"
             }, ensure_ascii=False)
 
     except Exception as e:
