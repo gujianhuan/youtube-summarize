@@ -5,6 +5,7 @@ import time
 import traceback
 import json
 import os
+import re
 import uuid
 import calendar
 from datetime import datetime, timedelta, time as dt_time
@@ -103,6 +104,37 @@ def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
     if len(history) > 500:
         history = history[:500]
     save_history(history)
+
+
+def _extract_whisper_device_info(text: str) -> tuple[str, str]:
+    """从字幕文本里提取 FW_DEVICE 标签，并返回清理后的正文。"""
+    text = text or ""
+    match = re.search(r"<!-- FW_DEVICE: (.*?) -->", text)
+    device_info = match.group(1).strip() if match else ""
+    cleaned = re.sub(r"\n*\s*<!-- FW_DEVICE: .*? -->", "", text)
+    return device_info, cleaned.strip()
+
+
+def _clean_transcript_for_display(text: str) -> str:
+    """清理内部标签，并把 ASR 长串文本整理成更适合阅读的段落。"""
+    _, cleaned = _extract_whisper_device_info(text or "")
+    cleaned = re.sub(r"\n*\s*<!-- TIMING: .*? -->", "", cleaned)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if not cleaned:
+        return ""
+
+    if "\n" in cleaned:
+        lines = [line.strip() for line in cleaned.splitlines()]
+        lines = [line for line in lines if line]
+        return "\n\n".join(lines)
+
+    # 对 ASR 连续文本做温和断句，避免一大坨难以阅读
+    punctuated = re.sub(r"([。！？!?；;])", r"\1\n", cleaned)
+    punctuated = re.sub(r"([，,])", r"\1 ", punctuated)
+    punctuated = re.sub(r"\n{2,}", "\n", punctuated)
+    segments = [seg.strip() for seg in punctuated.split("\n") if seg.strip()]
+    return "\n\n".join(segments)
 
 def update_settings_partial(patch):
     with _get_shared_lock():
@@ -965,14 +997,8 @@ with tab_single:
                 st.error(err)
                 return
 
-            whisper_device_info = ""
-            if text and "<!-- FW_DEVICE" in text:
-                import re
-                m = re.search(r"<!-- FW_DEVICE: (.*?) -->", text)
-                if m:
-                    whisper_device_info = f"⚡ {m.group(1)}"
-                    st.session_state.whisper_device_tag = f"<!-- FW_DEVICE: {m.group(1)} -->"
-                text = re.sub(r"\n\n<!-- FW_DEVICE: .*? -->", "", text)
+            whisper_device_info, text = _extract_whisper_device_info(text)
+            st.session_state.whisper_device_tag = whisper_device_info
 
             st.session_state.transcript_text = text
 
@@ -1088,7 +1114,7 @@ with tab_single:
         # 尝试提取 fetch/download 耗时
         footer_info = ""
         if st.session_state.whisper_device_tag:
-             footer_info = f"⚡ {st.session_state.whisper_device_tag}"
+             footer_info = f"⚡ Whisper: {st.session_state.whisper_device_tag}"
         
         try:
             # 检查 transcript_text 是否包含 TIMING tag
@@ -1107,13 +1133,10 @@ with tab_single:
         if footer_info:
             st.caption(footer_info)
 
-        if st.session_state.whisper_device_tag:
-            st.markdown("### ⚡ Whisper 设备标签 (可复制)")
-            st.code(st.session_state.whisper_device_tag, language="text")
-
     if st.session_state.transcript_text:
         with st.expander("查看字幕原文", expanded=False):
-            st.text_area("字幕内容", st.session_state.transcript_text, height=300)
+            st.caption("已自动清理内部标签，并按更适合阅读的形式展示。")
+            st.text_area("字幕内容", _clean_transcript_for_display(st.session_state.transcript_text), height=360)
 
 
 # ==========================
@@ -1603,15 +1626,9 @@ with tab_sub:
                                                     status_container.info("🚀 正在请求 AI 生成总结 (流式输出)...")
                                                     
                                                     # 提取 Whisper 设备信息 (从 transcript text 中)
-                                                    whisper_device_info = ""
-                                                    device_tag_for_copy = ""
-                                                    if text and "<!-- FW_DEVICE" in text:
-                                                        import re
-                                                        m = re.search(r"<!-- FW_DEVICE: (.*?) -->", text)
-                                                        if m:
-                                                            whisper_device_info = f" | ⚡ Whisper引擎: {m.group(1)}"
-                                                            device_tag_for_copy = f"<!-- FW_DEVICE: {m.group(1)} -->"
-                                                        text = re.sub(r"\n\n<!-- FW_DEVICE: .*? -->", "", text)
+                                                    whisper_device_name, text = _extract_whisper_device_info(text)
+                                                    whisper_device_info = f" | ⚡ Whisper引擎: {whisper_device_name}" if whisper_device_name else ""
+                                                    st.session_state.whisper_device_tag = whisper_device_name
                                                     
                                                     # 2. 流式总结
                                                     if not api_key:
@@ -1706,9 +1723,6 @@ with tab_sub:
                                                                         yield f"\n\n> {footer_str}"
                                                                     
                                                                 st.write_stream(stream_generator())
-                                                                if device_tag_for_copy:
-                                                                    st.markdown("### ⚡ Whisper 设备标签 (可复制)")
-                                                                    st.code(device_tag_for_copy, language="text")
                                                                 status_container.empty() # 清除进度提示
                                                                 
                                                                 # 强制刷新以触发缓存读取逻辑 (从而正确渲染分栏)
