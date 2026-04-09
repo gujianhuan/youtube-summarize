@@ -2943,20 +2943,36 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         prompt = (
             f"你是一个专业的新闻分析师和事实核查专家。当前真实日期是：{current_date}。\n"
             "请务必基于此日期进行时效性判断，不要使用你训练时的截止日期（如2023或2024）。\n"
-            "请分析以下视频字幕，生成一份包含两个部分的深度报告。\n"
+            "请分析以下视频字幕，生成一份结构清晰、便于阅读的报告。\n"
             f"{search_context}\n\n"
             "【输出格式要求】\n"
-            "请严格输出为 JSON 格式，包含以下两个字段：\n"
-            "1. `summary_markdown`: 视频内容的**深度总结**（Markdown 格式，不少于 600 字）。\n"
-            "   - 包含：核心主题、详细摘要（分点阐述背景、经过、影响）、关键要点、金句、结论。\n"
-            "   - 请确保内容详实，拒绝空洞的概括。\n"
-            "2. `fact_check_markdown`: 对视频中提到的新闻事件进行真实性核查（Markdown 格式）。\n"
-            "   - 请以表格形式列出：\n"
-            "     | 新闻事件 | 真实性评估 | 来源/出处 | 备注 |\n"
-            "     | --- | --- | --- | --- |\n"
-            "     | (事件描述) | (真/假/存疑) | (必须基于提供的【实时搜索结果】或你的知识库提供具体来源 URL，如 `[BBC](https://...)`) | (简要分析) |\n"
-            "   - 注意：基于你截至目前的知识库和提供的搜索结果进行判断。\n"
-            "   - **重要：在“来源/出处”列，请尽量提供可访问的新闻链接。如果无法确认来源，请标注“需进一步核实”。**\n\n"
+            "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n\n"
+            "1. `summary_markdown` 的要求：\n"
+            "   - 必须是 Markdown。\n"
+            "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
+            "   - 固定结构如下：\n"
+            "     ## 核心主题\n"
+            "     - 1 句话概括视频主旨。\n"
+            "     ## 主要内容\n"
+            "     - 逐条列出 6-12 条要点。\n"
+            "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
+            "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
+            "     ## 关键信息\n"
+            "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
+            "     ## 结论（可选）\n"
+            "     - 只有当视频确实提出了明确结论时才输出本节。\n"
+            "     - 如果视频没有清晰结论，就不要硬写结论。\n\n"
+            "2. `fact_check_markdown` 的要求：\n"
+            "   - 必须是 Markdown。\n"
+            "   - 不要输出表格，改为逐条列出“新闻/声明核查项”。\n"
+            "   - 每一条都必须使用下面结构：\n"
+            "     ### 条目1\n"
+            "     - 新闻/声明：...\n"
+            "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
+            "     - 依据：简要说明为什么这样判断\n"
+            "     - 来源/出处：必须给出 1-3 个具体来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
+            "   - 如果视频里没有明确可核查的新闻或声明，就输出：`- 未识别到足够明确、可独立核查的新闻声明。`\n"
+            "   - 严禁编造来源；没有可靠来源时，明确写“需进一步核实”。\n\n"
             "**字幕内容输入：**\n"
             f"{content}"
         )
@@ -2967,10 +2983,15 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "请对以下长视频字幕进行总结和事实核查。\n"
                 f"{search_context}\n\n"
                 "【输出格式要求】\n"
-                "请严格输出为 JSON 格式，包含两个字段：\n"
-                "1. `summary_markdown`: 快速总结（核心一句话、8-12条核心要点、结论，不少于 500 字）。\n"
-                "2. `fact_check_markdown`: 新闻事实核查表（Markdown 表格）。\n"
-                "   - 包含：新闻事件、真实性评估、来源（请务必提供 URL 链接）、备注。\n\n"
+                "请严格输出 JSON，并只包含 `summary_markdown` 与 `fact_check_markdown` 两个字段。\n"
+                "1. `summary_markdown`：\n"
+                "   - 必须按分条形式输出。\n"
+                "   - 结构固定为：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。\n"
+                "   - `## 主要内容` 里输出 8-12 条核心要点，每条只表达一个意思。\n"
+                "2. `fact_check_markdown`：\n"
+                "   - 必须逐条列出可核查新闻，不要使用表格。\n"
+                "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`来源/出处`。\n"
+                "   - `来源/出处` 必须尽量给出具体 URL。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
             )
@@ -2982,10 +3003,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         response = client.chat.completions.create(
             model=model.strip() or "gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "你是一个专业的视频内容总结与事实核查助手。请始终以 JSON 格式回复。"},
+                {"role": "system", "content": "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰，事实核查必须逐条列出新闻/声明并给出来源。"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7,
+            temperature=0.35,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             stream=stream,
@@ -3031,8 +3052,8 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             # 如果 AI 没返回标准 JSON，尝试直接返回文本（兼容旧逻辑）
             # 或者我们构造一个伪 JSON
             return json.dumps({
-                "summary_markdown": content_str, 
-                "fact_check_markdown": "⚠️ AI 未能按照 JSON 格式返回事实核查结果，请查看左侧总结。"
+                "summary_markdown": content_str,
+                "fact_check_markdown": "- AI 未能按约定 JSON 返回事实核查结果。\n- 请优先查看左侧总结内容，并对其中可核查新闻逐条补充来源。"
             }, ensure_ascii=False)
 
     except Exception as e:
