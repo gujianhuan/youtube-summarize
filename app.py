@@ -143,6 +143,46 @@ def _raw_transcript_for_display(text: str) -> str:
     cleaned = re.sub(r"\n*\s*<!-- TIMING: .*? -->", "", cleaned)
     return cleaned.strip()
 
+
+def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
+    """尽量把模型返回的 JSON/伪 JSON 拆成总结与事实核查两部分。"""
+    text = (summary_text or "").strip()
+    if not text:
+        return "", ""
+
+    candidates = [text]
+    if text.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", text)
+        stripped = re.sub(r"\s*```$", "", stripped).strip()
+        candidates.append(stripped)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    continue
+            if isinstance(data, dict):
+                summary_md = str(data.get("summary_markdown") or data.get("summary") or "").strip()
+                fact_md = str(
+                    data.get("fact_check_markdown")
+                    or data.get("fact_check")
+                    or data.get("factcheck_markdown")
+                    or ""
+                ).strip()
+                if summary_md:
+                    return summary_md, fact_md
+        except Exception:
+            continue
+
+    return text, ""
+
 def update_settings_partial(patch):
     with _get_shared_lock():
         settings = load_settings()
@@ -1093,25 +1133,17 @@ with tab_single:
             
         # 尝试解析 JSON 总结并分栏显示
         summary_content = st.session_state.summary_text
-        is_json_summary = False
-        summary_data = {}
-        
-        try:
-            # 简单启发式检查：如果是 { 开头 } 结尾，尝试解析
-            if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
-                summary_data = json.loads(summary_content)
-                if "summary_markdown" in summary_data:
-                    is_json_summary = True
-        except Exception:
-            pass
-            
-        if is_json_summary:
+        summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
+        if summary_md:
             col_sum, col_check = st.columns([1.2, 1])
             with col_sum:
-                st.markdown(summary_data.get("summary_markdown", ""))
+                st.markdown(summary_md)
             with col_check:
                 st.info("🕵️ **新闻事实核查**")
-                st.markdown(summary_data.get("fact_check_markdown", ""))
+                if fact_check_md:
+                    st.markdown(fact_check_md)
+                else:
+                    st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
         else:
             # 兼容旧的纯文本总结
             st.markdown(summary_content)
@@ -1593,22 +1625,14 @@ with tab_sub:
                                             is_json_summary = False
                                             summary_data = {}
                                             
-                                            try:
-                                                if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
-                                                    summary_data = json.loads(summary_content)
-                                                    if "summary_markdown" in summary_data:
-                                                        is_json_summary = True
-                                            except Exception:
-                                                pass
-                                                
-                                            if is_json_summary:
+                                            summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
+                                            if summary_md:
                                                 # 使用 Tabs 替代分栏，解决拥挤问题
                                                 tab_sum, tab_check = st.tabs(["📝 核心总结", "🕵️ 事实核查"])
                                                 with tab_sum:
-                                                    st.markdown(summary_data.get("summary_markdown", ""))
+                                                    st.markdown(summary_md)
                                                 with tab_check:
-                                                    # st.info("🕵️ **新闻事实核查**") # Tab标题已有，不再重复
-                                                    st.markdown(summary_data.get("fact_check_markdown", ""))
+                                                    st.markdown(fact_check_md or "- 本次未成功拆出结构化事实核查结果。")
                                             else:
                                                 st.markdown(summary_content)
                                                 
@@ -1844,24 +1868,14 @@ with tab_batch:
                             with st.expander("查看 AI 总结", expanded=False):
                                 # 尝试解析 JSON 总结并分栏显示
                                 summary_content = item.get("summary") or ""
-                                is_json_summary = False
-                                summary_data = {}
-                                
-                                try:
-                                    if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
-                                        summary_data = json.loads(summary_content)
-                                        if "summary_markdown" in summary_data:
-                                            is_json_summary = True
-                                except Exception:
-                                    pass
-                                    
-                                if is_json_summary:
+                                summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
+                                if summary_md:
                                     col_sum, col_check = st.columns([1.2, 1])
                                     with col_sum:
-                                        st.markdown(summary_data.get("summary_markdown", ""))
+                                        st.markdown(summary_md)
                                     with col_check:
                                         st.info("🕵️ **新闻事实核查**")
-                                        st.markdown(summary_data.get("fact_check_markdown", ""))
+                                        st.markdown(fact_check_md or "- 本次未成功拆出结构化事实核查结果。")
                                 else:
                                     st.markdown(summary_content)
                         else:
@@ -2062,15 +2076,8 @@ with tab_history:
                 body_hit = False
                 if search_body and not (title_hit or url_hit):
                     raw = entry.get("summary_text") or ""
-                    body_text = ""
-                    try:
-                        if raw.strip().startswith("{") and raw.strip().endswith("}"):
-                            data = json.loads(raw)
-                            body_text = (data.get("summary_markdown") or "") + "\n" + (data.get("fact_check_markdown") or "")
-                        else:
-                            body_text = raw
-                    except Exception:
-                        body_text = raw
+                    summary_md_for_search, fact_md_for_search = _parse_summary_for_ui(raw)
+                    body_text = (summary_md_for_search or raw) + "\n" + (fact_md_for_search or "")
                     body_hit = kw in body_text.lower()
                 if not (title_hit or url_hit or body_hit):
                     continue
@@ -2079,24 +2086,14 @@ with tab_history:
                 st.caption(f"来源: {'⏰ 定时任务' if entry.get('source_type') == 'schedule' else '🎬 单次任务'} | URL: {entry.get('video_url')}")
                 
                 summary_content = entry.get("summary_text") or ""
-                is_json_summary = False
-                summary_data = {}
-                
-                try:
-                    if summary_content.strip().startswith("{") and summary_content.strip().endswith("}"):
-                        summary_data = json.loads(summary_content)
-                        if "summary_markdown" in summary_data:
-                            is_json_summary = True
-                except Exception:
-                    pass
-                    
-                if is_json_summary:
+                summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
+                if summary_md:
                     h_col1, h_col2 = st.columns([1.2, 1])
                     with h_col1:
-                        st.markdown(summary_data.get("summary_markdown", ""))
+                        st.markdown(summary_md)
                     with h_col2:
                         st.info("🕵️ **新闻事实核查**")
-                        st.markdown(summary_data.get("fact_check_markdown", ""))
+                        st.markdown(fact_check_md or "- 本次未成功拆出结构化事实核查结果。")
                 else:
                     st.markdown(summary_content)
 

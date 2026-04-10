@@ -2888,6 +2888,70 @@ def perform_web_search(queries: list[str], proxy: str = None) -> str:
             
     return "\n".join(results_text)
 
+
+def _extract_json_candidate(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
+
+
+def _parse_summary_payload(raw_text: str):
+    visited = set()
+    candidates = [raw_text, _extract_json_candidate(raw_text)]
+    while candidates:
+        candidate = (candidates.pop(0) or "").strip()
+        if not candidate or candidate in visited:
+            continue
+        visited.add(candidate)
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, str):
+            candidates.append(data)
+            candidates.append(_extract_json_candidate(data))
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _normalize_summary_payload(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    summary_text = (
+        payload.get("summary_markdown")
+        or payload.get("summary")
+        or payload.get("summary_md")
+        or ""
+    )
+    fact_check_text = (
+        payload.get("fact_check_markdown")
+        or payload.get("fact_check")
+        or payload.get("factcheck_markdown")
+        or payload.get("fact_check_md")
+        or ""
+    )
+    summary_text = str(summary_text or "").strip()
+    fact_check_text = str(fact_check_text or "").strip()
+    if not summary_text:
+        return None
+    if not fact_check_text:
+        fact_check_text = "- 暂未成功生成结构化事实核查结果，请重新尝试生成。"
+    return {
+        "summary_markdown": summary_text,
+        "fact_check_markdown": fact_check_text,
+    }
+
 def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
     if not text or not text.strip():
         return "没有可总结的内容（文本为空）。"
@@ -3070,17 +3134,40 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         if not content_str:
              return f"总结失败：无法解析响应内容。\n原始响应: {str(response)[:500]}"
 
+        normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
+        if normalized_payload:
+            return json.dumps(normalized_payload, ensure_ascii=False)
+
         try:
-            summary_data = json.loads(content_str)
-            # 重新封装为 JSON 字符串返回，以便前端解析
-            return json.dumps(summary_data, ensure_ascii=False)
-        except json.JSONDecodeError:
-            # 如果 AI 没返回标准 JSON，尝试直接返回文本（兼容旧逻辑）
-            # 或者我们构造一个伪 JSON
-            return json.dumps({
-                "summary_markdown": content_str,
-                "fact_check_markdown": "- AI 未能按约定 JSON 返回事实核查结果。\n- 请重新尝试生成，并重点检查模型是否按要求逐条给出外部来源链接。"
-            }, ensure_ascii=False)
+            repair_prompt = (
+                "请将下面内容修复为合法 JSON，并且只能包含两个字段："
+                "`summary_markdown` 和 `fact_check_markdown`。\n"
+                "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
+                "- `fact_check_markdown` 必须保留或补齐事实核查内容。\n"
+                "- 只返回 JSON，不要解释。\n\n"
+                f"原始内容：\n{content_str}"
+            )
+            repair_resp = client.chat.completions.create(
+                model=model.strip() or "gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "你是一个 JSON 修复助手，只返回合法 JSON。"},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=min(2200, max_tokens),
+                temperature=0.1,
+            )
+            repair_content = repair_resp.choices[0].message.content
+            normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
+            if normalized_payload:
+                return json.dumps(normalized_payload, ensure_ascii=False)
+        except Exception as repair_exc:
+            print(f"Repair summary JSON failed: {repair_exc}")
+
+        return json.dumps({
+            "summary_markdown": content_str,
+            "fact_check_markdown": "- AI 未能稳定输出结构化事实核查结果。\n- 请重新尝试生成；系统已尽量修复 JSON，但本次返回仍不完整。"
+        }, ensure_ascii=False)
 
     except Exception as e:
         msg = str(e)
