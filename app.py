@@ -150,6 +150,19 @@ def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
     if not text:
         return "", ""
 
+    def _extract_field(raw: str, field_names: list[str]) -> str:
+        for field_name in field_names:
+            pattern = rf'"{re.escape(field_name)}"\s*:\s*("(?:\\.|[^"\\])*")'
+            match = re.search(pattern, raw, re.S)
+            if not match:
+                continue
+            try:
+                value = json.loads(match.group(1))
+                return str(value or "").strip()
+            except Exception:
+                continue
+        return ""
+
     candidates = [text]
     if text.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", text)
@@ -181,7 +194,12 @@ def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
         except Exception:
             continue
 
-    return text, ""
+    summary_md = _extract_field(text, ["summary_markdown", "summary", "summary_md"])
+    fact_md = _extract_field(text, ["fact_check_markdown", "fact_check", "factcheck_markdown", "fact_check_md"])
+    if summary_md:
+        return summary_md, fact_md
+
+    return "", ""
 
 def update_settings_partial(patch):
     with _get_shared_lock():

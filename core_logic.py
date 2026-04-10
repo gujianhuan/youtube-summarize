@@ -2904,6 +2904,21 @@ def _extract_json_candidate(text: str) -> str:
     return text
 
 
+def _extract_json_string_field(raw_text: str, field_names: list[str]) -> str:
+    raw_text = raw_text or ""
+    for field_name in field_names:
+        pattern = rf'"{re.escape(field_name)}"\s*:\s*("(?:\\.|[^"\\])*")'
+        match = re.search(pattern, raw_text, re.S)
+        if not match:
+            continue
+        try:
+            value = json.loads(match.group(1))
+            return str(value or "").strip()
+        except Exception:
+            continue
+    return ""
+
+
 def _parse_summary_payload(raw_text: str):
     visited = set()
     candidates = [raw_text, _extract_json_candidate(raw_text)]
@@ -2922,6 +2937,13 @@ def _parse_summary_payload(raw_text: str):
             continue
         if isinstance(data, dict):
             return data
+    summary_md = _extract_json_string_field(raw_text, ["summary_markdown", "summary", "summary_md"])
+    fact_md = _extract_json_string_field(raw_text, ["fact_check_markdown", "fact_check", "factcheck_markdown", "fact_check_md"])
+    if summary_md:
+        return {
+            "summary_markdown": summary_md,
+            "fact_check_markdown": fact_md,
+        }
     return None
 
 
