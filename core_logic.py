@@ -2976,7 +2976,7 @@ def _normalize_summary_payload(payload: dict | None) -> dict | None:
     }
 
 
-SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown", ".pptx"}
 DEFAULT_DOCUMENT_MAX_MB = int(os.environ.get("DOCUMENT_MAX_UPLOAD_MB", "20") or "20")
 DEFAULT_DOCUMENT_DIRECT_SUMMARY_CHARS = int(os.environ.get("DOCUMENT_DIRECT_SUMMARY_CHARS", "15000") or "15000")
 DEFAULT_DOCUMENT_CHUNK_CHARS = int(os.environ.get("DOCUMENT_CHUNK_CHARS", "12000") or "12000")
@@ -3029,10 +3029,19 @@ def _extract_pdf_text(file_bytes: bytes) -> dict:
             page_text = ""
         if page_text:
             page_texts.append(f"## 第{idx}页\n{page_text}")
+    raw_text = "\n\n".join(page_texts).strip()
+    ocr_used = False
+    if not raw_text:
+        ocr_text = _extract_pdf_text_via_ocr(file_bytes)
+        if ocr_text:
+            raw_text = ocr_text
+            ocr_used = True
+
     return {
-        "raw_text": "\n\n".join(page_texts).strip(),
+        "raw_text": raw_text,
         "page_count": len(reader.pages),
         "section_count": len(page_texts),
+        "ocr_used": ocr_used,
     }
 
 
@@ -3077,6 +3086,41 @@ def _extract_docx_text(file_bytes: bytes) -> dict:
     }
 
 
+def _extract_pptx_text(file_bytes: bytes) -> dict:
+    try:
+        from pptx import Presentation
+    except ImportError as e:
+        raise RuntimeError("未安装 python-pptx，无法解析 PPTX。") from e
+
+    prs = Presentation(BytesIO(file_bytes))
+    slide_parts = []
+    for idx, slide in enumerate(prs.slides, start=1):
+        shape_texts = []
+        for shape in slide.shapes:
+            text = str(getattr(shape, "text", "") or "").strip()
+            if text:
+                shape_texts.append(text)
+                continue
+            table = getattr(shape, "table", None)
+            if table:
+                rows = []
+                for row in table.rows:
+                    cells = [str(cell.text or "").strip() for cell in row.cells]
+                    cells = [cell for cell in cells if cell]
+                    if cells:
+                        rows.append(" | ".join(cells))
+                if rows:
+                    shape_texts.append("\n".join(rows))
+        if shape_texts:
+            slide_parts.append(f"## 第{idx}页幻灯片\n" + "\n\n".join(shape_texts))
+
+    return {
+        "raw_text": "\n\n".join(slide_parts).strip(),
+        "page_count": len(prs.slides),
+        "section_count": len(slide_parts),
+    }
+
+
 def _extract_plain_text(file_bytes: bytes) -> dict:
     encodings = ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "latin-1"]
     last_error = None
@@ -3092,12 +3136,172 @@ def _extract_plain_text(file_bytes: bytes) -> dict:
     raise RuntimeError(f"文本文件解码失败：{last_error}")
 
 
+def _extract_pdf_text_via_ocr(file_bytes: bytes) -> str:
+    if str(os.environ.get("DOCUMENT_PDF_OCR_ENABLED", "1") or "1").strip().lower() in {"0", "false", "no"}:
+        return ""
+    try:
+        import fitz
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        return ""
+
+    try:
+        ocr_engine = RapidOCR()
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        page_texts = []
+        max_pages = int(os.environ.get("DOCUMENT_PDF_OCR_MAX_PAGES", "20") or "20")
+        for idx, page in enumerate(doc, start=1):
+            if idx > max_pages:
+                break
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            channels = 3 if pix.n >= 3 else 1
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if channels == 1:
+                img = img[:, :, 0]
+            elif pix.n > 3:
+                img = img[:, :, :3]
+            result, _ = ocr_engine(img)
+            if not result:
+                continue
+            page_lines = []
+            for item in result:
+                try:
+                    text = str(item[1] or "").strip()
+                except Exception:
+                    text = ""
+                if text:
+                    page_lines.append(text)
+            if page_lines:
+                page_texts.append(f"## 第{idx}页\n" + "\n".join(page_lines))
+        return "\n\n".join(page_texts).strip()
+    except Exception as e:
+        print(f"PDF OCR extraction failed: {e}")
+        return ""
+
+
+def _guess_remote_file_name(url: str, response=None) -> str:
+    parsed = urlparse(str(url or "").strip())
+    candidate = os.path.basename(parsed.path or "").strip()
+    if candidate:
+        return candidate
+    content_type = str(getattr(response, "headers", {}).get("Content-Type", "") or "").lower()
+    if "pdf" in content_type:
+        return "remote.pdf"
+    if "presentation" in content_type or "pptx" in content_type:
+        return "remote.pptx"
+    if "wordprocessingml" in content_type or "docx" in content_type:
+        return "remote.docx"
+    if "markdown" in content_type:
+        return "remote.md"
+    if "text/plain" in content_type:
+        return "remote.txt"
+    return "remote.html"
+
+
+def _build_requests_kwargs(proxy_url: str = None, timeout_seconds: float = 25.0) -> dict:
+    kwargs = {"timeout": timeout_seconds, "verify": False}
+    if proxy_url and proxy_url.strip():
+        kwargs["proxies"] = {
+            "http": proxy_url.strip(),
+            "https": proxy_url.strip(),
+        }
+    return kwargs
+
+
+def extract_web_article_text(url: str, proxy_url: str = None) -> dict:
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        raise RuntimeError("未安装 beautifulsoup4，无法解析网页文章。") from e
+
+    resp = requests.get(url, **_build_requests_kwargs(proxy_url, timeout_seconds=30.0))
+    resp.raise_for_status()
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    main = soup.find("article") or soup.find("main") or soup.body or soup
+    blocks = []
+    for node in main.find_all(["h1", "h2", "h3", "p", "li"], limit=500):
+        text = node.get_text(" ", strip=True)
+        if not text or len(text) < 2:
+            continue
+        if node.name in {"h1", "h2", "h3"}:
+            level = {"h1": "#", "h2": "##", "h3": "###"}.get(node.name, "##")
+            blocks.append(f"{level} {text}")
+        else:
+            blocks.append(text)
+
+    raw_text = "\n\n".join(blocks).strip()
+    if title and title not in raw_text[:200]:
+        raw_text = f"# {title}\n\n{raw_text}".strip()
+    clean_text = clean_document_text(raw_text)
+    if not clean_text:
+        raise RuntimeError("网页未提取到足够正文内容，请尝试更换文章链接。")
+    return {
+        "file_name": title or _guess_remote_file_name(url, resp) or "remote_article.html",
+        "file_type": "html",
+        "raw_text": raw_text,
+        "clean_text": clean_text,
+        "char_count": len(clean_text),
+        "page_count": None,
+        "section_count": None,
+        "source_url": url,
+        "ocr_used": False,
+    }
+
+
+def extract_document_from_url(url: str, proxy_url: str = None) -> dict:
+    url = str(url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise RuntimeError("请输入完整的在线链接（以 http:// 或 https:// 开头）。")
+
+    resp = requests.get(url, stream=True, **_build_requests_kwargs(proxy_url, timeout_seconds=35.0))
+    resp.raise_for_status()
+    content = resp.content
+    file_name = _guess_remote_file_name(url, resp)
+    suffix = os.path.splitext(file_name)[1].lower()
+    content_type = str(resp.headers.get("Content-Type", "") or "").lower()
+
+    if not suffix:
+        if "pdf" in content_type:
+            file_name = "remote.pdf"
+        elif "presentation" in content_type or "pptx" in content_type:
+            file_name = "remote.pptx"
+        elif "wordprocessingml" in content_type or "docx" in content_type:
+            file_name = "remote.docx"
+        elif "markdown" in content_type:
+            file_name = "remote.md"
+        elif "text/plain" in content_type:
+            file_name = "remote.txt"
+        else:
+            file_name = "remote_article.html"
+        suffix = os.path.splitext(file_name)[1].lower()
+
+    if suffix in SUPPORTED_DOCUMENT_EXTENSIONS:
+        ok, err = validate_document_upload(file_name, len(content))
+        if not ok:
+            raise RuntimeError(err)
+        result = extract_document_text(content, file_name)
+        result["source_url"] = url
+        return result
+
+    return extract_web_article_text(url, proxy_url=proxy_url)
+
+
 def extract_document_text(file_bytes: bytes, file_name: str) -> dict:
     suffix = os.path.splitext(str(file_name or "").strip())[1].lower()
     if suffix == ".pdf":
         extracted = _extract_pdf_text(file_bytes)
     elif suffix == ".docx":
         extracted = _extract_docx_text(file_bytes)
+    elif suffix == ".pptx":
+        extracted = _extract_pptx_text(file_bytes)
     else:
         extracted = _extract_plain_text(file_bytes)
 
@@ -3114,6 +3318,7 @@ def extract_document_text(file_bytes: bytes, file_name: str) -> dict:
         "char_count": len(clean_text),
         "page_count": extracted.get("page_count"),
         "section_count": extracted.get("section_count"),
+        "ocr_used": bool(extracted.get("ocr_used", False)),
     }
 
 

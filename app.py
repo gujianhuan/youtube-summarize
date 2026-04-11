@@ -21,6 +21,7 @@ from core_logic import (
     summarize_text,
     validate_document_upload,
     extract_document_text,
+    extract_document_from_url,
     summarize_document_text,
     fetch_available_models,
     get_channel_info,
@@ -792,6 +793,8 @@ if "document_summary_text" not in st.session_state:
     st.session_state.document_summary_text = ""
 if "document_meta" not in st.session_state:
     st.session_state.document_meta = {}
+if "document_source_url" not in st.session_state:
+    st.session_state.document_source_url = ""
 if "whisper_device_tag" not in st.session_state:
     st.session_state.whisper_device_tag = ""
 if "asr_force_cpu" not in st.session_state:
@@ -961,6 +964,38 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
 
         if progress_callback:
             progress_callback(25, f"文档解析完成，正文约 {extracted['char_count']} 字符。")
+
+        def relay_document_progress(pct, message):
+            if progress_callback:
+                progress_callback(25 + int(min(max(pct, 0), 100) * 0.7), message)
+
+        summary_result = summarize_document_text(
+            extracted["clean_text"],
+            eff_api_key,
+            eff_base_url,
+            model_name,
+            eff_proxy,
+            progress_callback=relay_document_progress,
+        )
+        return {
+            "extract": extracted,
+            "summary": summary_result,
+        }, None
+
+
+def internal_summarize_document_url(source_url, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
+        eff_api_key = api_key_override or api_key
+        eff_base_url = base_url_override or base_url
+        eff_proxy = proxy_override or proxy_input
+
+        if not eff_api_key:
+            return None, "请先填写 API Key。"
+        if progress_callback:
+            progress_callback(10, "正在抓取在线文档/网页...")
+
+        extracted = extract_document_from_url(source_url, proxy_url=eff_proxy)
+        if progress_callback:
+            progress_callback(25, f"在线内容解析完成，正文约 {extracted['char_count']} 字符。")
 
         def relay_document_progress(pct, message):
             if progress_callback:
@@ -1259,57 +1294,105 @@ with tab_single:
 # Tab 2: 文档总结
 # ==========================
 with tab_doc:
-    st.info("💡 一期支持上传：PDF、DOCX、TXT、Markdown。首版默认只做文档总结，暂不默认开启事实核查。")
-    uploaded_doc = st.file_uploader(
-        "上传文档",
-        type=["pdf", "docx", "txt", "md", "markdown"],
-        key="doc_uploader",
-        help="首版建议单文件不超过 20MB。长文档会自动分块总结。",
-    )
+    st.info("💡 二期已支持：本地 PDF / DOCX / TXT / Markdown / PPTX，以及在线 PDF 链接、网页文章链接。扫描版 PDF 会在提取不到文本时自动尝试 OCR。")
 
-    doc_col1, doc_col2 = st.columns([1, 2])
-    with doc_col1:
-        doc_sum_btn = st.button("📄 提取并总结文档", type="primary", use_container_width=True, key="btn_doc_sum")
-    with doc_col2:
-        st.caption("长文档会自动分块总结；文档事实核查将在后续版本单独增强。")
+    def save_document_result(result, duration: float):
+        extracted = result["extract"]
+        summary_result = result["summary"]
+        st.session_state.document_raw_text = extracted["raw_text"]
+        st.session_state.document_clean_text = extracted["clean_text"]
+        st.session_state.document_summary_text = summary_result["summary_markdown"]
+        st.session_state.document_source_url = str(extracted.get("source_url") or "")
+        st.session_state.document_meta = {
+            **extracted,
+            **summary_result,
+            "duration": duration,
+        }
 
-    if doc_sum_btn:
-        if not uploaded_doc:
-            st.warning("请先上传文档。")
-        else:
-            status_container = st.empty()
-            progress_bar = st.progress(0)
-            status_container.info("正在准备文档总结...")
-            t_doc_start = time.time()
+    doc_source_upload, doc_source_url_tab = st.tabs(["📂 本地上传", "🔗 在线链接"])
 
-            def update_doc_progress(pct, message):
-                progress_bar.progress(max(0, min(100, int(pct))), text=message)
+    with doc_source_upload:
+        uploaded_doc = st.file_uploader(
+            "上传文档",
+            type=["pdf", "docx", "txt", "md", "markdown", "pptx"],
+            key="doc_uploader",
+            help="支持 PDF、DOCX、TXT、Markdown、PPTX，建议单文件不超过 20MB。",
+        )
+        doc_col1, doc_col2 = st.columns([1, 2])
+        with doc_col1:
+            doc_sum_btn = st.button("📄 提取并总结文档", type="primary", use_container_width=True, key="btn_doc_sum")
+        with doc_col2:
+            st.caption("长文档会自动分块总结；文档事实核查将在后续版本按关键声明方式接入。")
 
-            try:
-                result, err = internal_summarize_document(uploaded_doc.name, uploaded_doc.getvalue(), model_selected, update_doc_progress)
-                doc_duration = time.time() - t_doc_start
-                if err:
+        if doc_sum_btn:
+            if not uploaded_doc:
+                st.warning("请先上传文档。")
+            else:
+                status_container = st.empty()
+                progress_bar = st.progress(0)
+                status_container.info("正在准备文档总结...")
+                t_doc_start = time.time()
+
+                def update_doc_progress(pct, message):
+                    progress_bar.progress(max(0, min(100, int(pct))), text=message)
+
+                try:
+                    result, err = internal_summarize_document(uploaded_doc.name, uploaded_doc.getvalue(), model_selected, update_doc_progress)
+                    doc_duration = time.time() - t_doc_start
+                    if err:
+                        progress_bar.empty()
+                        status_container.error("❌ 文档总结失败")
+                        st.error(err)
+                    else:
+                        save_document_result(result, doc_duration)
+                        progress_bar.empty()
+                        status_container.success(f"✅ 文档总结完成！耗时: {doc_duration:.1f}s")
+                except Exception as e:
                     progress_bar.empty()
-                    status_container.error("❌ 文档总结失败")
-                    st.error(err)
-                else:
-                    extracted = result["extract"]
-                    summary_result = result["summary"]
-                    st.session_state.document_raw_text = extracted["raw_text"]
-                    st.session_state.document_clean_text = extracted["clean_text"]
-                    st.session_state.document_summary_text = summary_result["summary_markdown"]
-                    st.session_state.document_meta = {
-                        **extracted,
-                        **summary_result,
-                        "duration": doc_duration,
-                    }
+                    status_container.error("❌ 文档处理异常")
+                    st.error(str(e))
+                    st.code(traceback.format_exc())
+
+    with doc_source_url_tab:
+        doc_url = st.text_input(
+            "在线文档/文章链接",
+            key="document_url_input",
+            placeholder="https://example.com/report.pdf 或 https://example.com/article",
+        )
+        doc_url_col1, doc_url_col2 = st.columns([1, 2])
+        with doc_url_col1:
+            doc_url_btn = st.button("🌐 抓取并总结在线内容", type="primary", use_container_width=True, key="btn_doc_url_sum")
+        with doc_url_col2:
+            st.caption("支持在线 PDF、网页文章、公开 DOCX/PPTX/TXT/Markdown 链接。")
+
+        if doc_url_btn:
+            if not doc_url.strip():
+                st.warning("请输入在线链接。")
+            else:
+                status_container = st.empty()
+                progress_bar = st.progress(0)
+                status_container.info("正在抓取在线内容...")
+                t_doc_start = time.time()
+
+                def update_doc_url_progress(pct, message):
+                    progress_bar.progress(max(0, min(100, int(pct))), text=message)
+
+                try:
+                    result, err = internal_summarize_document_url(doc_url.strip(), model_selected, update_doc_url_progress)
+                    doc_duration = time.time() - t_doc_start
+                    if err:
+                        progress_bar.empty()
+                        status_container.error("❌ 在线文档总结失败")
+                        st.error(err)
+                    else:
+                        save_document_result(result, doc_duration)
+                        progress_bar.empty()
+                        status_container.success(f"✅ 在线内容总结完成！耗时: {doc_duration:.1f}s")
+                except Exception as e:
                     progress_bar.empty()
-                    status_container.success(f"✅ 文档总结完成！耗时: {doc_duration:.1f}s")
-            except Exception as e:
-                progress_bar.empty()
-                status_container.error("❌ 文档处理异常")
-                st.error(str(e))
-                st.code(traceback.format_exc())
+                    status_container.error("❌ 在线内容处理异常")
+                    st.error(str(e))
+                    st.code(traceback.format_exc())
 
     if st.session_state.document_summary_text:
         st.markdown("### 📄 文档总结")
@@ -1321,16 +1404,22 @@ with tab_doc:
         chunk_count = int(doc_meta.get("chunk_count") or 1)
         strategy = "分块总结" if doc_meta.get("strategy") == "chunked" else "直接总结"
         duration = float(doc_meta.get("duration") or 0.0)
+        source_url = str(doc_meta.get("source_url") or st.session_state.document_source_url or "").strip()
+        ocr_used = bool(doc_meta.get("ocr_used", False))
 
         meta_parts = [f"文件：`{file_name}`", f"类型：`{file_type}`", f"正文：`{char_count}` 字符", f"策略：`{strategy}`", f"分块：`{chunk_count}`"]
         if page_count:
             meta_parts.append(f"页数：`{page_count}`")
         if duration:
             meta_parts.append(f"耗时：`{duration:.1f}s`")
+        if ocr_used:
+            meta_parts.append("OCR：`已启用`")
         st.caption(" | ".join(meta_parts))
+        if source_url:
+            st.caption(f"来源链接：[{source_url}]({source_url})")
 
         st.markdown(st.session_state.document_summary_text)
-        st.info("📝 一期先聚焦文档总结主链路，事实核查将在后续版本按“关键声明核查”方式接入。")
+        st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退；文档事实核查将在后续版本按“关键声明核查”方式接入。")
 
         with st.expander("查看文档原文", expanded=False):
             doc_view_mode = st.radio(

@@ -10,3 +10,8 @@ curl_cffi==0.14.0
 yt_dlp_ejs
 pypdf
 python-docx
+python-pptx
+beautifulsoup4
+PyMuPDF
+rapidocr_onnxruntime
+numpy
