@@ -3317,6 +3317,7 @@ def summarize_document_text(
 
     if callable(progress_callback):
         progress_callback(80, "正在汇总整份文档摘要...")
+    merged_chunk_text = "\n\n".join(chunk_summaries)
     merge_prompt = (
         "下面是同一份长文档的分块摘要，请基于这些分块摘要生成最终总结。\n"
         "要求：\n"
@@ -3326,7 +3327,7 @@ def summarize_document_text(
         "- 固定结构：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`\n"
         "- `## 主要内容` 输出 8-12 条，按条列出\n"
         "- 不要重复每一块的相同意思\n\n"
-        f"分块摘要：\n{'\n\n'.join(chunk_summaries)}"
+        f"分块摘要：\n{merged_chunk_text}"
     )
     summary_markdown = _summarize_document_passage(
         client,
