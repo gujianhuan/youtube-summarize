@@ -3630,6 +3630,80 @@ def extract_key_claims(
     return claims
 
 
+def classify_document_for_fact_check(
+    text: str,
+    summary_markdown: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    proxy_url: str = None,
+) -> dict:
+    client = _build_openai_client(api_key, base_url, proxy_url)
+    cleaned_text = clean_document_text(text)
+    excerpt = cleaned_text[:8000]
+    prompt = (
+        "请判断下面文档是否属于需要进行事实核查的类型。\n"
+        "需要事实核查的典型类型包括：新闻、研究报告、时评/评论、政策解读、行业分析、带现实事件与数据结论的文章。\n"
+        "通常不需要事实核查的类型包括：小说、散文、内部会议纪要、教程、产品文档、纯技术方案、个人笔记、合同草稿。\n"
+        "请只返回 JSON，格式如下：\n"
+        "{\n"
+        '  "document_type": "news|research|commentary|policy_analysis|industry_analysis|meeting_notes|tutorial|technical_doc|fiction|personal_notes|other",\n'
+        '  "should_fact_check": true,\n'
+        '  "reason": "简短原因",\n'
+        '  "recommended_claim_count": 5\n'
+        "}\n"
+        "- 如果文档明显属于新闻、研究、时评、政策解读、行业分析，should_fact_check 设为 true。\n"
+        "- 否则设为 false。\n"
+        "- recommended_claim_count 只能取 3、5、8 之一。\n\n"
+        f"文档总结：\n{summary_markdown[:3500]}\n\n"
+        f"文档正文节选：\n{excerpt}"
+    )
+    response = client.chat.completions.create(
+        model=model.strip() or "gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "你是一个文档类型判定助手。请只返回合法 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=500,
+        temperature=0.1,
+    )
+    content = _extract_completion_content(response)
+    payload = _parse_summary_payload(content)
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(_extract_json_candidate(content))
+        except Exception:
+            payload = {}
+
+    doc_type = str(payload.get("document_type") or "other").strip() or "other"
+    should_fact_check = bool(payload.get("should_fact_check", False))
+    reason = str(payload.get("reason") or "").strip()
+    recommended_claim_count = int(payload.get("recommended_claim_count") or 5)
+    if recommended_claim_count not in {3, 5, 8}:
+        recommended_claim_count = 5
+
+    if not reason:
+        lowered = (summary_markdown + "\n" + excerpt).lower()
+        if any(k in lowered for k in ["研究", "报告", "统计", "数据", "survey", "research", "report"]):
+            doc_type = "research" if doc_type == "other" else doc_type
+            should_fact_check = True
+            reason = "文档包含研究/数据结论，适合做关键声明核查。"
+        elif any(k in lowered for k in ["评论", "时评", "社论", "news", "记者", "新华社", "路透", "政策"]):
+            doc_type = "commentary" if doc_type == "other" else doc_type
+            should_fact_check = True
+            reason = "文档涉及现实事件、新闻或政策判断，适合做关键声明核查。"
+        else:
+            reason = "文档更偏说明、教程、纪要或普通资料，可直接总结，无需默认核查。"
+
+    return {
+        "document_type": doc_type,
+        "should_fact_check": should_fact_check,
+        "reason": reason,
+        "recommended_claim_count": recommended_claim_count,
+    }
+
+
 def search_claim_sources(claim_items: list[dict], proxy_url: str = None) -> list[dict]:
     results = []
     for item in claim_items:

@@ -23,6 +23,7 @@ from core_logic import (
     extract_document_text,
     extract_document_from_url,
     summarize_document_text,
+    classify_document_for_fact_check,
     fact_check_document_claims,
     fetch_available_models,
     get_channel_info,
@@ -950,7 +951,7 @@ def internal_summarize(text, model_name, api_key_override=None, base_url_overrid
             return None, str(e)
 
 
-def internal_summarize_document(file_name, file_bytes, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None, fact_check_count=0):
+def internal_summarize_document(file_name, file_bytes, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
         eff_proxy = proxy_override or proxy_input
@@ -980,8 +981,18 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
             eff_proxy,
             progress_callback=relay_document_progress,
         )
+        if progress_callback:
+            progress_callback(72, "正在判断文档类型与是否需要事实核查...")
+        fact_check_plan = classify_document_for_fact_check(
+            text=extracted["clean_text"],
+            summary_markdown=summary_result["summary_markdown"],
+            api_key=eff_api_key,
+            base_url=eff_base_url,
+            model=model_name,
+            proxy_url=eff_proxy,
+        )
         fact_check_markdown = ""
-        if int(fact_check_count or 0) > 0:
+        if bool(fact_check_plan.get("should_fact_check")):
             def relay_fact_progress(pct, message):
                 if progress_callback:
                     progress_callback(72 + int(min(max(pct, 0), 100) * 0.28), message)
@@ -992,17 +1003,18 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
                 base_url=eff_base_url,
                 model=model_name,
                 proxy_url=eff_proxy,
-                max_claims=int(fact_check_count),
+                max_claims=int(fact_check_plan.get("recommended_claim_count") or 5),
                 progress_callback=relay_fact_progress,
             )
         return {
             "extract": extracted,
             "summary": summary_result,
             "fact_check_markdown": fact_check_markdown,
+            "fact_check_plan": fact_check_plan,
         }, None
 
 
-def internal_summarize_document_url(source_url, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None, fact_check_count=0):
+def internal_summarize_document_url(source_url, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
         eff_proxy = proxy_override or proxy_input
@@ -1028,8 +1040,18 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
             eff_proxy,
             progress_callback=relay_document_progress,
         )
+        if progress_callback:
+            progress_callback(72, "正在判断文档类型与是否需要事实核查...")
+        fact_check_plan = classify_document_for_fact_check(
+            text=extracted["clean_text"],
+            summary_markdown=summary_result["summary_markdown"],
+            api_key=eff_api_key,
+            base_url=eff_base_url,
+            model=model_name,
+            proxy_url=eff_proxy,
+        )
         fact_check_markdown = ""
-        if int(fact_check_count or 0) > 0:
+        if bool(fact_check_plan.get("should_fact_check")):
             def relay_fact_progress(pct, message):
                 if progress_callback:
                     progress_callback(72 + int(min(max(pct, 0), 100) * 0.28), message)
@@ -1040,13 +1062,14 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
                 base_url=eff_base_url,
                 model=model_name,
                 proxy_url=eff_proxy,
-                max_claims=int(fact_check_count),
+                max_claims=int(fact_check_plan.get("recommended_claim_count") or 5),
                 progress_callback=relay_fact_progress,
             )
         return {
             "extract": extracted,
             "summary": summary_result,
             "fact_check_markdown": fact_check_markdown,
+            "fact_check_plan": fact_check_plan,
         }, None
 
 
@@ -1334,6 +1357,7 @@ with tab_doc:
     def save_document_result(result, duration: float):
         extracted = result["extract"]
         summary_result = result["summary"]
+        fact_check_plan = result.get("fact_check_plan") or {}
         st.session_state.document_raw_text = extracted["raw_text"]
         st.session_state.document_clean_text = extracted["clean_text"]
         st.session_state.document_summary_text = summary_result["summary_markdown"]
@@ -1342,23 +1366,10 @@ with tab_doc:
         st.session_state.document_meta = {
             **extracted,
             **summary_result,
+            "fact_check_plan": fact_check_plan,
             "duration": duration,
         }
-
-    fact_check_options = {
-        "不开启": 0,
-        "核查 3 条": 3,
-        "核查 5 条": 5,
-        "核查 8 条": 8,
-    }
-    selected_fact_check_label = st.selectbox(
-        "关键声明事实核查",
-        options=list(fact_check_options.keys()),
-        index=0,
-        key="document_fact_check_option",
-        help="只核查最关键的声明，不做全文逐句核查。开启后会更慢。",
-    )
-    selected_fact_check_count = fact_check_options[selected_fact_check_label]
+    st.caption("系统会先自动判断文档类型。只有识别为新闻、研究、时评、政策解读、行业分析等适合核查的文档，才会自动执行关键声明事实核查。")
 
     doc_source_upload, doc_source_url_tab = st.tabs(["📂 本地上传", "🔗 在线链接"])
 
@@ -1393,7 +1404,6 @@ with tab_doc:
                         uploaded_doc.getvalue(),
                         model_selected,
                         update_doc_progress,
-                        fact_check_count=selected_fact_check_count,
                     )
                     doc_duration = time.time() - t_doc_start
                     if err:
@@ -1439,7 +1449,6 @@ with tab_doc:
                         doc_url.strip(),
                         model_selected,
                         update_doc_url_progress,
-                        fact_check_count=selected_fact_check_count,
                     )
                     doc_duration = time.time() - t_doc_start
                     if err:
@@ -1468,6 +1477,11 @@ with tab_doc:
         duration = float(doc_meta.get("duration") or 0.0)
         source_url = str(doc_meta.get("source_url") or st.session_state.document_source_url or "").strip()
         ocr_used = bool(doc_meta.get("ocr_used", False))
+        fact_check_plan = doc_meta.get("fact_check_plan") or {}
+        doc_type = str(fact_check_plan.get("document_type") or "unknown")
+        should_fact_check = bool(fact_check_plan.get("should_fact_check", False))
+        fact_check_reason = str(fact_check_plan.get("reason") or "").strip()
+        recommended_claim_count = int(fact_check_plan.get("recommended_claim_count") or 0)
 
         meta_parts = [f"文件：`{file_name}`", f"类型：`{file_type}`", f"正文：`{char_count}` 字符", f"策略：`{strategy}`", f"分块：`{chunk_count}`"]
         if page_count:
@@ -1476,9 +1490,12 @@ with tab_doc:
             meta_parts.append(f"耗时：`{duration:.1f}s`")
         if ocr_used:
             meta_parts.append("OCR：`已启用`")
+        meta_parts.append(f"文档判定：`{doc_type}`")
         st.caption(" | ".join(meta_parts))
         if source_url:
             st.caption(f"来源链接：[{source_url}]({source_url})")
+        if fact_check_reason:
+            st.caption(f"事实核查判定：{'已开启' if should_fact_check else '已跳过'}。{fact_check_reason}")
 
         fact_check_content = st.session_state.document_fact_check_text or ""
         if fact_check_content:
@@ -1490,7 +1507,10 @@ with tab_doc:
                 st.markdown(fact_check_content)
         else:
             st.markdown(st.session_state.document_summary_text)
-            st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。关键声明事实核查为可选项，默认关闭。")
+            if should_fact_check and recommended_claim_count > 0:
+                st.warning(f"⚠️ 文档已被判定为适合事实核查，但本次未成功生成核查结果。预期核查关键声明约 {recommended_claim_count} 条。")
+            else:
+                st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。系统会自动判断是否需要关键声明事实核查。")
 
         with st.expander("查看文档原文", expanded=False):
             doc_view_mode = st.radio(
