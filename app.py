@@ -19,6 +19,9 @@ from core_logic import (
     format_error,
     strip_ansi,
     summarize_text,
+    validate_document_upload,
+    extract_document_text,
+    summarize_document_text,
     fetch_available_models,
     get_channel_info,
     get_channel_recent_videos,
@@ -781,6 +784,14 @@ if "transcript_text" not in st.session_state:
     st.session_state.transcript_text = ""
 if "summary_text" not in st.session_state:
     st.session_state.summary_text = ""
+if "document_raw_text" not in st.session_state:
+    st.session_state.document_raw_text = ""
+if "document_clean_text" not in st.session_state:
+    st.session_state.document_clean_text = ""
+if "document_summary_text" not in st.session_state:
+    st.session_state.document_summary_text = ""
+if "document_meta" not in st.session_state:
+    st.session_state.document_meta = {}
 if "whisper_device_tag" not in st.session_state:
     st.session_state.whisper_device_tag = ""
 if "asr_force_cpu" not in st.session_state:
@@ -840,7 +851,7 @@ st.title("🎬 Video Summarizer")
 st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
 
 # 使用 Tabs 分割功能
-tab_single, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
+tab_single, tab_doc, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "📄 文档总结", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
 
 # --- 通用逻辑函数 (供两个 Tab 使用) ---
 def internal_fetch_transcript(video_url, progress_callback=None):
@@ -931,6 +942,42 @@ def internal_summarize(text, model_name, api_key_override=None, base_url_overrid
             return summary, None
         except Exception as e:
             return None, str(e)
+
+
+def internal_summarize_document(file_name, file_bytes, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
+        eff_api_key = api_key_override or api_key
+        eff_base_url = base_url_override or base_url
+        eff_proxy = proxy_override or proxy_input
+
+        ok, err = validate_document_upload(file_name, len(file_bytes))
+        if not ok:
+            return None, err
+        if not eff_api_key:
+            return None, "请先填写 API Key。"
+
+        if progress_callback:
+            progress_callback(10, "正在解析文档...")
+        extracted = extract_document_text(file_bytes, file_name)
+
+        if progress_callback:
+            progress_callback(25, f"文档解析完成，正文约 {extracted['char_count']} 字符。")
+
+        def relay_document_progress(pct, message):
+            if progress_callback:
+                progress_callback(25 + int(min(max(pct, 0), 100) * 0.7), message)
+
+        summary_result = summarize_document_text(
+            extracted["clean_text"],
+            eff_api_key,
+            eff_base_url,
+            model_name,
+            eff_proxy,
+            progress_callback=relay_document_progress,
+        )
+        return {
+            "extract": extracted,
+            "summary": summary_result,
+        }, None
 
 
 # ==========================
@@ -1209,7 +1256,101 @@ with tab_single:
 
 
 # ==========================
-# Tab 2: 频道订阅
+# Tab 2: 文档总结
+# ==========================
+with tab_doc:
+    st.info("💡 一期支持上传：PDF、DOCX、TXT、Markdown。首版默认只做文档总结，暂不默认开启事实核查。")
+    uploaded_doc = st.file_uploader(
+        "上传文档",
+        type=["pdf", "docx", "txt", "md", "markdown"],
+        key="doc_uploader",
+        help="首版建议单文件不超过 20MB。长文档会自动分块总结。",
+    )
+
+    doc_col1, doc_col2 = st.columns([1, 2])
+    with doc_col1:
+        doc_sum_btn = st.button("📄 提取并总结文档", type="primary", use_container_width=True, key="btn_doc_sum")
+    with doc_col2:
+        st.caption("长文档会自动分块总结；文档事实核查将在后续版本单独增强。")
+
+    if doc_sum_btn:
+        if not uploaded_doc:
+            st.warning("请先上传文档。")
+        else:
+            status_container = st.empty()
+            progress_bar = st.progress(0)
+            status_container.info("正在准备文档总结...")
+            t_doc_start = time.time()
+
+            def update_doc_progress(pct, message):
+                progress_bar.progress(max(0, min(100, int(pct))), text=message)
+
+            try:
+                result, err = internal_summarize_document(uploaded_doc.name, uploaded_doc.getvalue(), model_selected, update_doc_progress)
+                doc_duration = time.time() - t_doc_start
+                if err:
+                    progress_bar.empty()
+                    status_container.error("❌ 文档总结失败")
+                    st.error(err)
+                else:
+                    extracted = result["extract"]
+                    summary_result = result["summary"]
+                    st.session_state.document_raw_text = extracted["raw_text"]
+                    st.session_state.document_clean_text = extracted["clean_text"]
+                    st.session_state.document_summary_text = summary_result["summary_markdown"]
+                    st.session_state.document_meta = {
+                        **extracted,
+                        **summary_result,
+                        "duration": doc_duration,
+                    }
+                    progress_bar.empty()
+                    status_container.success(f"✅ 文档总结完成！耗时: {doc_duration:.1f}s")
+            except Exception as e:
+                progress_bar.empty()
+                status_container.error("❌ 文档处理异常")
+                st.error(str(e))
+                st.code(traceback.format_exc())
+
+    if st.session_state.document_summary_text:
+        st.markdown("### 📄 文档总结")
+        doc_meta = st.session_state.document_meta or {}
+        file_name = doc_meta.get("file_name", "未命名文档")
+        file_type = str(doc_meta.get("file_type") or "").upper() or "DOC"
+        char_count = int(doc_meta.get("char_count") or 0)
+        page_count = doc_meta.get("page_count")
+        chunk_count = int(doc_meta.get("chunk_count") or 1)
+        strategy = "分块总结" if doc_meta.get("strategy") == "chunked" else "直接总结"
+        duration = float(doc_meta.get("duration") or 0.0)
+
+        meta_parts = [f"文件：`{file_name}`", f"类型：`{file_type}`", f"正文：`{char_count}` 字符", f"策略：`{strategy}`", f"分块：`{chunk_count}`"]
+        if page_count:
+            meta_parts.append(f"页数：`{page_count}`")
+        if duration:
+            meta_parts.append(f"耗时：`{duration:.1f}s`")
+        st.caption(" | ".join(meta_parts))
+
+        st.markdown(st.session_state.document_summary_text)
+        st.info("📝 一期先聚焦文档总结主链路，事实核查将在后续版本按“关键声明核查”方式接入。")
+
+        with st.expander("查看文档原文", expanded=False):
+            doc_view_mode = st.radio(
+                "文档视图",
+                ["阅读版", "原始版"],
+                horizontal=True,
+                index=0,
+                key="document_view_mode",
+            )
+            if doc_view_mode == "原始版":
+                st.caption("原始版为文档提取后的原始文本，适合排查解析问题。")
+                display_text = st.session_state.document_raw_text
+            else:
+                st.caption("阅读版为清洗后的正文文本，更适合直接阅读。")
+                display_text = st.session_state.document_clean_text
+            st.text_area("文档内容", display_text, height=420)
+
+
+# ==========================
+# Tab 3: 频道订阅
 # ==========================
 with tab_sub:
     # --- 订阅管理 (合并了添加和列表) ---

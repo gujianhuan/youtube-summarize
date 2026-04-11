@@ -16,6 +16,7 @@ import subprocess
 import traceback
 import requests
 import platform
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, quote
 
@@ -2972,6 +2973,375 @@ def _normalize_summary_payload(payload: dict | None) -> dict | None:
     return {
         "summary_markdown": summary_text,
         "fact_check_markdown": fact_check_text,
+    }
+
+
+SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown"}
+DEFAULT_DOCUMENT_MAX_MB = int(os.environ.get("DOCUMENT_MAX_UPLOAD_MB", "20") or "20")
+DEFAULT_DOCUMENT_DIRECT_SUMMARY_CHARS = int(os.environ.get("DOCUMENT_DIRECT_SUMMARY_CHARS", "15000") or "15000")
+DEFAULT_DOCUMENT_CHUNK_CHARS = int(os.environ.get("DOCUMENT_CHUNK_CHARS", "12000") or "12000")
+
+
+def validate_document_upload(file_name: str, file_size: int, max_size_mb: int = DEFAULT_DOCUMENT_MAX_MB) -> tuple[bool, str]:
+    file_name = str(file_name or "").strip()
+    suffix = os.path.splitext(file_name)[1].lower()
+    if not file_name or suffix not in SUPPORTED_DOCUMENT_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_DOCUMENT_EXTENSIONS))
+        return False, f"暂不支持该文档格式。当前支持：{supported}"
+    if int(file_size or 0) <= 0:
+        return False, "上传文件为空，请重新选择。"
+    if int(file_size or 0) > max_size_mb * 1024 * 1024:
+        return False, f"文档超过大小限制（{max_size_mb}MB），请拆分后再上传。"
+    return True, ""
+
+
+def clean_document_text(text: str) -> str:
+    text = str(text or "")
+    text = text.replace("\u00a0", " ").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    blank_pending = False
+    for raw_line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not line:
+            if not blank_pending:
+                lines.append("")
+                blank_pending = True
+            continue
+        blank_pending = False
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def _extract_pdf_text(file_bytes: bytes) -> dict:
+    try:
+        from pypdf import PdfReader
+    except ImportError as e:
+        raise RuntimeError("未安装 pypdf，无法解析 PDF。") from e
+
+    reader = PdfReader(BytesIO(file_bytes))
+    page_texts = []
+    for idx, page in enumerate(reader.pages, start=1):
+        try:
+            page_text = str(page.extract_text() or "").strip()
+        except Exception:
+            page_text = ""
+        if page_text:
+            page_texts.append(f"## 第{idx}页\n{page_text}")
+    return {
+        "raw_text": "\n\n".join(page_texts).strip(),
+        "page_count": len(reader.pages),
+        "section_count": len(page_texts),
+    }
+
+
+def _extract_docx_text(file_bytes: bytes) -> dict:
+    try:
+        from docx import Document
+    except ImportError as e:
+        raise RuntimeError("未安装 python-docx，无法解析 DOCX。") from e
+
+    document = Document(BytesIO(file_bytes))
+    parts = []
+    paragraph_count = 0
+    for para in document.paragraphs:
+        text = str(para.text or "").strip()
+        if not text:
+            continue
+        paragraph_count += 1
+        style_name = str(getattr(getattr(para, "style", None), "name", "") or "").lower()
+        heading_match = re.search(r"heading\s*(\d+)", style_name)
+        if heading_match:
+            level = max(1, min(6, int(heading_match.group(1))))
+            parts.append(f"{'#' * level} {text}")
+        else:
+            parts.append(text)
+
+    table_count = 0
+    for table in document.tables:
+        rows = []
+        for row in table.rows:
+            cells = [str(cell.text or "").strip() for cell in row.cells]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                rows.append(" | ".join(cells))
+        if rows:
+            table_count += 1
+            parts.append(f"## 表格{table_count}\n" + "\n".join(rows))
+
+    return {
+        "raw_text": "\n\n".join(parts).strip(),
+        "page_count": None,
+        "section_count": paragraph_count + table_count,
+    }
+
+
+def _extract_plain_text(file_bytes: bytes) -> dict:
+    encodings = ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "latin-1"]
+    last_error = None
+    for encoding in encodings:
+        try:
+            return {
+                "raw_text": file_bytes.decode(encoding).strip(),
+                "page_count": None,
+                "section_count": None,
+            }
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"文本文件解码失败：{last_error}")
+
+
+def extract_document_text(file_bytes: bytes, file_name: str) -> dict:
+    suffix = os.path.splitext(str(file_name or "").strip())[1].lower()
+    if suffix == ".pdf":
+        extracted = _extract_pdf_text(file_bytes)
+    elif suffix == ".docx":
+        extracted = _extract_docx_text(file_bytes)
+    else:
+        extracted = _extract_plain_text(file_bytes)
+
+    raw_text = str(extracted.get("raw_text") or "").strip()
+    clean_text = clean_document_text(raw_text)
+    if not clean_text:
+        raise RuntimeError("文档未提取到可用文本，请确认文档不是纯扫描图片，或先转换为可复制文本。")
+
+    return {
+        "file_name": file_name,
+        "file_type": suffix.lstrip("."),
+        "raw_text": raw_text,
+        "clean_text": clean_text,
+        "char_count": len(clean_text),
+        "page_count": extracted.get("page_count"),
+        "section_count": extracted.get("section_count"),
+    }
+
+
+def split_document_chunks(text: str, max_chars: int = DEFAULT_DOCUMENT_CHUNK_CHARS) -> list[dict]:
+    text = clean_document_text(text)
+    if not text:
+        return []
+
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+
+    chunks = []
+    current_parts = []
+    current_len = 0
+
+    def flush_current():
+        nonlocal current_parts, current_len
+        if not current_parts:
+            return
+        chunk_text = "\n\n".join(current_parts).strip()
+        chunks.append({
+            "chunk_index": len(chunks) + 1,
+            "text": chunk_text,
+            "char_count": len(chunk_text),
+        })
+        current_parts = []
+        current_len = 0
+
+    for para in paragraphs:
+        if len(para) > max_chars:
+            flush_current()
+            start = 0
+            while start < len(para):
+                end = min(start + max_chars, len(para))
+                split_at = para.rfind("。", start, end)
+                if split_at <= start + int(max_chars * 0.6):
+                    split_at = para.rfind("，", start, end)
+                if split_at <= start + int(max_chars * 0.5):
+                    split_at = end
+                else:
+                    split_at += 1
+                piece = para[start:split_at].strip()
+                if piece:
+                    chunks.append({
+                        "chunk_index": len(chunks) + 1,
+                        "text": piece,
+                        "char_count": len(piece),
+                    })
+                start = split_at
+            continue
+
+        para_len = len(para) + 2
+        if current_parts and current_len + para_len > max_chars:
+            flush_current()
+        current_parts.append(para)
+        current_len += para_len
+
+    flush_current()
+    return chunks
+
+
+def _build_openai_client(api_key: str, base_url: str, proxy_url: str = None):
+    if not api_key:
+        raise RuntimeError("请填写 API Key 以启用总结功能。")
+    try:
+        from openai import OpenAI
+        import httpx
+    except ImportError as e:
+        raise RuntimeError("未安装 openai 依赖，无法进行总结。") from e
+
+    client_kwargs = {"api_key": api_key}
+    if base_url and base_url.strip():
+        client_kwargs["base_url"] = base_url.strip()
+
+    httpx_kwargs = {"verify": False}
+    if proxy_url and proxy_url.strip():
+        httpx_kwargs["proxy"] = proxy_url.strip()
+    client_kwargs["http_client"] = httpx.Client(**httpx_kwargs)
+    return OpenAI(**client_kwargs)
+
+
+def _extract_completion_content(raw_resp) -> str:
+    if isinstance(raw_resp, dict):
+        choices = raw_resp.get("choices", [])
+        if choices:
+            return str(choices[0].get("message", {}).get("content", "") or "")
+        return ""
+    if hasattr(raw_resp, "choices") and raw_resp.choices:
+        return str(raw_resp.choices[0].message.content or "")
+    if isinstance(raw_resp, str):
+        return raw_resp
+    return ""
+
+
+def _extract_summary_markdown(raw_text: str) -> str:
+    payload = _parse_summary_payload(raw_text)
+    if isinstance(payload, dict):
+        summary_text = str(
+            payload.get("summary_markdown")
+            or payload.get("summary")
+            or payload.get("summary_md")
+            or ""
+        ).strip()
+        if summary_text:
+            return summary_text
+    return str(raw_text or "").strip()
+
+
+def _summarize_document_passage(client, model: str, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+    response = client.chat.completions.create(
+        model=model.strip() or "gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+    )
+    content = _extract_completion_content(response)
+    if not content:
+        raise RuntimeError("模型未返回有效总结内容。")
+    return _extract_summary_markdown(content)
+
+
+def summarize_document_text(
+    text: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    proxy_url: str = None,
+    progress_callback=None,
+) -> dict:
+    cleaned_text = clean_document_text(text)
+    if not cleaned_text:
+        raise RuntimeError("文档文本为空，无法总结。")
+
+    client = _build_openai_client(api_key, base_url, proxy_url)
+    content_len = len(cleaned_text)
+    direct_system_prompt = (
+        "你是一个专业的文档总结助手。请始终返回合法 JSON，且只能包含字段 `summary_markdown`。"
+        "输出必须使用 Markdown，结构固定为：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。"
+        "所有内容尽量分条列出，不要写成长篇大段落。"
+    )
+
+    if content_len <= DEFAULT_DOCUMENT_DIRECT_SUMMARY_CHARS:
+        if callable(progress_callback):
+            progress_callback(35, "文档较短，正在直接生成总结...")
+        prompt = (
+            "请总结以下文档内容。\n"
+            "要求：\n"
+            "- 只返回 JSON\n"
+            "- 仅包含字段 `summary_markdown`\n"
+            "- `## 主要内容` 中输出 6-10 条要点\n"
+            "- `## 结论（可选）` 只有在文档确实有明确结论时才输出\n\n"
+            f"文档正文：\n{cleaned_text}"
+        )
+        summary_markdown = _summarize_document_passage(
+            client,
+            model,
+            direct_system_prompt,
+            prompt,
+            max_tokens=2200,
+        )
+        if callable(progress_callback):
+            progress_callback(100, "文档总结完成。")
+        return {
+            "summary_markdown": summary_markdown,
+            "strategy": "direct",
+            "chunk_count": 1,
+            "char_count": content_len,
+        }
+
+    chunks = split_document_chunks(cleaned_text, max_chars=DEFAULT_DOCUMENT_CHUNK_CHARS)
+    if not chunks:
+        raise RuntimeError("文档分块失败，无法继续总结。")
+
+    chunk_summaries = []
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        if callable(progress_callback):
+            progress_callback(20 + int(50 * idx / max(1, total_chunks)), f"正在总结第 {idx}/{total_chunks} 块...")
+        chunk_prompt = (
+            f"请总结下面这段文档片段（第 {idx}/{total_chunks} 块）。\n"
+            "要求：\n"
+            "- 只返回 JSON\n"
+            "- 仅包含字段 `summary_markdown`\n"
+            "- 输出结构：`### 本块要点`、`### 本块关键信息`\n"
+            "- 使用分条要点，不要长段落\n\n"
+            f"文档片段：\n{chunk['text']}"
+        )
+        chunk_summary = _summarize_document_passage(
+            client,
+            model,
+            "你是一个文档片段总结助手。请始终返回合法 JSON，且只能包含 `summary_markdown`。",
+            chunk_prompt,
+            max_tokens=1000,
+        )
+        chunk_summaries.append(f"## 第{idx}块摘要\n{chunk_summary}")
+
+    if callable(progress_callback):
+        progress_callback(80, "正在汇总整份文档摘要...")
+    merge_prompt = (
+        "下面是同一份长文档的分块摘要，请基于这些分块摘要生成最终总结。\n"
+        "要求：\n"
+        "- 只返回 JSON\n"
+        "- 仅包含字段 `summary_markdown`\n"
+        "- 使用 Markdown\n"
+        "- 固定结构：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`\n"
+        "- `## 主要内容` 输出 8-12 条，按条列出\n"
+        "- 不要重复每一块的相同意思\n\n"
+        f"分块摘要：\n{'\n\n'.join(chunk_summaries)}"
+    )
+    summary_markdown = _summarize_document_passage(
+        client,
+        model,
+        direct_system_prompt,
+        merge_prompt,
+        max_tokens=2500,
+    )
+    if callable(progress_callback):
+        progress_callback(100, "长文档总结完成。")
+    return {
+        "summary_markdown": summary_markdown,
+        "strategy": "chunked",
+        "chunk_count": total_chunks,
+        "char_count": content_len,
     }
 
 def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
