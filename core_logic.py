@@ -3209,15 +3209,92 @@ def _build_requests_kwargs(proxy_url: str = None, timeout_seconds: float = 25.0)
     return kwargs
 
 
+def _build_article_headers(url: str) -> dict:
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.netloc or "").lower()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    if "mp.weixin.qq.com" in host:
+        headers.update({
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.40",
+            "Referer": "https://mp.weixin.qq.com/",
+        })
+    return headers
+
+
+def _looks_like_access_block_page(html: str, url: str = "") -> bool:
+    sample = str(html or "")[:4000]
+    host = (urlparse(str(url or "").strip()).netloc or "").lower()
+    keywords = [
+        "环境异常",
+        "去验证",
+        "请在微信客户端打开链接",
+        "访问过于频繁",
+        "当前访问环境异常",
+        "完成验证",
+    ]
+    if any(keyword in sample for keyword in keywords):
+        return True
+    if "mp.weixin.qq.com" in host and "#js_content" not in sample and "js_content" not in sample:
+        return True
+    return False
+
+
+def _extract_wechat_article_text(html: str, url: str) -> dict:
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        raise RuntimeError("未安装 beautifulsoup4，无法解析微信公众号文章。") from e
+
+    soup = BeautifulSoup(html, "html.parser")
+    title_node = soup.select_one("#activity-name") or soup.select_one("h1")
+    meta_title = soup.select_one('meta[property="og:title"]')
+    title = title_node.get_text(" ", strip=True) if title_node else ""
+    if not title and meta_title:
+        title = str(meta_title.get("content") or "").strip()
+
+    content_node = soup.select_one("#js_content")
+    if not content_node:
+        raise RuntimeError("未能从微信公众号页面中定位正文区域。")
+
+    for tag in content_node.select("script, style, noscript"):
+        tag.decompose()
+    raw_text = content_node.get_text("\n", strip=True)
+    clean_text = clean_document_text(raw_text)
+    if not clean_text or len(clean_text) < 80:
+        raise RuntimeError("微信公众号正文提取结果过短，疑似仍为异常页。")
+    if title and title not in clean_text[:150]:
+        raw_text = f"# {title}\n\n{raw_text}".strip()
+        clean_text = clean_document_text(raw_text)
+
+    return {
+        "file_name": title or "wechat_article.html",
+        "file_type": "html",
+        "raw_text": raw_text,
+        "clean_text": clean_text,
+        "char_count": len(clean_text),
+        "page_count": None,
+        "section_count": None,
+        "source_url": url,
+        "ocr_used": False,
+    }
+
+
 def extract_web_article_text(url: str, proxy_url: str = None) -> dict:
     try:
         from bs4 import BeautifulSoup
     except ImportError as e:
         raise RuntimeError("未安装 beautifulsoup4，无法解析网页文章。") from e
 
-    resp = requests.get(url, **_build_requests_kwargs(proxy_url, timeout_seconds=30.0))
+    headers = _build_article_headers(url)
+    resp = requests.get(url, headers=headers, **_build_requests_kwargs(proxy_url, timeout_seconds=30.0))
     resp.raise_for_status()
     html = resp.text
+    if "mp.weixin.qq.com" in (urlparse(url).netloc or "").lower():
+        return _extract_wechat_article_text(html, url)
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
         tag.decompose()
@@ -3241,7 +3318,7 @@ def extract_web_article_text(url: str, proxy_url: str = None) -> dict:
     if title and title not in raw_text[:200]:
         raw_text = f"# {title}\n\n{raw_text}".strip()
     clean_text = clean_document_text(raw_text)
-    if not clean_text:
+    if not clean_text or _looks_like_access_block_page(html, url):
         raise RuntimeError("网页未提取到足够正文内容，请尝试更换文章链接。")
     return {
         "file_name": title or _guess_remote_file_name(url, resp) or "remote_article.html",
@@ -3261,7 +3338,8 @@ def extract_document_from_url(url: str, proxy_url: str = None) -> dict:
     if not url.lower().startswith(("http://", "https://")):
         raise RuntimeError("请输入完整的在线链接（以 http:// 或 https:// 开头）。")
 
-    resp = requests.get(url, stream=True, **_build_requests_kwargs(proxy_url, timeout_seconds=35.0))
+    headers = _build_article_headers(url)
+    resp = requests.get(url, stream=True, headers=headers, **_build_requests_kwargs(proxy_url, timeout_seconds=35.0))
     resp.raise_for_status()
     content = resp.content
     file_name = _guess_remote_file_name(url, resp)
