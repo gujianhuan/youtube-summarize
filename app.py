@@ -23,6 +23,7 @@ from core_logic import (
     extract_document_text,
     extract_document_from_url,
     summarize_document_text,
+    fact_check_document_claims,
     fetch_available_models,
     get_channel_info,
     get_channel_recent_videos,
@@ -791,6 +792,8 @@ if "document_clean_text" not in st.session_state:
     st.session_state.document_clean_text = ""
 if "document_summary_text" not in st.session_state:
     st.session_state.document_summary_text = ""
+if "document_fact_check_text" not in st.session_state:
+    st.session_state.document_fact_check_text = ""
 if "document_meta" not in st.session_state:
     st.session_state.document_meta = {}
 if "document_source_url" not in st.session_state:
@@ -947,7 +950,7 @@ def internal_summarize(text, model_name, api_key_override=None, base_url_overrid
             return None, str(e)
 
 
-def internal_summarize_document(file_name, file_bytes, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
+def internal_summarize_document(file_name, file_bytes, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None, fact_check_count=0):
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
         eff_proxy = proxy_override or proxy_input
@@ -967,7 +970,7 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
 
         def relay_document_progress(pct, message):
             if progress_callback:
-                progress_callback(25 + int(min(max(pct, 0), 100) * 0.7), message)
+                progress_callback(25 + int(min(max(pct, 0), 100) * 0.45), message)
 
         summary_result = summarize_document_text(
             extracted["clean_text"],
@@ -977,13 +980,29 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
             eff_proxy,
             progress_callback=relay_document_progress,
         )
+        fact_check_markdown = ""
+        if int(fact_check_count or 0) > 0:
+            def relay_fact_progress(pct, message):
+                if progress_callback:
+                    progress_callback(72 + int(min(max(pct, 0), 100) * 0.28), message)
+            fact_check_markdown = fact_check_document_claims(
+                text=extracted["clean_text"],
+                summary_markdown=summary_result["summary_markdown"],
+                api_key=eff_api_key,
+                base_url=eff_base_url,
+                model=model_name,
+                proxy_url=eff_proxy,
+                max_claims=int(fact_check_count),
+                progress_callback=relay_fact_progress,
+            )
         return {
             "extract": extracted,
             "summary": summary_result,
+            "fact_check_markdown": fact_check_markdown,
         }, None
 
 
-def internal_summarize_document_url(source_url, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
+def internal_summarize_document_url(source_url, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None, fact_check_count=0):
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
         eff_proxy = proxy_override or proxy_input
@@ -999,7 +1018,7 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
 
         def relay_document_progress(pct, message):
             if progress_callback:
-                progress_callback(25 + int(min(max(pct, 0), 100) * 0.7), message)
+                progress_callback(25 + int(min(max(pct, 0), 100) * 0.45), message)
 
         summary_result = summarize_document_text(
             extracted["clean_text"],
@@ -1009,9 +1028,25 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
             eff_proxy,
             progress_callback=relay_document_progress,
         )
+        fact_check_markdown = ""
+        if int(fact_check_count or 0) > 0:
+            def relay_fact_progress(pct, message):
+                if progress_callback:
+                    progress_callback(72 + int(min(max(pct, 0), 100) * 0.28), message)
+            fact_check_markdown = fact_check_document_claims(
+                text=extracted["clean_text"],
+                summary_markdown=summary_result["summary_markdown"],
+                api_key=eff_api_key,
+                base_url=eff_base_url,
+                model=model_name,
+                proxy_url=eff_proxy,
+                max_claims=int(fact_check_count),
+                progress_callback=relay_fact_progress,
+            )
         return {
             "extract": extracted,
             "summary": summary_result,
+            "fact_check_markdown": fact_check_markdown,
         }, None
 
 
@@ -1302,12 +1337,28 @@ with tab_doc:
         st.session_state.document_raw_text = extracted["raw_text"]
         st.session_state.document_clean_text = extracted["clean_text"]
         st.session_state.document_summary_text = summary_result["summary_markdown"]
+        st.session_state.document_fact_check_text = str(result.get("fact_check_markdown") or "")
         st.session_state.document_source_url = str(extracted.get("source_url") or "")
         st.session_state.document_meta = {
             **extracted,
             **summary_result,
             "duration": duration,
         }
+
+    fact_check_options = {
+        "不开启": 0,
+        "核查 3 条": 3,
+        "核查 5 条": 5,
+        "核查 8 条": 8,
+    }
+    selected_fact_check_label = st.selectbox(
+        "关键声明事实核查",
+        options=list(fact_check_options.keys()),
+        index=0,
+        key="document_fact_check_option",
+        help="只核查最关键的声明，不做全文逐句核查。开启后会更慢。",
+    )
+    selected_fact_check_count = fact_check_options[selected_fact_check_label]
 
     doc_source_upload, doc_source_url_tab = st.tabs(["📂 本地上传", "🔗 在线链接"])
 
@@ -1322,7 +1373,7 @@ with tab_doc:
         with doc_col1:
             doc_sum_btn = st.button("📄 提取并总结文档", type="primary", use_container_width=True, key="btn_doc_sum")
         with doc_col2:
-            st.caption("长文档会自动分块总结；文档事实核查将在后续版本按关键声明方式接入。")
+            st.caption("长文档会自动分块总结；事实核查只针对关键声明进行。")
 
         if doc_sum_btn:
             if not uploaded_doc:
@@ -1337,7 +1388,13 @@ with tab_doc:
                     progress_bar.progress(max(0, min(100, int(pct))), text=message)
 
                 try:
-                    result, err = internal_summarize_document(uploaded_doc.name, uploaded_doc.getvalue(), model_selected, update_doc_progress)
+                    result, err = internal_summarize_document(
+                        uploaded_doc.name,
+                        uploaded_doc.getvalue(),
+                        model_selected,
+                        update_doc_progress,
+                        fact_check_count=selected_fact_check_count,
+                    )
                     doc_duration = time.time() - t_doc_start
                     if err:
                         progress_bar.empty()
@@ -1378,7 +1435,12 @@ with tab_doc:
                     progress_bar.progress(max(0, min(100, int(pct))), text=message)
 
                 try:
-                    result, err = internal_summarize_document_url(doc_url.strip(), model_selected, update_doc_url_progress)
+                    result, err = internal_summarize_document_url(
+                        doc_url.strip(),
+                        model_selected,
+                        update_doc_url_progress,
+                        fact_check_count=selected_fact_check_count,
+                    )
                     doc_duration = time.time() - t_doc_start
                     if err:
                         progress_bar.empty()
@@ -1418,8 +1480,17 @@ with tab_doc:
         if source_url:
             st.caption(f"来源链接：[{source_url}]({source_url})")
 
-        st.markdown(st.session_state.document_summary_text)
-        st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退；文档事实核查将在后续版本按“关键声明核查”方式接入。")
+        fact_check_content = st.session_state.document_fact_check_text or ""
+        if fact_check_content:
+            col_doc_sum, col_doc_check = st.columns([1.2, 1])
+            with col_doc_sum:
+                st.markdown(st.session_state.document_summary_text)
+            with col_doc_check:
+                st.info("🕵️ **关键声明事实核查**")
+                st.markdown(fact_check_content)
+        else:
+            st.markdown(st.session_state.document_summary_text)
+            st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。关键声明事实核查为可选项，默认关闭。")
 
         with st.expander("查看文档原文", expanded=False):
             doc_view_mode = st.radio(

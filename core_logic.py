@@ -3550,6 +3550,176 @@ def summarize_document_text(
         "char_count": content_len,
     }
 
+
+def _extract_claim_items(raw_text: str, max_claims: int) -> list[dict]:
+    payload = _parse_summary_payload(raw_text)
+    if isinstance(payload, dict):
+        claim_list = payload.get("claims") or payload.get("items") or payload.get("key_claims") or []
+    else:
+        candidate = _extract_json_candidate(raw_text)
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            claim_list = parsed.get("claims") or parsed.get("items") or parsed.get("key_claims") or []
+        else:
+            claim_list = []
+
+    normalized = []
+    for item in claim_list:
+        if isinstance(item, str):
+            claim = item.strip()
+            queries = [claim] if claim else []
+        elif isinstance(item, dict):
+            claim = str(item.get("claim") or item.get("statement") or item.get("text") or "").strip()
+            queries = item.get("queries") or item.get("search_queries") or []
+            if isinstance(queries, str):
+                queries = [queries]
+            queries = [str(q).strip() for q in queries if str(q).strip()]
+        else:
+            continue
+        if claim:
+            normalized.append({"claim": claim, "queries": queries[:2]})
+        if len(normalized) >= max_claims:
+            break
+    return normalized
+
+
+def extract_key_claims(
+    text: str,
+    summary_markdown: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    proxy_url: str = None,
+    max_claims: int = 5,
+) -> list[dict]:
+    client = _build_openai_client(api_key, base_url, proxy_url)
+    cleaned_text = clean_document_text(text)
+    excerpt = cleaned_text[:12000]
+    prompt = (
+        f"请从下面文档中提取最值得做事实核查的 {max_claims} 条关键声明。\n"
+        "要求：\n"
+        "- 只提取可核查的硬信息，不要提取纯观点、情绪表达或修辞。\n"
+        "- 优先提取：数字、时间、政策、官方表述、事件是否发生、人物公开言论、强因果判断。\n"
+        "- 只返回 JSON，对象格式如下：\n"
+        "{\n"
+        '  "claims": [\n'
+        '    {"claim": "声明内容", "queries": ["搜索词1", "搜索词2"]}\n'
+        "  ]\n"
+        "}\n"
+        "- 每条 queries 最多给 2 个，搜索词中尽量包含主体、时间、地点、数字、机构。\n\n"
+        f"文档总结：\n{summary_markdown[:5000]}\n\n"
+        f"文档正文节选：\n{excerpt}"
+    )
+    response = client.chat.completions.create(
+        model=model.strip() or "gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "你是一个事实核查分析助手。请只返回合法 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=1200,
+        temperature=0.1,
+    )
+    content = _extract_completion_content(response)
+    claims = _extract_claim_items(content, max_claims=max_claims)
+    if not claims:
+        raise RuntimeError("未能从文档中提取到可核查的关键声明。")
+    return claims
+
+
+def search_claim_sources(claim_items: list[dict], proxy_url: str = None) -> list[dict]:
+    results = []
+    for item in claim_items:
+        claim = str(item.get("claim") or "").strip()
+        queries = item.get("queries") or []
+        if not queries:
+            queries = [claim]
+        search_markdown = perform_web_search(queries[:2], proxy=proxy_url)
+        results.append({
+            "claim": claim,
+            "queries": queries[:2],
+            "search_markdown": search_markdown,
+        })
+    return results
+
+
+def fact_check_document_claims(
+    text: str,
+    summary_markdown: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    proxy_url: str = None,
+    max_claims: int = 5,
+    progress_callback=None,
+) -> str:
+    if max_claims <= 0:
+        return ""
+
+    if callable(progress_callback):
+        progress_callback(5, "正在抽取关键声明...")
+    claims = extract_key_claims(
+        text=text,
+        summary_markdown=summary_markdown,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        proxy_url=proxy_url,
+        max_claims=max_claims,
+    )
+
+    if callable(progress_callback):
+        progress_callback(35, "正在检索外部来源...")
+    claim_sources = search_claim_sources(claims, proxy_url=proxy_url)
+
+    compiled_sections = []
+    for idx, item in enumerate(claim_sources, start=1):
+        compiled_sections.append(
+            f"### 候选声明{idx}\n"
+            f"- 声明：{item['claim']}\n"
+            f"- 搜索词：{' | '.join(item.get('queries') or [])}\n"
+            f"- 搜索结果：\n{item['search_markdown']}"
+        )
+
+    if callable(progress_callback):
+        progress_callback(70, "正在生成逐条核查结果...")
+
+    client = _build_openai_client(api_key, base_url, proxy_url)
+    compiled_claim_text = "\n\n".join(compiled_sections)
+    prompt = (
+        "请根据下面的关键声明与搜索结果，输出逐条事实核查 Markdown。\n"
+        "要求：\n"
+        "- 每条都使用下面结构：\n"
+        "### 条目1\n"
+        "- 关键声明：...\n"
+        "- 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
+        "- 判断依据：...\n"
+        "- 来源/出处：给出 1-3 个外部来源链接，格式如 [新华社](https://...)\n"
+        "- 禁止把文档本身当来源。\n"
+        "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
+        "- 只返回 Markdown，不要 JSON。\n\n"
+        f"文档总结：\n{summary_markdown[:4000]}\n\n"
+        f"候选声明与搜索结果：\n{compiled_claim_text}"
+    )
+    response = client.chat.completions.create(
+        model=model.strip() or "gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "你是一个严谨的事实核查助手。请基于外部来源逐条核查关键声明。"},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=2200,
+        temperature=0.15,
+    )
+    content = _extract_completion_content(response).strip()
+    if callable(progress_callback):
+        progress_callback(100, "关键声明事实核查完成。")
+    if not content:
+        raise RuntimeError("模型未返回事实核查结果。")
+    return content
+
 def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
     if not text or not text.strip():
         return "没有可总结的内容（文本为空）。"
