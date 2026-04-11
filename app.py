@@ -799,6 +799,11 @@ if "document_meta" not in st.session_state:
     st.session_state.document_meta = {}
 if "document_source_url" not in st.session_state:
     st.session_state.document_source_url = ""
+if "document_results" not in st.session_state:
+    st.session_state.document_results = {
+        "upload": {},
+        "url": {},
+    }
 if "whisper_device_tag" not in st.session_state:
     st.session_state.whisper_device_tag = ""
 if "asr_force_cpu" not in st.session_state:
@@ -1354,21 +1359,95 @@ with tab_single:
 with tab_doc:
     st.info("💡 二期已支持：本地 PDF / DOCX / TXT / Markdown / PPTX，以及在线 PDF 链接、网页文章链接。扫描版 PDF 会在提取不到文本时自动尝试 OCR。")
 
-    def save_document_result(result, duration: float):
+    def save_document_result(source_key: str, result, duration: float):
         extracted = result["extract"]
         summary_result = result["summary"]
         fact_check_plan = result.get("fact_check_plan") or {}
-        st.session_state.document_raw_text = extracted["raw_text"]
-        st.session_state.document_clean_text = extracted["clean_text"]
-        st.session_state.document_summary_text = summary_result["summary_markdown"]
-        st.session_state.document_fact_check_text = str(result.get("fact_check_markdown") or "")
-        st.session_state.document_source_url = str(extracted.get("source_url") or "")
-        st.session_state.document_meta = {
+        st.session_state.document_results[source_key] = {
+            "raw_text": extracted["raw_text"],
+            "clean_text": extracted["clean_text"],
+            "summary_text": summary_result["summary_markdown"],
+            "fact_check_text": str(result.get("fact_check_markdown") or ""),
+            "source_url": str(extracted.get("source_url") or ""),
+            "meta": {
             **extracted,
             **summary_result,
             "fact_check_plan": fact_check_plan,
             "duration": duration,
+            },
         }
+
+    def render_document_result(source_key: str):
+        result_state = st.session_state.document_results.get(source_key) or {}
+        summary_text = str(result_state.get("summary_text") or "").strip()
+        if not summary_text:
+            return
+
+        raw_text = str(result_state.get("raw_text") or "")
+        clean_text = str(result_state.get("clean_text") or "")
+        fact_check_content = str(result_state.get("fact_check_text") or "")
+        source_url_state = str(result_state.get("source_url") or "")
+        doc_meta = result_state.get("meta") or {}
+
+        st.markdown("### 📄 文档总结")
+        file_name = doc_meta.get("file_name", "未命名文档")
+        file_type = str(doc_meta.get("file_type") or "").upper() or "DOC"
+        char_count = int(doc_meta.get("char_count") or 0)
+        page_count = doc_meta.get("page_count")
+        chunk_count = int(doc_meta.get("chunk_count") or 1)
+        strategy = "分块总结" if doc_meta.get("strategy") == "chunked" else "直接总结"
+        duration = float(doc_meta.get("duration") or 0.0)
+        source_url = str(doc_meta.get("source_url") or source_url_state or "").strip()
+        ocr_used = bool(doc_meta.get("ocr_used", False))
+        fact_check_plan = doc_meta.get("fact_check_plan") or {}
+        doc_type = str(fact_check_plan.get("document_type") or "unknown")
+        should_fact_check = bool(fact_check_plan.get("should_fact_check", False))
+        fact_check_reason = str(fact_check_plan.get("reason") or "").strip()
+        recommended_claim_count = int(fact_check_plan.get("recommended_claim_count") or 0)
+
+        meta_parts = [f"文件：`{file_name}`", f"类型：`{file_type}`", f"正文：`{char_count}` 字符", f"策略：`{strategy}`", f"分块：`{chunk_count}`"]
+        if page_count:
+            meta_parts.append(f"页数：`{page_count}`")
+        if duration:
+            meta_parts.append(f"耗时：`{duration:.1f}s`")
+        if ocr_used:
+            meta_parts.append("OCR：`已启用`")
+        meta_parts.append(f"文档判定：`{doc_type}`")
+        st.caption(" | ".join(meta_parts))
+        if source_url:
+            st.caption(f"来源链接：[{source_url}]({source_url})")
+        if fact_check_reason:
+            st.caption(f"事实核查判定：{'已开启' if should_fact_check else '已跳过'}。{fact_check_reason}")
+
+        if fact_check_content:
+            col_doc_sum, col_doc_check = st.columns([1.2, 1])
+            with col_doc_sum:
+                st.markdown(summary_text)
+            with col_doc_check:
+                st.info("🕵️ **关键声明事实核查**")
+                st.markdown(fact_check_content)
+        else:
+            st.markdown(summary_text)
+            if should_fact_check and recommended_claim_count > 0:
+                st.warning(f"⚠️ 文档已被判定为适合事实核查，但本次未成功生成核查结果。预期核查关键声明约 {recommended_claim_count} 条。")
+            else:
+                st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。系统会自动判断是否需要关键声明事实核查。")
+
+        with st.expander("查看文档原文", expanded=False):
+            doc_view_mode = st.radio(
+                "文档视图",
+                ["阅读版", "原始版"],
+                horizontal=True,
+                index=0,
+                key=f"document_view_mode_{source_key}",
+            )
+            if doc_view_mode == "原始版":
+                st.caption("原始版为文档提取后的原始文本，适合排查解析问题。")
+                display_text = raw_text
+            else:
+                st.caption("阅读版为清洗后的正文文本，更适合直接阅读。")
+                display_text = clean_text
+            st.text_area("文档内容", display_text, height=420, key=f"document_content_{source_key}")
     st.caption("系统会先自动判断文档类型。只有识别为新闻、研究、时评、政策解读、行业分析等适合核查的文档，才会自动执行关键声明事实核查。")
 
     doc_source_upload, doc_source_url_tab = st.tabs(["📂 本地上传", "🔗 在线链接"])
@@ -1411,7 +1490,7 @@ with tab_doc:
                         status_container.error("❌ 文档总结失败")
                         st.error(err)
                     else:
-                        save_document_result(result, doc_duration)
+                        save_document_result("upload", result, doc_duration)
                         progress_bar.empty()
                         status_container.success(f"✅ 文档总结完成！耗时: {doc_duration:.1f}s")
                 except Exception as e:
@@ -1419,6 +1498,7 @@ with tab_doc:
                     status_container.error("❌ 文档处理异常")
                     st.error(str(e))
                     st.code(traceback.format_exc())
+        render_document_result("upload")
 
     with doc_source_url_tab:
         doc_url = st.text_input(
@@ -1456,7 +1536,7 @@ with tab_doc:
                         status_container.error("❌ 在线文档总结失败")
                         st.error(err)
                     else:
-                        save_document_result(result, doc_duration)
+                        save_document_result("url", result, doc_duration)
                         progress_bar.empty()
                         status_container.success(f"✅ 在线内容总结完成！耗时: {doc_duration:.1f}s")
                 except Exception as e:
@@ -1464,69 +1544,7 @@ with tab_doc:
                     status_container.error("❌ 在线内容处理异常")
                     st.error(str(e))
                     st.code(traceback.format_exc())
-
-    if st.session_state.document_summary_text:
-        st.markdown("### 📄 文档总结")
-        doc_meta = st.session_state.document_meta or {}
-        file_name = doc_meta.get("file_name", "未命名文档")
-        file_type = str(doc_meta.get("file_type") or "").upper() or "DOC"
-        char_count = int(doc_meta.get("char_count") or 0)
-        page_count = doc_meta.get("page_count")
-        chunk_count = int(doc_meta.get("chunk_count") or 1)
-        strategy = "分块总结" if doc_meta.get("strategy") == "chunked" else "直接总结"
-        duration = float(doc_meta.get("duration") or 0.0)
-        source_url = str(doc_meta.get("source_url") or st.session_state.document_source_url or "").strip()
-        ocr_used = bool(doc_meta.get("ocr_used", False))
-        fact_check_plan = doc_meta.get("fact_check_plan") or {}
-        doc_type = str(fact_check_plan.get("document_type") or "unknown")
-        should_fact_check = bool(fact_check_plan.get("should_fact_check", False))
-        fact_check_reason = str(fact_check_plan.get("reason") or "").strip()
-        recommended_claim_count = int(fact_check_plan.get("recommended_claim_count") or 0)
-
-        meta_parts = [f"文件：`{file_name}`", f"类型：`{file_type}`", f"正文：`{char_count}` 字符", f"策略：`{strategy}`", f"分块：`{chunk_count}`"]
-        if page_count:
-            meta_parts.append(f"页数：`{page_count}`")
-        if duration:
-            meta_parts.append(f"耗时：`{duration:.1f}s`")
-        if ocr_used:
-            meta_parts.append("OCR：`已启用`")
-        meta_parts.append(f"文档判定：`{doc_type}`")
-        st.caption(" | ".join(meta_parts))
-        if source_url:
-            st.caption(f"来源链接：[{source_url}]({source_url})")
-        if fact_check_reason:
-            st.caption(f"事实核查判定：{'已开启' if should_fact_check else '已跳过'}。{fact_check_reason}")
-
-        fact_check_content = st.session_state.document_fact_check_text or ""
-        if fact_check_content:
-            col_doc_sum, col_doc_check = st.columns([1.2, 1])
-            with col_doc_sum:
-                st.markdown(st.session_state.document_summary_text)
-            with col_doc_check:
-                st.info("🕵️ **关键声明事实核查**")
-                st.markdown(fact_check_content)
-        else:
-            st.markdown(st.session_state.document_summary_text)
-            if should_fact_check and recommended_claim_count > 0:
-                st.warning(f"⚠️ 文档已被判定为适合事实核查，但本次未成功生成核查结果。预期核查关键声明约 {recommended_claim_count} 条。")
-            else:
-                st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。系统会自动判断是否需要关键声明事实核查。")
-
-        with st.expander("查看文档原文", expanded=False):
-            doc_view_mode = st.radio(
-                "文档视图",
-                ["阅读版", "原始版"],
-                horizontal=True,
-                index=0,
-                key="document_view_mode",
-            )
-            if doc_view_mode == "原始版":
-                st.caption("原始版为文档提取后的原始文本，适合排查解析问题。")
-                display_text = st.session_state.document_raw_text
-            else:
-                st.caption("阅读版为清洗后的正文文本，更适合直接阅读。")
-                display_text = st.session_state.document_clean_text
-            st.text_area("文档内容", display_text, height=420)
+        render_document_result("url")
 
 
 # ==========================
