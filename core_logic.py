@@ -199,6 +199,61 @@ def build_runtime_version_diagnostics() -> str:
     return "; ".join(parts)
 
 
+def get_remote_worker_status(timeout_seconds: float = 4.0) -> dict:
+    """检查远程抓取节点配置、健康状态和 Render ASR 兜底策略。"""
+    worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+    remote_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
+    worker_token = str(os.environ.get("REMOTE_TRANSCRIBE_TOKEN", "") or "").strip()
+    running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
+    disable_render_asr_fallback = running_on_render and str(
+        os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
+    ).strip().lower() not in {"0", "false", "no"}
+
+    status = {
+        "configured": bool(worker_url),
+        "remote_mode": remote_mode or "disabled",
+        "worker_url": worker_url,
+        "worker_host": "",
+        "worker_health_url": "",
+        "worker_token_configured": bool(worker_token),
+        "running_on_render": running_on_render,
+        "disable_render_asr_fallback": disable_render_asr_fallback,
+        "health_ok": False,
+        "health_status_code": None,
+        "health_error": "",
+        "health_payload": {},
+    }
+
+    if not worker_url:
+        status["health_error"] = "未配置 REMOTE_TRANSCRIBE_URL"
+        return status
+
+    parsed = urlparse(worker_url)
+    base = worker_url.rsplit("/fetch-transcript", 1)[0] if "/fetch-transcript" in worker_url else worker_url.rstrip("/")
+    health_url = f"{base}/health"
+    status["worker_host"] = parsed.netloc or worker_url
+    status["worker_health_url"] = health_url
+
+    try:
+        resp = requests.get(health_url, timeout=max(1.0, float(timeout_seconds)), verify=False)
+        status["health_status_code"] = resp.status_code
+        if resp.ok:
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {"raw_text": resp.text[:500]}
+            status["health_payload"] = payload if isinstance(payload, dict) else {"raw": payload}
+            status["health_ok"] = bool(status["health_payload"].get("ok", True))
+            if not status["health_ok"]:
+                status["health_error"] = str(status["health_payload"].get("error") or "健康检查返回 ok=false")
+        else:
+            status["health_error"] = f"HTTP {resp.status_code}"
+    except requests.exceptions.RequestException as e:
+        status["health_error"] = f"{type(e).__name__}: {e}"
+
+    return status
+
+
 def try_fetch_transcript_via_remote_worker(
     video_id: str,
     video_url: str,

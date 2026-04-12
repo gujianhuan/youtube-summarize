@@ -29,6 +29,7 @@ from core_logic import (
     get_channel_info,
     get_channel_recent_videos,
     search_channels,
+    get_remote_worker_status,
 )
 
 # --- 常量定义 ---
@@ -75,6 +76,11 @@ def load_guestbook():
 
 def save_guestbook(guestbook):
     save_json_file(GUESTBOOK_FILE, guestbook)
+
+
+@st.cache_data(ttl=8, show_spinner=False)
+def get_remote_worker_status_cached(refresh_key: int = 0):
+    return get_remote_worker_status(timeout_seconds=4.0)
 
 def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
     history = load_history()
@@ -1135,6 +1141,30 @@ if st.session_state.bg_task_id:
 with tab_single:
     # --- 界面布局 ---
     st.info("💡 支持输入：\n- YouTube 视频链接 / ID\n- Bilibili 视频链接 / BV号")
+    status_col1, status_col2 = st.columns([5, 1])
+    with status_col2:
+        remote_status_refresh = st.button("刷新节点状态", key="btn_refresh_remote_status", use_container_width=True)
+    remote_status = get_remote_worker_status_cached(1 if remote_status_refresh else 0)
+    with status_col1:
+        if remote_status.get("configured"):
+            host = str(remote_status.get("worker_host") or "unknown")
+            mode = str(remote_status.get("remote_mode") or "disabled")
+            fallback_disabled = bool(remote_status.get("disable_render_asr_fallback"))
+            if remote_status.get("health_ok"):
+                st.success(
+                    f"本地抓取节点在线 | mode={mode} | host={host} | "
+                    f"Render ASR兜底={'关闭' if fallback_disabled else '开启'}"
+                )
+            else:
+                err = str(remote_status.get("health_error") or "unknown")
+                st.error(
+                    f"本地抓取节点异常 | mode={mode} | host={host} | "
+                    f"Render ASR兜底={'关闭' if fallback_disabled else '开启'} | 错误: {err}"
+                )
+            with st.expander("查看抓取节点状态详情", expanded=False):
+                st.code(json.dumps(remote_status, ensure_ascii=False, indent=2))
+        else:
+            st.warning("未配置本地抓取节点。当前只能依赖 Render 自己抓取/转写，低内存环境下更容易失败。")
     url = st.text_input("视频链接或 ID", value=st.session_state.get("input_url", ""), placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...")
     
     col1, col2, col3 = st.columns([1, 1, 2])
