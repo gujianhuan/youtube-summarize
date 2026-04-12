@@ -1799,6 +1799,7 @@ def transcribe_audio_with_whisper(audio_path: str, model_name: str, language: st
                 used_device_now = str(cache.get(f"{cache_key}_info", {}).get("device", "cpu")).lower()
                 used_compute_now = str(cache.get(f"{cache_key}_info", {}).get("compute_type", "int8")).lower()
                 cpu_count = os.cpu_count() or 4
+                running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
                 audio_minutes = (float(wav_seconds) / 60.0) if wav_seconds is not None else None
                 batch_size = 8
                 if used_device_now == "cuda":
@@ -1830,6 +1831,9 @@ def transcribe_audio_with_whisper(audio_path: str, model_name: str, language: st
                         batch_size = min(10, base_cpu_batch)
                     if audio_minutes is not None and audio_minutes >= 60:
                         batch_size = max(8, min(batch_size, 12))
+                    if running_on_render:
+                        batch_size = min(batch_size, 4)
+                        _safe_status("Render 内存保护：已降低 CPU batch_size")
 
                 auto_fast_mode = False
                 if not fast_mode and wav_seconds is not None:
@@ -4176,6 +4180,11 @@ def get_video_transcript(
         proxy_url = str(getattr(api, "_effective_proxy", "") or "")
         timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
         retries = int(getattr(api, "_retries", 2) or 2)
+        status_cb = getattr(api, "_status_callback", None)
+        local_fetch_node_mode = bool(str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip())
+        remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
+        prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
+        remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
         cookie_resolve_error = ""
         try:
@@ -4199,6 +4208,22 @@ def get_video_transcript(
         asr_language = str(getattr(api, "_asr_language", "") or "")
         asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
         langs = expand_languages(languages or ["zh-Hans", "zh", "en"]) # B站默认中文优先
+
+        if prefer_remote_first and remote_worker_url and not local_fetch_node_mode:
+            try:
+                if callable(status_cb):
+                    status_cb("优先调用本地抓取节点处理 Bilibili 视频")
+                remote_text = try_fetch_transcript_via_remote_worker(
+                    video_id=video_id,
+                    video_url=video_url,
+                    languages=langs,
+                    api=api,
+                )
+                if remote_text and not is_html_like_text(remote_text):
+                    return remote_text
+            except Exception as remote_exc:
+                if callable(status_cb):
+                    status_cb(f"本地抓取节点处理 Bilibili 失败，回退 Render：{type(remote_exc).__name__}")
 
         # 尝试 yt-dlp 获取字幕 (B站可能有 CC 字幕)
         try:
