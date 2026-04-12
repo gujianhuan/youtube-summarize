@@ -21,6 +21,10 @@
 - `REMOTE_TRANSCRIBE_PROCESSING_EXTENSION_SECONDS`
   - 可选，当本地节点已经进入“音频下载 / Whisper 转写”阶段时，Render 额外延长等待秒数
   - 建议先设为 `240`
+- `REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK`
+  - 可选，默认 `1`
+  - 在 Render 这类低内存环境中，若已配置本地抓取节点，则禁止 Render 自己兜底执行“音频下载 + Whisper 转写”
+  - 建议保持 `1`，避免 512MB 实例在转写阶段 OOM
 
 ## 本地抓取节点环境变量
 

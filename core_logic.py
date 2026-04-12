@@ -4185,6 +4185,10 @@ def get_video_transcript(
         remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
         prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
         remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+        running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
+        disable_render_asr_fallback = running_on_render and str(
+            os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
+        ).strip().lower() not in {"0", "false", "no"}
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
         cookie_resolve_error = ""
         try:
@@ -4244,6 +4248,12 @@ def get_video_transcript(
         
         # 尝试 Whisper 转写 (B站最常用)
         if asr_enabled:
+            if prefer_remote_first and remote_worker_url and not local_fetch_node_mode and disable_render_asr_fallback:
+                raise RuntimeError(
+                    "Bilibili 视频未拿到字幕，且 Render 已启用低内存保护：已禁止在 Render 本机执行音频下载与 Whisper 转写。"
+                    " 请确认本地抓取节点在线，并让任务优先在本地节点完成；如确实需要允许 Render 兜底，可将 "
+                    "`REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK=0`。"
+                )
             try:
                 status_cb = getattr(api, "_status_callback", None)
                 label, text = transcribe_video_audio_with_ytdlp(
@@ -4273,6 +4283,10 @@ def get_video_transcript(
     asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
     status_cb = getattr(api, "_status_callback", None)
     local_fetch_node_mode = bool(str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip())
+    running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
+    disable_render_asr_fallback = running_on_render and str(
+        os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
+    ).strip().lower() not in {"0", "false", "no"}
     local_skip_transcript_api = (
         local_fetch_node_mode
         and str(os.environ.get("LOCAL_FETCH_SKIP_TRANSCRIPT_API", "1") or "1").strip().lower() not in {"0", "false", "no"}
@@ -4388,6 +4402,12 @@ def get_video_transcript(
             pass
 
         if asr_enabled:
+            if prefer_remote_first and remote_worker_url and not local_fetch_node_mode and disable_render_asr_fallback:
+                raise RuntimeError(
+                    "未获取到可用字幕，且 Render 已启用低内存保护：已禁止在 Render 本机执行音频下载与 Whisper 转写。"
+                    " 请确认本地抓取节点在线并优先处理该任务；如确实需要允许 Render 兜底，可将 "
+                    "`REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK=0`。"
+                )
             if callable(status_cb):
                 status_cb(f"尝试音频下载与 Whisper 转写: {video_id}")
             # 传递强制CPU标志到内部函数
