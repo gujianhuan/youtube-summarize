@@ -37,8 +37,9 @@
   - 默认 `1`
   - 本地抓取节点默认跳过 `youtube_transcript_api`，直接优先尝试 `yt-dlp` 和 Whisper
 - `LOCAL_FETCH_COOKIES_BROWSER`
-  - 可选，推荐本地设置为 `edge` 或 `chrome`
-  - 如果未设置，在 Windows 下会优先尝试 `edge`，再尝试 `chrome`
+  - 可选，可设为 `auto`、`edge`、`chrome`、`firefox`
+  - 推荐优先设为 `auto`
+  - 若未设置，在 Windows 下本地节点会自动使用 `auto`，按 `firefox -> edge -> chrome -> brave -> chromium` 回退
 - `LOCAL_FETCH_NODE_HOST`
   - 默认 `127.0.0.1`
 - `LOCAL_FETCH_NODE_PORT`

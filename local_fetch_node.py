@@ -74,11 +74,16 @@ def _pick_cookie_inputs(payload: dict) -> tuple[dict, str]:
         local_browser_candidates.extend(["edge", "chrome"])
     local_browser_candidates = [item for item in local_browser_candidates if item]
 
+    preferred_browser = local_browser_candidates[0] if local_browser_candidates else ""
+    explicit_browser = str(os.environ.get("LOCAL_FETCH_COOKIES_BROWSER", "") or os.environ.get("YTDLP_COOKIES_BROWSER", "")).strip().lower()
+    if not explicit_browser and prefer_local and local_browser_candidates:
+        preferred_browser = "auto"
+
     local_sources = {
         "cookies_file": str(os.environ.get("LOCAL_FETCH_COOKIES_FILE", "") or os.environ.get("YTDLP_COOKIES_FILE", "")).strip(),
         "cookies_content": str(os.environ.get("LOCAL_FETCH_COOKIES_CONTENT", "") or os.environ.get("YTDLP_COOKIES_CONTENT", "")),
         "cookies_content_b64": str(os.environ.get("LOCAL_FETCH_COOKIES_CONTENT_B64", "") or os.environ.get("YTDLP_COOKIES_CONTENT_B64", "")).strip(),
-        "cookies_from_browser": local_browser_candidates[0] if local_browser_candidates else "",
+        "cookies_from_browser": preferred_browser,
     }
     payload_sources = {
         "cookies_file": str(payload.get("cookies_file") or "").strip(),
