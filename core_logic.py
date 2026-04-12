@@ -319,6 +319,12 @@ def try_fetch_transcript_via_remote_worker(
         _raise_remote_connectivity_error(e)
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"提交本地抓取任务失败：{type(e).__name__}: {e}")
+    if submit_resp.status_code == 401:
+        raise RuntimeError(
+            "本地抓取节点拒绝了请求（401 Unauthorized）。"
+            " 这通常表示 Render 端的 `REMOTE_TRANSCRIBE_TOKEN` 与本地抓取节点的 `REMOTE_TRANSCRIBE_TOKEN` 不一致，"
+            "或本地节点要求 token 但 Render 未正确携带。"
+        )
     submit_resp.raise_for_status()
     data = submit_resp.json()
     if not isinstance(data, dict):
@@ -349,6 +355,11 @@ def try_fetch_transcript_via_remote_worker(
             _raise_remote_connectivity_error(e)
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"查询本地抓取节点状态失败：{type(e).__name__}: {e}")
+        if poll_resp.status_code == 401:
+            raise RuntimeError(
+                "查询本地抓取节点状态被拒绝（401 Unauthorized）。"
+                " 请检查 Render 端与本地节点的 `REMOTE_TRANSCRIBE_TOKEN` 是否完全一致。"
+            )
         poll_resp.raise_for_status()
         poll_data = poll_resp.json()
         if not isinstance(poll_data, dict) or not poll_data.get("ok"):
