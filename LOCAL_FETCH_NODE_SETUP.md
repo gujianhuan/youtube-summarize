@@ -65,6 +65,15 @@ curl http://127.0.0.1:8787/health
 
 推荐用 Cloudflare Tunnel、Tailscale Funnel 或 ngrok 暴露本地 `8787` 端口。
 
+注意：
+
+- `trycloudflare.com` 地址是临时的，重启 `cloudflared` 后通常会变化
+- 如果要给朋友持续测试，不建议长期使用临时 `trycloudflare` 地址
+- 更稳妥的做法是：
+  - 使用固定域名的 Cloudflare Tunnel
+  - 或使用 Tailscale Funnel / ngrok 固定地址
+- 如果 Render 中的 `REMOTE_TRANSCRIBE_URL` 仍指向一个已经失效的临时地址，远程抓取会直接失败
+
 示例：
 
 ```bash

@@ -236,12 +236,33 @@ def try_fetch_transcript_via_remote_worker(
     if worker_token:
         headers["X-Worker-Token"] = worker_token
 
-    submit_resp = requests.post(
-        worker_url,
-        headers=headers,
-        json=payload,
-        timeout=(10.0, 20.0),
-    )
+    def _raise_remote_connectivity_error(exc: Exception) -> None:
+        host = urlparse(worker_url).netloc or worker_url
+        detail = f"{type(exc).__name__}: {exc}"
+        if "trycloudflare.com" in host:
+            raise RuntimeError(
+                "本地抓取节点不可达：当前配置的是临时 Cloudflare Tunnel 地址，且该地址已失效或无法解析。"
+                f" host={host}；detail={detail}。"
+                " 请在本地重启 `cloudflared tunnel --url http://127.0.0.1:8787`，"
+                "拿到新的 trycloudflare 地址后，立即更新 Render 的 `REMOTE_TRANSCRIBE_URL`。"
+                " 如果需要给朋友持续测试，建议改用固定域名的 Cloudflare Tunnel、Tailscale Funnel 或 ngrok。"
+            )
+        raise RuntimeError(
+            f"本地抓取节点不可达：host={host}；detail={detail}。"
+            " 请检查本地抓取节点、隧道进程以及 Render 中的 `REMOTE_TRANSCRIBE_URL` 是否仍然有效。"
+        )
+
+    try:
+        submit_resp = requests.post(
+            worker_url,
+            headers=headers,
+            json=payload,
+            timeout=(10.0, 20.0),
+        )
+    except requests.exceptions.ConnectionError as e:
+        _raise_remote_connectivity_error(e)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"提交本地抓取任务失败：{type(e).__name__}: {e}")
     submit_resp.raise_for_status()
     data = submit_resp.json()
     if not isinstance(data, dict):
@@ -265,7 +286,12 @@ def try_fetch_transcript_via_remote_worker(
 
     while time.monotonic() < deadline:
         time.sleep(max(0.5, poll_interval_seconds))
-        poll_resp = requests.get(status_url, headers=headers, timeout=(10.0, 20.0))
+        try:
+            poll_resp = requests.get(status_url, headers=headers, timeout=(10.0, 20.0))
+        except requests.exceptions.ConnectionError as e:
+            _raise_remote_connectivity_error(e)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"查询本地抓取节点状态失败：{type(e).__name__}: {e}")
         poll_resp.raise_for_status()
         poll_data = poll_resp.json()
         if not isinstance(poll_data, dict) or not poll_data.get("ok"):
