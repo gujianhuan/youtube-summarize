@@ -422,7 +422,7 @@ def normalize_video_url(url_or_id: str) -> str:
         if not s.startswith("http"):
              if re.fullmatch(r"BV[a-zA-Z0-9]{10}", s):
                  return f"https://www.bilibili.com/video/{s}"
-             return "https://" + s if s.startswith("www") else s
+             return "https://" + s
         return s
 
     # YouTube
@@ -2216,7 +2216,12 @@ def transcribe_video_audio_with_ytdlp(
         # 移除 detect_js_runtime 的定义，改用 yt-dlp 原生解释器或 yt_dlp_ejs
         # 移除此处的本地 is_cookie_error 定义，改用顶层的 _is_cookie_error
 
-    cache_path = _audio_cache_path(video_url)
+    normalized_video_url = normalize_video_url(video_url)
+    parsed_video_host = (urlparse(normalized_video_url).netloc or "").lower()
+    is_youtube_url = ("youtube.com" in parsed_video_host) or ("youtu.be" in parsed_video_host)
+    is_bilibili_url = ("bilibili.com" in parsed_video_host) or ("b23.tv" in parsed_video_host)
+
+    cache_path = _audio_cache_path(normalized_video_url)
     if cache_path and cache_path.exists():
         try:
             if cache_path.stat().st_size > 16 * 1024:
@@ -2224,7 +2229,7 @@ def transcribe_video_audio_with_ytdlp(
                     status_callback("检测到音频缓存，跳过下载")
                 force_cpu_flag = bool(getattr(transcribe_video_audio_with_ytdlp, "_force_cpu", False))
                 text = transcribe_audio_with_whisper(str(cache_path), model_name=model_name, language=language, proxy_url=proxy_url, status_callback=status_callback, fast_mode=fast_mode, force_cpu=force_cpu_flag)
-                label = f"{_audio_cache_key(video_url)} | whisper:{(model_name or '').strip() or 'base'}"
+                label = f"{_audio_cache_key(normalized_video_url)} | whisper:{(model_name or '').strip() or 'base'}"
                 return label, text
         except Exception:
             pass
@@ -2245,13 +2250,16 @@ def transcribe_video_audio_with_ytdlp(
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
         web_clients_enabled = bool(js_runtime_available and not running_on_render)
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["tv"], ["web_safari"]]
-        if not has_cookie_hint:
-            client_strategies.extend([["ios"], ["android"]])
-        if not running_on_render:
-            client_strategies.append(["mweb"])
-        if web_clients_enabled:
-            client_strategies.extend([["web_creator"], []])
+        if is_youtube_url:
+            client_strategies = [["tv"], ["web_safari"]]
+            if not has_cookie_hint:
+                client_strategies.extend([["ios"], ["android"]])
+            if not running_on_render:
+                client_strategies.append(["mweb"])
+            if web_clients_enabled:
+                client_strategies.extend([["web_creator"], []])
+        else:
+            client_strategies = [[]]
         client_plan = ", ".join("+".join(cs) if cs else "default" for cs in client_strategies)
 
         if fast_mode:
@@ -2317,7 +2325,12 @@ def transcribe_video_audio_with_ytdlp(
                             "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
                             "logger": logger,
                         }
-                        if client_set:
+                        if is_bilibili_url:
+                            opts["http_headers"].update({
+                                "Referer": "https://www.bilibili.com/",
+                                "Origin": "https://www.bilibili.com",
+                            })
+                        if is_youtube_url and client_set:
                             opts["extractor_args"] = {"youtube": {"player_client": client_set}}
                         if ffmpeg_binary_path:
                             opts["ffmpeg_location"] = ffmpeg_binary_path
@@ -2403,7 +2416,7 @@ def transcribe_video_audio_with_ytdlp(
                                         session.proxies = {"http": proxy_url, "https": proxy_url}
 
                                     headers = dict(opts.get("http_headers") or {})
-                                    headers["Referer"] = video_url
+                                    headers["Referer"] = normalized_video_url
 
                                     if "m3u8" in protocol or "dash" in protocol:
                                         if not ffmpeg_binary_path or not os.path.exists(ffmpeg_binary_path):
@@ -2468,7 +2481,7 @@ def transcribe_video_audio_with_ytdlp(
                                             last_err = RuntimeError(reason)
                                         continue
 
-                                    info = ydl.extract_info(video_url, download=False, process=False)
+                                    info = ydl.extract_info(normalized_video_url, download=False, process=False)
                                 except DownloadError as e:
                                     msg = strip_ansi(str(e))
                                     has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
@@ -2572,7 +2585,7 @@ def transcribe_video_audio_with_ytdlp(
                                         if isinstance(info, dict):
                                             last_video_id = str(info.get("id") or last_video_id)
                                     else:
-                                        info = ydl.extract_info(video_url, download=True)
+                                        info = ydl.extract_info(normalized_video_url, download=True)
                                         if isinstance(info, dict):
                                             last_video_id = str(info.get("id") or last_video_id)
                                             requested_downloads = info.get("requested_downloads") or []
@@ -4144,6 +4157,7 @@ def get_video_transcript(
     # 1. 检查是否为 Bilibili 视频
     # 如果是 Bilibili，直接使用 yt-dlp 或 whisper，跳过 YouTubeTranscriptApi
     if "bilibili.com" in video_url or re.match(r"^BV[a-zA-Z0-9]{10}$", video_id):
+        video_url = normalize_video_url(video_url or video_id)
         proxy_url = str(getattr(api, "_effective_proxy", "") or "")
         timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
         retries = int(getattr(api, "_retries", 2) or 2)
