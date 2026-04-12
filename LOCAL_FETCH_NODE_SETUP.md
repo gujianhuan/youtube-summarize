@@ -17,7 +17,10 @@
   - Render 调本地抓取节点时的认证 token
 - `REMOTE_TRANSCRIBE_TIMEOUT_SECONDS`
   - 可选，Render 等待本地抓取节点返回的秒数
-  - 建议先设为 `180`
+  - 建议先设为 `300`
+- `REMOTE_TRANSCRIBE_PROCESSING_EXTENSION_SECONDS`
+  - 可选，当本地节点已经进入“音频下载 / Whisper 转写”阶段时，Render 额外延长等待秒数
+  - 建议先设为 `240`
 
 ## 本地抓取节点环境变量
 

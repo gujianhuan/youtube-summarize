@@ -217,6 +217,7 @@ def try_fetch_transcript_via_remote_worker(
 
     timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0) if api else 60.0
     worker_timeout_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_TIMEOUT_SECONDS", "180") or "180")
+    processing_extension_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_PROCESSING_EXTENSION_SECONDS", "240") or "240")
     poll_interval_seconds = float(os.environ.get("REMOTE_TRANSCRIBE_POLL_INTERVAL_SECONDS", "2.0") or "2.0")
     payload = {
         "video_id": video_id,
@@ -283,6 +284,7 @@ def try_fetch_transcript_via_remote_worker(
     last_stage = ""
     last_stage_detail = ""
     last_status = ""
+    processing_deadline_extended = False
 
     while time.monotonic() < deadline:
         time.sleep(max(0.5, poll_interval_seconds))
@@ -300,6 +302,14 @@ def try_fetch_transcript_via_remote_worker(
         last_status = status
         last_stage = str(poll_data.get("stage") or "").strip()
         last_stage_detail = str(poll_data.get("stage_detail") or "").strip()
+        if (
+            not processing_deadline_extended
+            and status in {"queued", "running"}
+            and last_stage == "processing"
+            and any(token in last_stage_detail.lower() for token in ["whisper", "转写", "audio", "音频"])
+        ):
+            deadline = max(deadline, time.monotonic() + max(60.0, processing_extension_seconds))
+            processing_deadline_extended = True
         if status in {"queued", "running"}:
             continue
         if status == "failed":
@@ -2235,9 +2245,9 @@ def transcribe_video_audio_with_ytdlp(
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
         web_clients_enabled = bool(js_runtime_available and not running_on_render)
         has_cookie_hint = bool((cookies_file or "").strip()) or bool((cookies_from_browser or "").strip())
-        client_strategies = [["tv"], ["android"]]
+        client_strategies = [["tv"], ["web_safari"]]
         if not has_cookie_hint:
-            client_strategies.append(["ios"])
+            client_strategies.extend([["ios"], ["android"]])
         if not running_on_render:
             client_strategies.append(["mweb"])
         if web_clients_enabled:
