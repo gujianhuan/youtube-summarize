@@ -711,6 +711,21 @@ def has_login_required(lines: list[str], msg: str = "") -> bool:
         or "use --cookies" in m
     )
 
+
+def has_premium_only_warning(lines: list[str], msg: str = "") -> bool:
+    tail = "\n".join(lines[-160:]).lower()
+    m = (msg or "").lower()
+    premium_markers = [
+        "become a premium member",
+        "formats) 1080p",
+        "formats are missing",
+        "format(s)",
+        "高码率 are missing",
+        "高码率",
+    ]
+    combined = tail + "\n" + m
+    return any(marker in combined for marker in premium_markers)
+
 def is_html_like_text(text: str | None) -> bool:
     if not text:
         return False
@@ -2503,7 +2518,7 @@ def transcribe_video_audio_with_ytdlp(
                                         last_attempt_note = attempt_note + " (challenge/po token)"
                                         last_debug_lines = logger.lines[-80:]
                                         continue
-                                    if has_login_required([], msg):
+                                    if has_login_required([], msg) and not (is_bilibili_url and has_premium_only_warning([], msg)):
                                         force_browser_cookie = True
                                         for c in client_set:
                                             if c in {"tv", "tv_embedded"}:
@@ -2527,7 +2542,7 @@ def transcribe_video_audio_with_ytdlp(
                                     raise e
 
                                 try:
-                                    if has_login_required(logger.lines):
+                                    if has_login_required(logger.lines) and not (is_bilibili_url and has_premium_only_warning(logger.lines)):
                                         force_browser_cookie = True
                                         for c in client_set:
                                             if c in {"tv", "tv_embedded"}:
