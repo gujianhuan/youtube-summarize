@@ -206,7 +206,7 @@ def get_remote_worker_status(timeout_seconds: float = 4.0) -> dict:
     worker_token = str(os.environ.get("REMOTE_TRANSCRIBE_TOKEN", "") or "").strip()
     running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
     disable_render_asr_fallback = running_on_render and str(
-        os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
+        os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "0") or "0"
     ).strip().lower() not in {"0", "false", "no"}
 
     status = {
@@ -4243,7 +4243,7 @@ def get_video_transcript(
         remote_worker_summary = "disabled"
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
         disable_render_asr_fallback = running_on_render and str(
-            os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
+            os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "0") or "0"
         ).strip().lower() not in {"0", "false", "no"}
         cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
         cookie_resolve_error = ""
@@ -4343,7 +4343,7 @@ def get_video_transcript(
     local_fetch_node_mode = bool(str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip())
     running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
     disable_render_asr_fallback = running_on_render and str(
-        os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
+        os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "0") or "0"
     ).strip().lower() not in {"0", "false", "no"}
     local_skip_transcript_api = (
         local_fetch_node_mode
