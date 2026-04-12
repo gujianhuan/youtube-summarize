@@ -4240,6 +4240,7 @@ def get_video_transcript(
         remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
         prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
         remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+        remote_worker_summary = "disabled"
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
         disable_render_asr_fallback = running_on_render and str(
             os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "1") or "1"
@@ -4281,6 +4282,7 @@ def get_video_transcript(
                 if remote_text and not is_html_like_text(remote_text):
                     return remote_text
             except Exception as remote_exc:
+                remote_worker_summary = f"{type(remote_exc).__name__}: {remote_exc}"
                 if callable(status_cb):
                     status_cb(f"本地抓取节点处理 Bilibili 失败，回退 Render：{type(remote_exc).__name__}")
 
@@ -4308,6 +4310,7 @@ def get_video_transcript(
                     "Bilibili 视频未拿到字幕，且 Render 已启用低内存保护：已禁止在 Render 本机执行音频下载与 Whisper 转写。"
                     " 请确认本地抓取节点在线，并让任务优先在本地节点完成；如确实需要允许 Render 兜底，可将 "
                     "`REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK=0`。"
+                    f"\n远程抓取诊断: {remote_worker_summary}"
                 )
             try:
                 status_cb = getattr(api, "_status_callback", None)
@@ -4462,6 +4465,7 @@ def get_video_transcript(
                     "未获取到可用字幕，且 Render 已启用低内存保护：已禁止在 Render 本机执行音频下载与 Whisper 转写。"
                     " 请确认本地抓取节点在线并优先处理该任务；如确实需要允许 Render 兜底，可将 "
                     "`REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK=0`。"
+                    f"\n远程抓取诊断: {remote_worker_summary}"
                 )
             if callable(status_cb):
                 status_cb(f"尝试音频下载与 Whisper 转写: {video_id}")
