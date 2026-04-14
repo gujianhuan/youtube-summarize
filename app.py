@@ -793,6 +793,12 @@ if "transcript_text" not in st.session_state:
     st.session_state.transcript_text = ""
 if "summary_text" not in st.session_state:
     st.session_state.summary_text = ""
+if "manual_transcript_text" not in st.session_state:
+    st.session_state.manual_transcript_text = ""
+if "manual_summary_text" not in st.session_state:
+    st.session_state.manual_summary_text = ""
+if "manual_summary_duration" not in st.session_state:
+    st.session_state.manual_summary_duration = {}
 if "document_raw_text" not in st.session_state:
     st.session_state.document_raw_text = ""
 if "document_clean_text" not in st.session_state:
@@ -869,7 +875,7 @@ st.title("🎬 Video Summarizer")
 st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
 
 # 使用 Tabs 分割功能
-tab_single, tab_doc, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "📄 文档总结", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
+tab_single, tab_paste, tab_doc, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "✍️ 粘贴字幕", "📄 文档总结", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
 
 # --- 通用逻辑函数 (供两个 Tab 使用) ---
 def internal_fetch_transcript(video_url, progress_callback=None):
@@ -1384,7 +1390,72 @@ with tab_single:
 
 
 # ==========================
-# Tab 2: 文档总结
+# Tab 2: 粘贴字幕
+# ==========================
+with tab_paste:
+    st.info("💡 适合浏览器扩展、第三方 transcript 或你手动复制的字幕文本。这里不负责抓取，只负责基于文本做总结。")
+    manual_source_url = st.text_input(
+        "来源链接（可选）",
+        key="manual_source_url",
+        placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...",
+    )
+    manual_transcript = st.text_area(
+        "粘贴 transcript / 字幕文本",
+        value=st.session_state.manual_transcript_text,
+        height=260,
+        key="manual_transcript_input",
+        placeholder="把浏览器扩展提取到的字幕文本粘贴到这里...",
+    )
+    paste_col1, paste_col2 = st.columns([1, 3])
+    with paste_col1:
+        paste_sum_btn = st.button("📝 总结字幕文本", type="primary", use_container_width=True, key="btn_manual_sum")
+    with paste_col2:
+        st.caption("适合作为 YouTube/B站抓取失败时的稳定兜底入口。")
+
+    if paste_sum_btn:
+        if not manual_transcript.strip():
+            st.warning("请先粘贴字幕文本。")
+        else:
+            t_manual_start = time.time()
+            with st.spinner(f"正在请求 AI 总结 ({model_selected})..."):
+                summary, err = internal_summarize(manual_transcript.strip(), model_selected)
+            duration = time.time() - t_manual_start
+            if err:
+                st.error(f"总结失败: {err}")
+            else:
+                st.session_state.manual_transcript_text = manual_transcript.strip()
+                st.session_state.manual_summary_text = summary
+                st.session_state.manual_summary_duration = {"summary": duration}
+                try:
+                    add_history_entry("manual_transcript", manual_source_url.strip(), summary, manual_transcript.strip())
+                except Exception as e_hist:
+                    print(f"Failed to save manual transcript history: {e_hist}")
+                st.success(f"总结完成 | AI生成耗时: {duration:.1f}s")
+
+    if st.session_state.manual_summary_text:
+        st.markdown("### 📝 字幕总结")
+        manual_dur = float((st.session_state.manual_summary_duration or {}).get("summary") or 0.0)
+        if manual_dur:
+            st.caption(f"⏱️ AI生成耗时: {manual_dur:.1f}s")
+        manual_summary_md, manual_fact_md = _parse_summary_for_ui(st.session_state.manual_summary_text)
+        if manual_summary_md:
+            col_sum, col_check = st.columns([1.2, 1])
+            with col_sum:
+                st.markdown(manual_summary_md)
+            with col_check:
+                st.info("🕵️ **新闻事实核查**")
+                if manual_fact_md:
+                    st.markdown(manual_fact_md)
+                else:
+                    st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
+        else:
+            st.markdown(st.session_state.manual_summary_text)
+        with st.expander("查看粘贴的字幕原文", expanded=False):
+            st.text_area("字幕原文", st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
+
+
+# ==========================
+# Tab 3: 文档总结
 # ==========================
 with tab_doc:
     st.info("💡 二期已支持：本地 PDF / DOCX / TXT / Markdown / PPTX，以及在线 PDF 链接、网页文章链接。扫描版 PDF 会在提取不到文本时自动尝试 OCR。")

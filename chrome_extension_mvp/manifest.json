@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Video Transcript Helper MVP",
+  "version": "0.1.0",
+  "description": "Extract transcript text from YouTube or Bilibili pages and send it to the summarizer site manually.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "https://www.bilibili.com/*",
+    "https://b23.tv/*"
+  ],
+  "action": {
+    "default_title": "Transcript Helper",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://youtube.com/*",
+        "https://www.bilibili.com/*",
+        "https://b23.tv/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
