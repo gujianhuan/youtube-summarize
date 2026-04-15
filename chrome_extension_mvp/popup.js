@@ -33,7 +33,8 @@ async function extractTranscript() {
     return;
   }
   if (!response.ok) {
-    setStatus(response.error || "未提取到字幕。", true);
+    const helperText = response.helperMessage ? ` ${response.helperMessage}` : "";
+    setStatus((response.error || "未提取到字幕。") + helperText, true);
     titleInput.value = response.title || "";
     urlInput.value = response.url || tab.url || "";
     transcriptOutput.value = response.transcript || "";
@@ -44,7 +45,8 @@ async function extractTranscript() {
   urlInput.value = response.url || tab.url || "";
   transcriptOutput.value = response.transcript || "";
   copyBtn.disabled = !response.transcript.trim();
-  setStatus(`提取完成：${response.platform}，约 ${response.transcript.length} 字符。`);
+  const helperText = response.helperMessage ? ` ${response.helperMessage}` : "";
+  setStatus(`提取完成：${response.platform}，约 ${response.transcript.length} 字符。${helperText}`);
 }
 
 extractBtn.addEventListener("click", extractTranscript);
