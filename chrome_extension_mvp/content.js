@@ -130,7 +130,10 @@
       ".bpx-player-subtitle-panel-text",
       ".bcc-subtitle-row",
       ".subtitle-item-text",
-      ".bui-collapse-wrap .text"
+      ".bui-collapse-wrap .text",
+      ".bpx-player-subtitle-wrap .bpx-player-subtitle-item-text",
+      ".bpx-player-ctrl-subtitle-item-text",
+      "[class*='subtitle'] [class*='text']"
     ];
     const lines = [];
     for (const selector of selectors) {

@@ -84,10 +84,10 @@ openBtn.addEventListener("click", async () => {
 
   const injectPayload = async () => {
     if (!targetTab.id) {
-      return false;
+      return { filled: false, submitted: false };
     }
     try {
-      await chrome.scripting.executeScript({
+      const execResults = await chrome.scripting.executeScript({
         target: { tabId: targetTab.id },
         func: (payload) => {
           function sleep(ms) {
@@ -136,31 +136,50 @@ openBtn.addEventListener("click", async () => {
                 }
                 setNativeValue(transcriptArea, payload.transcript || "");
                 transcriptArea.focus();
-                return true;
+                await sleep(700);
+
+                for (let j = 0; j < 20; j += 1) {
+                  const actionButtons = Array.from(document.querySelectorAll("button"));
+                  const summaryButton = actionButtons.find((node) => {
+                    const text = (node.textContent || "").trim();
+                    return text.includes("总结字幕文本");
+                  });
+                  if (summaryButton) {
+                    summaryButton.click();
+                    return { filled: true, submitted: true };
+                  }
+                  await sleep(400);
+                }
+                return { filled: true, submitted: false };
               }
               await sleep(500);
             }
-            return false;
+            return { filled: false, submitted: false };
           }
 
           return run();
         },
         args: [{ transcript, sourceUrl }]
       });
-      return true;
+      return execResults?.[0]?.result || { filled: false, submitted: false };
     } catch (_error) {
-      return false;
+      return { filled: false, submitted: false };
     }
   };
 
-  let injected = false;
   const listener = async (tabId, changeInfo) => {
     if (tabId !== targetTab.id || changeInfo.status !== "complete") {
       return;
     }
     chrome.tabs.onUpdated.removeListener(listener);
-    injected = await injectPayload();
-    setStatus(injected ? "已自动打开主站并填充字幕。请在主站确认后生成总结。" : "主站已打开，但自动填充失败。请手动粘贴。", !injected);
+    const injected = await injectPayload();
+    if (injected.submitted) {
+      setStatus("已自动打开主站并触发总结，请稍候查看结果。");
+    } else if (injected.filled) {
+      setStatus("主站已自动填入字幕，但未自动触发总结。请在主站手动点一次总结。", true);
+    } else {
+      setStatus("主站已打开，但自动填充失败。请手动粘贴。", true);
+    }
   };
 
   chrome.tabs.onUpdated.addListener(listener);
