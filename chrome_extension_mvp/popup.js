@@ -47,6 +47,7 @@ async function extractTranscript() {
   copyBtn.disabled = !response.transcript.trim();
   const helperText = response.helperMessage ? ` ${response.helperMessage}` : "";
   setStatus(`提取完成：${response.platform}，约 ${response.transcript.length} 字符。${helperText}`);
+  return response;
 }
 
 extractBtn.addEventListener("click", extractTranscript);
@@ -62,5 +63,105 @@ copyBtn.addEventListener("click", async () => {
 });
 
 openBtn.addEventListener("click", async () => {
-  await chrome.tabs.create({ url: SUMMARIZER_URL });
+  let transcript = transcriptOutput.value.trim();
+  let sourceUrl = urlInput.value.trim();
+  if (!transcript) {
+    const response = await extractTranscript();
+    if (!response || !response.ok) {
+      setStatus("未能自动提取字幕，无法发送到主站。", true);
+      return;
+    }
+    transcript = (response.transcript || "").trim();
+    sourceUrl = (response.url || "").trim();
+  }
+  if (!transcript) {
+    setStatus("没有可发送的字幕文本。", true);
+    return;
+  }
+
+  setStatus("正在打开主站并自动填充字幕...");
+  const targetTab = await chrome.tabs.create({ url: SUMMARIZER_URL });
+
+  const injectPayload = async () => {
+    if (!targetTab.id) {
+      return false;
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: targetTab.id },
+        func: (payload) => {
+          function sleep(ms) {
+            return new Promise((resolve) => window.setTimeout(resolve, ms));
+          }
+
+          function setNativeValue(element, value) {
+            const prototype = Object.getPrototypeOf(element);
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+            if (descriptor && descriptor.set) {
+              descriptor.set.call(element, value);
+            } else {
+              element.value = value;
+            }
+            element.dispatchEvent(new Event("input", { bubbles: true }));
+            element.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+
+          async function run() {
+            for (let i = 0; i < 20; i += 1) {
+              const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'));
+              const pasteTab = tabButtons.find((node) => (node.textContent || "").includes("粘贴字幕"));
+              if (pasteTab) {
+                pasteTab.click();
+                break;
+              }
+              await sleep(500);
+            }
+
+            for (let i = 0; i < 30; i += 1) {
+              const textareas = Array.from(document.querySelectorAll('textarea'));
+              const transcriptArea = textareas.find((node) => {
+                const label = node.getAttribute("aria-label") || node.getAttribute("placeholder") || "";
+                return label.includes("transcript") || label.includes("字幕文本") || label.includes("粘贴");
+              }) || textareas[0];
+
+              const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+              const sourceInput = textInputs.find((node) => {
+                const label = node.getAttribute("aria-label") || node.getAttribute("placeholder") || "";
+                return label.includes("来源链接") || label.includes("youtube") || label.includes("bilibili");
+              });
+
+              if (transcriptArea) {
+                if (sourceInput) {
+                  setNativeValue(sourceInput, payload.sourceUrl || "");
+                }
+                setNativeValue(transcriptArea, payload.transcript || "");
+                transcriptArea.focus();
+                return true;
+              }
+              await sleep(500);
+            }
+            return false;
+          }
+
+          return run();
+        },
+        args: [{ transcript, sourceUrl }]
+      });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+
+  let injected = false;
+  const listener = async (tabId, changeInfo) => {
+    if (tabId !== targetTab.id || changeInfo.status !== "complete") {
+      return;
+    }
+    chrome.tabs.onUpdated.removeListener(listener);
+    injected = await injectPayload();
+    setStatus(injected ? "已自动打开主站并填充字幕。请在主站确认后生成总结。" : "主站已打开，但自动填充失败。请手动粘贴。", !injected);
+  };
+
+  chrome.tabs.onUpdated.addListener(listener);
 });
