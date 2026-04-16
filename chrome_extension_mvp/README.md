@@ -33,6 +33,28 @@
 3. 选择“加载已解压的扩展程序”
 4. 选择当前目录 `chrome_extension_mvp`
 
+## 更新方式
+
+- 当前如果你使用的是“加载已解压的扩展程序”，**每次代码更新后都需要在 `chrome://extensions/` 里点一次刷新**
+- 现在项目里已经提供开发辅助脚本：
+
+```powershell
+Set-Location "D:\Program Files\Trae\YouTubeSummarizer\chrome_extension_mvp"
+.\refresh_dev.ps1
+```
+
+- 这个脚本会：
+  - 读取当前扩展版本
+  - 重新打包 `chrome_extension_mvp.zip`
+  - 提示你去 Chrome 扩展页刷新
+
+注意：
+
+- **加载目录模式不能真正自动更新**
+- 真正的自动更新需要后续走：
+  - Chrome Web Store
+  - 或自托管 CRX + `update_url`
+
 ## 建议使用流程
 
 1. 打开 YouTube / Bilibili 视频页面
