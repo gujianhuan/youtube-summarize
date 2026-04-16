@@ -258,6 +258,46 @@
     return null;
   }
 
+  function isVisibleElement(node) {
+    if (!node) {
+      return false;
+    }
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  }
+
+  function findYouTubeMoreActionsButton() {
+    const candidates = Array.from(document.querySelectorAll("button, [role='button']"));
+    const labels = [
+      "more actions",
+      "更多操作",
+      "更多",
+      "actions"
+    ];
+
+    for (const node of candidates) {
+      const aria = String(node.getAttribute("aria-label") || "").toLowerCase();
+      const title = String(node.getAttribute("title") || "").toLowerCase();
+      const tooltip = String(node.getAttribute("data-tooltip-text") || "").toLowerCase();
+      const text = normalizeWhitespace(node.textContent).toLowerCase();
+      const joined = [aria, title, tooltip, text].join(" | ");
+      if (!joined) {
+        continue;
+      }
+      if (!labels.some((label) => joined.includes(label))) {
+        continue;
+      }
+      if (joined.includes("download") || joined.includes("下载") || joined.includes("premium")) {
+        continue;
+      }
+      if (isVisibleElement(node)) {
+        return node;
+      }
+    }
+    return null;
+  }
+
   async function clickNode(node) {
     if (!node) {
       return false;
@@ -290,9 +330,7 @@
       }
     }
 
-    const moreActionsButton = document.querySelector(
-      'button[aria-label*="More actions"], button[aria-label*="更多操作"], ytd-menu-renderer yt-button-shape button'
-    );
+    const moreActionsButton = findYouTubeMoreActionsButton();
     if (await clickNode(moreActionsButton)) {
       const menuTranscriptButton = findClickableByText([
         "show transcript",
