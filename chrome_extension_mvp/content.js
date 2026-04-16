@@ -137,6 +137,20 @@
     return [];
   }
 
+  function hasVisibleYouTubeTranscriptPanel() {
+    return Boolean(
+      document.querySelector("ytd-transcript-segment-renderer .segment-text") ||
+      document.querySelector("ytd-transcript-segment-renderer .cue") ||
+      document.querySelector("[target-id] .segment-text") ||
+      document.querySelector("[target-id] .cue")
+    );
+  }
+
+  function hasPotentialTranscriptButton() {
+    const patterns = ["show transcript", "open transcript", "transcript", "显示文字稿", "显示转录稿", "转录稿", "文字稿"];
+    return Boolean(findClickableByText(patterns));
+  }
+
   function parseYouTubeXmlTranscript(xmlText) {
     try {
       const parser = new DOMParser();
@@ -340,10 +354,12 @@
       let transcript = "";
       let platform = "unknown";
       let helperMessage = "";
+      let detailedError = "";
 
       if (host.includes("youtube.com")) {
         platform = "youtube";
         transcript = extractYouTubeTranscript();
+        const tracks = getYouTubeCaptionTracks();
         if (!transcript) {
           transcript = await extractYouTubeTranscriptFromData();
           if (transcript) {
@@ -356,6 +372,9 @@
           if (ensureResult.autoOpened) {
             helperMessage = "已自动尝试展开 YouTube transcript 面板。";
           }
+        }
+        if (!transcript && tracks.length === 0 && !hasVisibleYouTubeTranscriptPanel() && !hasPotentialTranscriptButton()) {
+          detailedError = "当前视频疑似没有公开的 YouTube transcript / captionTracks。页面里看到的可能是视频画面内硬字幕，而不是平台可提取字幕。建议改走本地转写兜底。";
         }
       } else if (host.includes("bilibili.com") || host.includes("b23.tv")) {
         platform = "bilibili";
@@ -370,7 +389,7 @@
           url: location.href,
           transcript: "",
           helperMessage,
-          error: "当前页面未提取到可见字幕。YouTube 已自动尝试展开 transcript 面板；如果仍失败，请手动展开 transcript/字幕面板后再试。"
+          error: detailedError || "当前页面未提取到可见字幕。YouTube 已自动尝试展开 transcript 面板；如果仍失败，请手动展开 transcript/字幕面板后再试。"
         });
         return;
       }
