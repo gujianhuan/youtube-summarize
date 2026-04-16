@@ -18,6 +18,17 @@ async function getActiveTab() {
   return tab;
 }
 
+async function sendExtractMessage(tabId) {
+  return chrome.tabs.sendMessage(tabId, { action: "extractTranscript" });
+}
+
+async function ensureContentScript(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content.js"]
+  });
+}
+
 async function extractTranscript() {
   const tab = await getActiveTab();
   if (!tab || !tab.id) {
@@ -25,10 +36,25 @@ async function extractTranscript() {
     return;
   }
   setStatus("正在向页面请求字幕...");
-  const response = await chrome.tabs.sendMessage(tab.id, { action: "extractTranscript" }).catch((error) => {
-    setStatus(`提取失败: ${error.message}`, true);
-    return null;
-  });
+  let response = null;
+  try {
+    response = await sendExtractMessage(tab.id);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message.includes("Receiving end does not exist")) {
+      try {
+        setStatus("当前页面未注入扩展脚本，正在自动补注入后重试...");
+        await ensureContentScript(tab.id);
+        response = await sendExtractMessage(tab.id);
+      } catch (retryError) {
+        setStatus(`提取失败: ${retryError.message}`, true);
+        return;
+      }
+    } else {
+      setStatus(`提取失败: ${message || "未知错误"}`, true);
+      return;
+    }
+  }
   if (!response) {
     return;
   }
