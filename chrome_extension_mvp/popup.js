@@ -144,15 +144,21 @@ openBtn.addEventListener("click", async () => {
           }
 
           function setNativeValue(element, value) {
-            const prototype = Object.getPrototypeOf(element);
-            const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+            const proto = element instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype
+              : element instanceof HTMLInputElement
+                ? HTMLInputElement.prototype
+                : Object.getPrototypeOf(element);
+            const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
             if (descriptor && descriptor.set) {
               descriptor.set.call(element, value);
             } else {
               element.value = value;
             }
+            element.dispatchEvent(new Event("focus", { bubbles: true }));
             element.dispatchEvent(new Event("input", { bubbles: true }));
             element.dispatchEvent(new Event("change", { bubbles: true }));
+            element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
             element.dispatchEvent(new Event("blur", { bubbles: true }));
           }
 
@@ -192,7 +198,11 @@ openBtn.addEventListener("click", async () => {
 
                 if ((transcriptArea.value || "").trim().length < Math.min(20, payload.transcript.length)) {
                   setNativeValue(transcriptArea, payload.transcript || "");
-                  await sleep(800);
+                  await sleep(1200);
+                }
+
+                if ((transcriptArea.value || "").trim().length < Math.min(20, payload.transcript.length)) {
+                  continue;
                 }
 
                 for (let j = 0; j < 10; j += 1) {
