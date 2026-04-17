@@ -1464,7 +1464,6 @@ with tab_paste:
             if err:
                 st.error(f"总结失败: {err}")
             else:
-                st.session_state.manual_transcript_text = manual_transcript.strip()
                 st.session_state.manual_summary_text = summary
                 st.session_state.manual_summary_duration = {"summary": duration}
                 try:
