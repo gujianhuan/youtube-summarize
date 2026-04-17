@@ -55,6 +55,12 @@
       }
     }
     if (!lines.length) {
+      const byTimestampBlocks = extractYouTubeTranscriptFromTimestampBlocks();
+      if (byTimestampBlocks) {
+        return byTimestampBlocks;
+      }
+    }
+    if (!lines.length) {
       const fallback = extractYouTubeTranscriptFromPanelText();
       if (fallback) {
         return fallback;
@@ -67,18 +73,40 @@
     return /^(\d{1,2}:)?\d{1,2}:\d{2}$/.test(text.trim());
   }
 
-  function extractYouTubeTranscriptFromPanelText() {
-    const panel = document.querySelector(
-      "ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer[target-id*='transcript'], ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']"
-    );
-    if (!panel) {
+  function collectVisibleTranscriptContainers() {
+    const selectors = [
+      "ytd-transcript-search-panel-renderer",
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript']",
+      "ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']",
+      "#panels",
+      "#secondary",
+      "#secondary-inner"
+    ];
+    const containers = [];
+    for (const selector of selectors) {
+      for (const node of Array.from(document.querySelectorAll(selector))) {
+        if (!isVisibleElement(node)) {
+          continue;
+        }
+        const text = normalizeWhitespace(node.textContent || "");
+        if (!text) {
+          continue;
+        }
+        const timestampMatches = text.match(/(?:^|\s)(?:\d{1,2}:)?\d{1,2}:\d{2}(?=\s|$)/g) || [];
+        if (timestampMatches.length >= 2) {
+          containers.push(node);
+        }
+      }
+    }
+    return containers;
+  }
+
+  function cleanTranscriptLine(line) {
+    const normalized = normalizeWhitespace(line);
+    if (!normalized) {
       return "";
     }
-    const rawLines = normalizeWhitespace(panel.textContent || "")
-      .split("\n")
-      .map((line) => normalizeWhitespace(line))
-      .filter(Boolean);
-
+    const lower = normalized.toLowerCase();
     const skipFragments = [
       "在此视频中",
       "转写文稿",
@@ -93,18 +121,79 @@
       "show transcript",
       "open transcript"
     ];
+    if (skipFragments.some((fragment) => lower === fragment || lower.includes(fragment))) {
+      return "";
+    }
+    if (isLikelyTimestamp(normalized)) {
+      return "";
+    }
+    return normalized;
+  }
+
+  function extractYouTubeTranscriptFromTimestampBlocks() {
+    const containers = collectVisibleTranscriptContainers();
+    for (const container of containers) {
+      const rawLines = normalizeWhitespace(container.innerText || container.textContent || "")
+        .split("\n")
+        .map((line) => normalizeWhitespace(line))
+        .filter(Boolean);
+      if (!rawLines.length) {
+        continue;
+      }
+
+      const result = [];
+      let buffer = [];
+
+      const flushBuffer = () => {
+        const text = normalizeWhitespace(buffer.join(" "));
+        if (text && result[result.length - 1] !== text) {
+          result.push(text);
+        }
+        buffer = [];
+      };
+
+      for (const rawLine of rawLines) {
+        const line = normalizeWhitespace(rawLine);
+        if (!line) {
+          continue;
+        }
+        if (isLikelyTimestamp(line)) {
+          flushBuffer();
+          continue;
+        }
+        const cleaned = cleanTranscriptLine(line);
+        if (!cleaned) {
+          continue;
+        }
+        buffer.push(cleaned);
+      }
+      flushBuffer();
+
+      const transcript = normalizeWhitespace(result.join("\n"));
+      if (transcript && transcript.length >= 40) {
+        return transcript;
+      }
+    }
+    return "";
+  }
+
+  function extractYouTubeTranscriptFromPanelText() {
+    const panel = document.querySelector(
+      "ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer[target-id*='transcript'], ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']"
+    );
+    if (!panel) {
+      return "";
+    }
+    const rawLines = normalizeWhitespace(panel.textContent || "")
+      .split("\n")
+      .map((line) => normalizeWhitespace(line))
+      .filter(Boolean);
 
     const result = [];
     for (const line of rawLines) {
-      const lower = line.toLowerCase();
-      if (skipFragments.some((fragment) => lower === fragment || lower.includes(fragment))) {
-        continue;
-      }
-      if (isLikelyTimestamp(line)) {
-        continue;
-      }
-      if (result[result.length - 1] !== line) {
-        result.push(line);
+      const cleaned = cleanTranscriptLine(line);
+      if (cleaned && result[result.length - 1] !== cleaned) {
+        result.push(cleaned);
       }
     }
     return normalizeWhitespace(result.join("\n"));
@@ -198,7 +287,8 @@
       document.querySelector("ytd-transcript-segment-renderer .segment-text") ||
       document.querySelector("ytd-transcript-segment-renderer .cue") ||
       document.querySelector("[target-id] .segment-text") ||
-      document.querySelector("[target-id] .cue")
+      document.querySelector("[target-id] .cue") ||
+      collectVisibleTranscriptContainers().length > 0
     );
   }
 
