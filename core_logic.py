@@ -3126,21 +3126,36 @@ def _extract_markdown_links(markdown_text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _soften_fact_check_wording(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return value
+    replacements = [
+        (r"手动搜索未发现", "当前检索到的公开候选来源暂未形成直接佐证"),
+        (r"未发现支持", "暂缺可直接支撑"),
+        (r"未搜索到关于", "当前检索到的公开候选来源中，暂缺关于"),
+        (r"未搜索到来自", "当前检索到的公开候选来源中，暂缺来自"),
+        (r"未检索到可靠外部来源", "当前可交叉验证的公开候选来源仍不足"),
+        (r"未找到关于", "当前检索到的公开候选来源中，暂缺关于"),
+        (r"未找到来自", "当前检索到的公开候选来源中，暂缺来自"),
+        (r"未发现关于", "当前检索到的公开候选来源中，暂缺关于"),
+    ]
+    for pattern, replacement in replacements:
+        value = re.sub(pattern, replacement, value)
+    return value
+
+
 def _enrich_fact_check_markdown_with_links(fact_md: str, search_results_md: str) -> str:
     fact_text = str(fact_md or "").strip()
     if not fact_text:
         return fact_text
-    if _extract_markdown_links(fact_text):
-        return fact_text
-
     search_links = _extract_markdown_links(search_results_md)
     if not search_links:
-        return fact_text
-
-    fallback_lines = ["", "### 参考新闻来源"]
-    for label, url in search_links[:5]:
-        fallback_lines.append(f"- [{label}]({url})")
-    return fact_text + "\n" + "\n".join(fallback_lines)
+        return _soften_fact_check_wording(fact_text)
+    return _enrich_fact_check_items_with_claim_sources(
+        fact_text,
+        [{"search_markdown": search_results_md}],
+    )
 
 
 def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: list[dict] | None) -> str:
@@ -3150,7 +3165,7 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
     if not claim_sources:
         return fact_text
 
-    sections = re.split(r"(?=^###\s*条目\d+)", fact_text, flags=re.M)
+    sections = re.split(r"(?=^###\s*条目\d+)", _soften_fact_check_wording(fact_text), flags=re.M)
     updated_sections: list[str] = []
     claim_idx = 0
 
@@ -3162,8 +3177,11 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
             updated_sections.append(stripped)
             continue
 
-        current_sources = claim_sources[claim_idx] if claim_idx < len(claim_sources) else {}
-        claim_idx += 1
+        if len(claim_sources) == 1:
+            current_sources = claim_sources[0]
+        else:
+            current_sources = claim_sources[claim_idx] if claim_idx < len(claim_sources) else {}
+            claim_idx += 1
         source_links = _extract_markdown_links(str(current_sources.get("search_markdown") or ""))
         if not source_links:
             updated_sections.append(stripped)
@@ -4064,6 +4082,7 @@ def fact_check_document_claims(
         "- 来源/出处：给出 1-3 个外部来源链接，格式如 [新华社](https://...)\n"
         "- 禁止把文档本身当来源。\n"
         "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
+        "- 避免使用“手动搜索未发现”“未搜索到”这类空泛表述，改为说明“现有公开候选来源不足以直接支撑该说法”，并保留候选链接。\n"
         "- 只返回 Markdown，不要 JSON。\n\n"
         f"文档总结：\n{summary_markdown[:4000]}\n\n"
         f"候选声明与搜索结果：\n{compiled_claim_text}"
@@ -4192,8 +4211,8 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             "     - 依据：简要说明为什么这样判断\n"
             "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
             "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
-            "   - 不要写“无法独立核实”这种空话。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
-            "   - 如果某条确实找不到可靠来源，也必须给出你已经检索到的候选链接，或明确写出“未检索到可靠外部来源，仅找到如下候选：...”。\n\n"
+            "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
+            "   - 如果某条暂时缺乏直接证据，也要明确写出当前候选来源，并说明“现有公开候选来源不足以直接支撑该说法”，不要只写“未发现”。\n\n"
             "**字幕内容输入：**\n"
             f"{content}"
         )
@@ -4213,7 +4232,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "   - 必须逐条列出可核查新闻，不要使用表格。\n"
                 "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`来源/出处`。\n"
                 "   - `来源/出处` 必须尽量给出具体 URL，禁止把视频本身当作来源。\n"
-                "   - 不要写“无法独立核实”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”。\n\n"
+                "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”，并保留候选来源链接。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
             )
