@@ -3143,6 +3143,51 @@ def _enrich_fact_check_markdown_with_links(fact_md: str, search_results_md: str)
     return fact_text + "\n" + "\n".join(fallback_lines)
 
 
+def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: list[dict] | None) -> str:
+    fact_text = str(fact_md or "").strip()
+    if not fact_text:
+        return fact_text
+    if not claim_sources:
+        return fact_text
+
+    sections = re.split(r"(?=^###\s*条目\d+)", fact_text, flags=re.M)
+    updated_sections: list[str] = []
+    claim_idx = 0
+
+    for section in sections:
+        stripped = section.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("### 条目"):
+            updated_sections.append(stripped)
+            continue
+
+        current_sources = claim_sources[claim_idx] if claim_idx < len(claim_sources) else {}
+        claim_idx += 1
+        source_links = _extract_markdown_links(str(current_sources.get("search_markdown") or ""))
+        if not source_links:
+            updated_sections.append(stripped)
+            continue
+
+        if re.search(r"-\s*来源/出处：.*\[[^\]]+\]\(https?://", stripped):
+            updated_sections.append(stripped)
+            continue
+
+        source_text = "；".join(f"[{label}]({url})" for label, url in source_links[:3])
+        if "- 来源/出处：" in stripped:
+            stripped = re.sub(
+                r"(-\s*来源/出处：)(.*)",
+                lambda m: f"{m.group(1)} {source_text}",
+                stripped,
+                count=1,
+            )
+        else:
+            stripped = stripped.rstrip() + f"\n- 来源/出处： {source_text}"
+        updated_sections.append(stripped)
+
+    return "\n\n".join(updated_sections)
+
+
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown", ".pptx"}
 DEFAULT_DOCUMENT_MAX_MB = int(os.environ.get("DOCUMENT_MAX_UPLOAD_MB", "20") or "20")
 DEFAULT_DOCUMENT_DIRECT_SUMMARY_CHARS = int(os.environ.get("DOCUMENT_DIRECT_SUMMARY_CHARS", "15000") or "15000")
@@ -4037,7 +4082,7 @@ def fact_check_document_claims(
         progress_callback(100, "关键声明事实核查完成。")
     if not content:
         raise RuntimeError("模型未返回事实核查结果。")
-    return content
+    return _enrich_fact_check_items_with_claim_sources(content, claim_sources)
 
 def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
     if not text or not text.strip():
@@ -4223,10 +4268,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
 
         normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
         if normalized_payload:
-            normalized_payload["fact_check_markdown"] = _enrich_fact_check_markdown_with_links(
-                normalized_payload.get("fact_check_markdown", ""),
-                search_context,
-            )
+            fact_md = normalized_payload.get("fact_check_markdown", "")
+            fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
+            fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
+            normalized_payload["fact_check_markdown"] = fact_md
             return json.dumps(normalized_payload, ensure_ascii=False)
 
         try:
@@ -4251,10 +4296,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             repair_content = repair_resp.choices[0].message.content
             normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
             if normalized_payload:
-                normalized_payload["fact_check_markdown"] = _enrich_fact_check_markdown_with_links(
-                    normalized_payload.get("fact_check_markdown", ""),
-                    search_context,
-                )
+                fact_md = normalized_payload.get("fact_check_markdown", "")
+                fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
+                fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
+                normalized_payload["fact_check_markdown"] = fact_md
                 return json.dumps(normalized_payload, ensure_ascii=False)
         except Exception as repair_exc:
             print(f"Repair summary JSON failed: {repair_exc}")
