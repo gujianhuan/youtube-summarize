@@ -795,10 +795,18 @@ if "summary_text" not in st.session_state:
     st.session_state.summary_text = ""
 if "manual_transcript_text" not in st.session_state:
     st.session_state.manual_transcript_text = ""
+if "manual_source_url" not in st.session_state:
+    st.session_state.manual_source_url = ""
 if "manual_summary_text" not in st.session_state:
     st.session_state.manual_summary_text = ""
 if "manual_summary_duration" not in st.session_state:
     st.session_state.manual_summary_duration = {}
+if "manual_auto_payload_id" not in st.session_state:
+    st.session_state.manual_auto_payload_id = ""
+if "manual_last_payload_id" not in st.session_state:
+    st.session_state.manual_last_payload_id = ""
+if "prefer_paste_tab" not in st.session_state:
+    st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
     st.session_state.document_raw_text = ""
 if "document_clean_text" not in st.session_state:
@@ -868,6 +876,21 @@ st.session_state.api_key = api_key
 st.session_state.base_url = base_url
 st.session_state.model = model_selected
 
+query_params = st.query_params
+ext_payload_id = str(query_params.get("ext_payload_id", "") or "").strip()
+ext_source_url = str(query_params.get("ext_source_url", "") or "").strip()
+ext_transcript = str(query_params.get("ext_transcript", "") or "").strip()
+ext_autosubmit = str(query_params.get("ext_autosubmit", "") or "").strip().lower() in {"1", "true", "yes"}
+
+if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id != ext_payload_id:
+    st.session_state.manual_source_url = ext_source_url
+    st.session_state.manual_transcript_text = ext_transcript
+    st.session_state.manual_summary_text = ""
+    st.session_state.manual_summary_duration = {}
+    st.session_state.prefer_paste_tab = True
+    if ext_autosubmit:
+        st.session_state.manual_auto_payload_id = ext_payload_id
+
 
 
 # --- 主界面 ---
@@ -875,7 +898,10 @@ st.title("🎬 Video Summarizer")
 st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
 
 # 使用 Tabs 分割功能
-tab_single, tab_paste, tab_doc, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "✍️ 粘贴字幕", "📄 文档总结", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
+if st.session_state.prefer_paste_tab:
+    tab_paste, tab_single, tab_doc, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["✍️ 粘贴字幕", "🎬 单视频处理", "📄 文档总结", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
+else:
+    tab_single, tab_paste, tab_doc, tab_sub, tab_batch, tab_history, tab_guestbook = st.tabs(["🎬 单视频处理", "✍️ 粘贴字幕", "📄 文档总结", "📡 频道订阅", "⏰ 定时任务", "📜 历史记录", "💬 留言板"])
 
 # --- 通用逻辑函数 (供两个 Tab 使用) ---
 def internal_fetch_transcript(video_url, progress_callback=None):
@@ -1401,9 +1427,8 @@ with tab_paste:
     )
     manual_transcript = st.text_area(
         "粘贴 transcript / 字幕文本",
-        value=st.session_state.manual_transcript_text,
         height=260,
-        key="manual_transcript_input",
+        key="manual_transcript_text",
         placeholder="把浏览器扩展提取到的字幕文本粘贴到这里...",
     )
     paste_col1, paste_col2 = st.columns([1, 3])
@@ -1412,14 +1437,30 @@ with tab_paste:
     with paste_col2:
         st.caption("适合作为 YouTube/B站抓取失败时的稳定兜底入口。")
 
-    if paste_sum_btn:
+    auto_paste_sum = bool(
+        st.session_state.manual_auto_payload_id
+        and st.session_state.manual_auto_payload_id != st.session_state.manual_last_payload_id
+        and manual_transcript.strip()
+    )
+    if auto_paste_sum:
+        st.caption("已接收到浏览器扩展传来的 transcript，正在自动开始总结...")
+
+    if paste_sum_btn or auto_paste_sum:
         if not manual_transcript.strip():
             st.warning("请先粘贴字幕文本。")
         else:
+            current_payload_id = st.session_state.manual_auto_payload_id if auto_paste_sum else ""
             t_manual_start = time.time()
             with st.spinner(f"正在请求 AI 总结 ({model_selected})..."):
                 summary, err = internal_summarize(manual_transcript.strip(), model_selected)
             duration = time.time() - t_manual_start
+            if current_payload_id:
+                st.session_state.manual_last_payload_id = current_payload_id
+                st.session_state.manual_auto_payload_id = ""
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
             if err:
                 st.error(f"总结失败: {err}")
             else:
