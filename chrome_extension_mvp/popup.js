@@ -110,7 +110,7 @@ openBtn.addEventListener("click", async () => {
 
   const injectPayload = async () => {
     if (!targetTab.id) {
-      return { filled: false, submitted: false };
+      return { filled: false, submitted: false, debug: "missing_tab_id" };
     }
     try {
       const execResults = await chrome.scripting.executeScript({
@@ -162,6 +162,27 @@ openBtn.addEventListener("click", async () => {
             element.dispatchEvent(new Event("blur", { bubbles: true }));
           }
 
+          function matchesTranscriptArea(node) {
+            const hint = getElementHint(node);
+            return (
+              hint.includes("transcript") ||
+              hint.includes("字幕文本") ||
+              hint.includes("粘贴") ||
+              hint.includes("把浏览器扩展提取到的字幕文本粘贴到这里")
+            );
+          }
+
+          function matchesSourceInput(node) {
+            const hint = getElementHint(node);
+            return (
+              hint.includes("来源链接") ||
+              hint.includes("youtube") ||
+              hint.includes("bilibili") ||
+              hint.includes("watch?v=") ||
+              hint.includes("/video/bv")
+            );
+          }
+
           async function run() {
             for (let i = 0; i < 20; i += 1) {
               const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'))
@@ -175,18 +196,15 @@ openBtn.addEventListener("click", async () => {
               await sleep(500);
             }
 
-            for (let attempt = 0; attempt < 8; attempt += 1) {
+            let lastDebug = "";
+            for (let attempt = 0; attempt < 24; attempt += 1) {
               const textareas = Array.from(document.querySelectorAll("textarea")).filter(isVisibleElement);
-              const transcriptArea = textareas.find((node) => {
-                const hint = getElementHint(node);
-                return hint.includes("transcript") || hint.includes("字幕文本") || hint.includes("粘贴");
-              }) || textareas[textareas.length - 1];
+              const transcriptArea = textareas.find(matchesTranscriptArea) || textareas[textareas.length - 1];
 
               const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisibleElement);
-              const sourceInput = textInputs.find((node) => {
-                const hint = getElementHint(node);
-                return hint.includes("来源链接") || hint.includes("youtube") || hint.includes("bilibili");
-              });
+              const sourceInput = textInputs.find(matchesSourceInput);
+
+              lastDebug = `attempt=${attempt}; textareas=${textareas.length}; inputs=${textInputs.length}; transcriptHint=${transcriptArea ? getElementHint(transcriptArea).slice(0, 120) : "none"}; sourceHint=${sourceInput ? getElementHint(sourceInput).slice(0, 120) : "none"}`;
 
               if (transcriptArea) {
                 if (sourceInput) {
@@ -202,6 +220,8 @@ openBtn.addEventListener("click", async () => {
                 }
 
                 if ((transcriptArea.value || "").trim().length < Math.min(20, payload.transcript.length)) {
+                  lastDebug += `; transcriptValueLen=${(transcriptArea.value || "").trim().length}; sourceValueLen=${sourceInput ? (sourceInput.value || "").trim().length : 0}`;
+                  await sleep(800);
                   continue;
                 }
 
@@ -214,24 +234,24 @@ openBtn.addEventListener("click", async () => {
                   if (summaryButton) {
                     summaryButton.click();
                     await sleep(1200);
-                    return { filled: true, submitted: true };
+                    return { filled: true, submitted: true, debug: `${lastDebug}; clicked=${(summaryButton.textContent || "").trim()}` };
                   }
                   await sleep(500);
                 }
-                return { filled: true, submitted: false };
+                return { filled: true, submitted: false, debug: `${lastDebug}; no_visible_summary_button` };
               }
-              await sleep(700);
+              await sleep(900);
             }
-            return { filled: false, submitted: false };
+            return { filled: false, submitted: false, debug: lastDebug || "no_visible_fields" };
           }
 
           return run();
         },
         args: [{ transcript, sourceUrl }]
       });
-      return execResults?.[0]?.result || { filled: false, submitted: false };
+      return execResults?.[0]?.result || { filled: false, submitted: false, debug: "no_exec_result" };
     } catch (_error) {
-      return { filled: false, submitted: false };
+      return { filled: false, submitted: false, debug: "execute_script_failed" };
     }
   };
 
@@ -244,9 +264,9 @@ openBtn.addEventListener("click", async () => {
     if (injected.submitted) {
       setStatus("已自动打开主站并触发总结，请稍候查看结果。");
     } else if (injected.filled) {
-      setStatus("主站已自动填入字幕，但未自动触发总结。请在主站手动点一次总结。", true);
+      setStatus(`主站已自动填入字幕，但未自动触发总结。${injected.debug || ""}`, true);
     } else {
-      setStatus("主站已打开，但自动填充失败。请手动粘贴。", true);
+      setStatus(`主站已打开，但自动填充失败。${injected.debug || ""}`, true);
     }
   };
 
