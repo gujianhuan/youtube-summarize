@@ -150,19 +150,49 @@ openBtn.addEventListener("click", async () => {
           }
 
           function setNativeValue(element, value) {
+            const nextValue = String(value || "");
+            const previousValue = String(element.value || "");
             const proto = element instanceof HTMLTextAreaElement
               ? HTMLTextAreaElement.prototype
               : element instanceof HTMLInputElement
                 ? HTMLInputElement.prototype
                 : Object.getPrototypeOf(element);
             const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
-            if (descriptor && descriptor.set) {
-              descriptor.set.call(element, value);
-            } else {
-              element.value = value;
-            }
             element.dispatchEvent(new Event("focus", { bubbles: true }));
-            element.dispatchEvent(new Event("input", { bubbles: true }));
+
+            try {
+              if (typeof element.setSelectionRange === "function") {
+                element.setSelectionRange(0, previousValue.length);
+              }
+              if (typeof element.setRangeText === "function") {
+                element.setRangeText(nextValue, 0, previousValue.length, "end");
+              } else if (descriptor && descriptor.set) {
+                descriptor.set.call(element, nextValue);
+              } else {
+                element.value = nextValue;
+              }
+            } catch (_error) {
+              if (descriptor && descriptor.set) {
+                descriptor.set.call(element, nextValue);
+              } else {
+                element.value = nextValue;
+              }
+            }
+
+            const tracker = element._valueTracker;
+            if (tracker && typeof tracker.setValue === "function") {
+              tracker.setValue(previousValue);
+            }
+
+            try {
+              const clipboardData = new DataTransfer();
+              clipboardData.setData("text/plain", nextValue);
+              element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData }));
+            } catch (_error) {
+              // Some environments do not allow constructing ClipboardEvent/DataTransfer.
+            }
+
+            element.dispatchEvent(new InputEvent("input", { bubbles: true, data: nextValue, inputType: "insertFromPaste" }));
             element.dispatchEvent(new Event("change", { bubbles: true }));
             element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
             element.dispatchEvent(new Event("blur", { bubbles: true }));

@@ -3110,6 +3110,39 @@ def _normalize_summary_payload(payload: dict | None) -> dict | None:
     }
 
 
+def _extract_markdown_links(markdown_text: str) -> list[tuple[str, str]]:
+    text = str(markdown_text or "")
+    if not text:
+        return []
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, url in re.findall(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", text):
+        clean_label = label.strip()
+        clean_url = url.strip()
+        if not clean_url or clean_url in seen:
+            continue
+        seen.add(clean_url)
+        pairs.append((clean_label or clean_url, clean_url))
+    return pairs
+
+
+def _enrich_fact_check_markdown_with_links(fact_md: str, search_results_md: str) -> str:
+    fact_text = str(fact_md or "").strip()
+    if not fact_text:
+        return fact_text
+    if _extract_markdown_links(fact_text):
+        return fact_text
+
+    search_links = _extract_markdown_links(search_results_md)
+    if not search_links:
+        return fact_text
+
+    fallback_lines = ["", "### 参考新闻来源"]
+    for label, url in search_links[:5]:
+        fallback_lines.append(f"- [{label}]({url})")
+    return fact_text + "\n" + "\n".join(fallback_lines)
+
+
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown", ".pptx"}
 DEFAULT_DOCUMENT_MAX_MB = int(os.environ.get("DOCUMENT_MAX_UPLOAD_MB", "20") or "20")
 DEFAULT_DOCUMENT_DIRECT_SUMMARY_CHARS = int(os.environ.get("DOCUMENT_DIRECT_SUMMARY_CHARS", "15000") or "15000")
@@ -4190,6 +4223,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
 
         normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
         if normalized_payload:
+            normalized_payload["fact_check_markdown"] = _enrich_fact_check_markdown_with_links(
+                normalized_payload.get("fact_check_markdown", ""),
+                search_context,
+            )
             return json.dumps(normalized_payload, ensure_ascii=False)
 
         try:
@@ -4214,6 +4251,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             repair_content = repair_resp.choices[0].message.content
             normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
             if normalized_payload:
+                normalized_payload["fact_check_markdown"] = _enrich_fact_check_markdown_with_links(
+                    normalized_payload.get("fact_check_markdown", ""),
+                    search_context,
+                )
                 return json.dumps(normalized_payload, ensure_ascii=False)
         except Exception as repair_exc:
             print(f"Repair summary JSON failed: {repair_exc}")
