@@ -120,6 +120,29 @@ openBtn.addEventListener("click", async () => {
             return new Promise((resolve) => window.setTimeout(resolve, ms));
           }
 
+          function isVisibleElement(node) {
+            if (!node) {
+              return false;
+            }
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+          }
+
+          function getElementHint(node) {
+            if (!node) {
+              return "";
+            }
+            const parts = [
+              node.getAttribute("aria-label") || "",
+              node.getAttribute("placeholder") || "",
+              node.getAttribute("name") || "",
+              node.id || "",
+              node.textContent || ""
+            ];
+            return parts.join(" ").toLowerCase();
+          }
+
           function setNativeValue(element, value) {
             const prototype = Object.getPrototypeOf(element);
             const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
@@ -130,30 +153,33 @@ openBtn.addEventListener("click", async () => {
             }
             element.dispatchEvent(new Event("input", { bubbles: true }));
             element.dispatchEvent(new Event("change", { bubbles: true }));
+            element.dispatchEvent(new Event("blur", { bubbles: true }));
           }
 
           async function run() {
             for (let i = 0; i < 20; i += 1) {
-              const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'));
+              const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'))
+                .filter(isVisibleElement);
               const pasteTab = tabButtons.find((node) => (node.textContent || "").includes("粘贴字幕"));
               if (pasteTab) {
                 pasteTab.click();
+                await sleep(900);
                 break;
               }
               await sleep(500);
             }
 
-            for (let i = 0; i < 30; i += 1) {
-              const textareas = Array.from(document.querySelectorAll('textarea'));
+            for (let attempt = 0; attempt < 8; attempt += 1) {
+              const textareas = Array.from(document.querySelectorAll("textarea")).filter(isVisibleElement);
               const transcriptArea = textareas.find((node) => {
-                const label = node.getAttribute("aria-label") || node.getAttribute("placeholder") || "";
-                return label.includes("transcript") || label.includes("字幕文本") || label.includes("粘贴");
-              }) || textareas[0];
+                const hint = getElementHint(node);
+                return hint.includes("transcript") || hint.includes("字幕文本") || hint.includes("粘贴");
+              }) || textareas[textareas.length - 1];
 
-              const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+              const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisibleElement);
               const sourceInput = textInputs.find((node) => {
-                const label = node.getAttribute("aria-label") || node.getAttribute("placeholder") || "";
-                return label.includes("来源链接") || label.includes("youtube") || label.includes("bilibili");
+                const hint = getElementHint(node);
+                return hint.includes("来源链接") || hint.includes("youtube") || hint.includes("bilibili");
               });
 
               if (transcriptArea) {
@@ -162,23 +188,29 @@ openBtn.addEventListener("click", async () => {
                 }
                 setNativeValue(transcriptArea, payload.transcript || "");
                 transcriptArea.focus();
-                await sleep(700);
+                await sleep(1200);
 
-                for (let j = 0; j < 20; j += 1) {
-                  const actionButtons = Array.from(document.querySelectorAll("button"));
+                if ((transcriptArea.value || "").trim().length < Math.min(20, payload.transcript.length)) {
+                  setNativeValue(transcriptArea, payload.transcript || "");
+                  await sleep(800);
+                }
+
+                for (let j = 0; j < 10; j += 1) {
+                  const actionButtons = Array.from(document.querySelectorAll("button")).filter(isVisibleElement);
                   const summaryButton = actionButtons.find((node) => {
                     const text = (node.textContent || "").trim();
-                    return text.includes("总结字幕文本");
+                    return text.includes("总结字幕文本") || text.includes("总结字幕");
                   });
                   if (summaryButton) {
                     summaryButton.click();
+                    await sleep(1200);
                     return { filled: true, submitted: true };
                   }
-                  await sleep(400);
+                  await sleep(500);
                 }
                 return { filled: true, submitted: false };
               }
-              await sleep(500);
+              await sleep(700);
             }
             return { filled: false, submitted: false };
           }
