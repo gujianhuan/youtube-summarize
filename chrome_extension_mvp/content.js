@@ -3,6 +3,45 @@
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
+  function getSearchRoots() {
+    const roots = [document];
+    const queue = [document];
+    const seen = new Set([document]);
+
+    while (queue.length) {
+      const root = queue.shift();
+      const elements = root.querySelectorAll ? Array.from(root.querySelectorAll("*")) : [];
+      for (const element of elements) {
+        if (element.shadowRoot && !seen.has(element.shadowRoot)) {
+          seen.add(element.shadowRoot);
+          roots.push(element.shadowRoot);
+          queue.push(element.shadowRoot);
+        }
+      }
+    }
+    return roots;
+  }
+
+  function querySelectorAllDeep(selector) {
+    const results = [];
+    const seen = new Set();
+    for (const root of getSearchRoots()) {
+      const nodes = root.querySelectorAll ? Array.from(root.querySelectorAll(selector)) : [];
+      for (const node of nodes) {
+        if (!seen.has(node)) {
+          seen.add(node);
+          results.push(node);
+        }
+      }
+    }
+    return results;
+  }
+
+  function querySelectorDeep(selector) {
+    const matches = querySelectorAllDeep(selector);
+    return matches[0] || null;
+  }
+
   function normalizeWhitespace(text) {
     return String(text || "")
       .replace(/\u200b/g, "")
@@ -40,7 +79,7 @@
     ];
     const lines = [];
     for (const selector of segmentSelectors) {
-      const nodes = Array.from(document.querySelectorAll(selector));
+      const nodes = querySelectorAllDeep(selector);
       if (!nodes.length) {
         continue;
       }
@@ -84,7 +123,7 @@
     ];
     const containers = [];
     for (const selector of selectors) {
-      for (const node of Array.from(document.querySelectorAll(selector))) {
+      for (const node of querySelectorAllDeep(selector)) {
         if (!isVisibleElement(node)) {
           continue;
         }
@@ -178,7 +217,7 @@
   }
 
   function extractYouTubeTranscriptFromPanelText() {
-    const panel = document.querySelector(
+    const panel = querySelectorDeep(
       "ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer[target-id*='transcript'], ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']"
     );
     if (!panel) {
@@ -284,10 +323,10 @@
 
   function hasVisibleYouTubeTranscriptPanel() {
     return Boolean(
-      document.querySelector("ytd-transcript-segment-renderer .segment-text") ||
-      document.querySelector("ytd-transcript-segment-renderer .cue") ||
-      document.querySelector("[target-id] .segment-text") ||
-      document.querySelector("[target-id] .cue") ||
+      querySelectorDeep("ytd-transcript-segment-renderer .segment-text") ||
+      querySelectorDeep("ytd-transcript-segment-renderer .cue") ||
+      querySelectorDeep("[target-id] .segment-text") ||
+      querySelectorDeep("[target-id] .cue") ||
       collectVisibleTranscriptContainers().length > 0
     );
   }
@@ -391,7 +430,7 @@
   }
 
   function findClickableByText(patterns) {
-    const nodes = Array.from(document.querySelectorAll('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer'));
+    const nodes = querySelectorAllDeep('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer');
     for (const node of nodes) {
       const text = normalizeWhitespace(node.textContent).toLowerCase();
       if (!text) {
@@ -414,7 +453,7 @@
   }
 
   function findYouTubeMoreActionsButton() {
-    const candidates = Array.from(document.querySelectorAll("button, [role='button']"));
+    const candidates = querySelectorAllDeep("button, [role='button']");
     const labels = [
       "more actions",
       "更多操作",
