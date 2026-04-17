@@ -105,14 +105,171 @@ openBtn.addEventListener("click", async () => {
     return;
   }
 
-  const params = new URLSearchParams({
-    ext_payload_id: String(Date.now()),
-    ext_autosubmit: "1",
-    ext_source_url: sourceUrl,
-    ext_transcript: transcript
-  });
-  const targetUrl = `${SUMMARIZER_URL}?${params.toString()}`;
-  setStatus("正在打开主站并自动带入 transcript...");
-  await chrome.tabs.create({ url: targetUrl });
-  setStatus("已打开主站，主站将自动接收 transcript 并开始总结。");
+  try {
+    await navigator.clipboard.writeText(transcript);
+  } catch (_error) {
+    // Clipboard is best-effort fallback.
+  }
+
+  setStatus("正在打开主站并尝试自动填入 transcript...");
+  const targetTab = await chrome.tabs.create({ url: SUMMARIZER_URL });
+
+  const injectPayload = async () => {
+    if (!targetTab.id) {
+      return { filled: false, submitted: false, debug: "missing_tab_id" };
+    }
+    try {
+      const execResults = await chrome.scripting.executeScript({
+        target: { tabId: targetTab.id },
+        func: (payload) => {
+          function sleep(ms) {
+            return new Promise((resolve) => window.setTimeout(resolve, ms));
+          }
+
+          function isVisibleElement(node) {
+            if (!node) {
+              return false;
+            }
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+          }
+
+          function getElementHint(node) {
+            if (!node) {
+              return "";
+            }
+            const parts = [
+              node.getAttribute("aria-label") || "",
+              node.getAttribute("placeholder") || "",
+              node.getAttribute("name") || "",
+              node.id || "",
+              node.textContent || ""
+            ];
+            return parts.join(" ").toLowerCase();
+          }
+
+          function setNativeValue(element, value) {
+            const proto = element instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype
+              : element instanceof HTMLInputElement
+                ? HTMLInputElement.prototype
+                : Object.getPrototypeOf(element);
+            const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+            if (descriptor && descriptor.set) {
+              descriptor.set.call(element, value);
+            } else {
+              element.value = value;
+            }
+            element.dispatchEvent(new Event("focus", { bubbles: true }));
+            element.dispatchEvent(new Event("input", { bubbles: true }));
+            element.dispatchEvent(new Event("change", { bubbles: true }));
+            element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
+            element.dispatchEvent(new Event("blur", { bubbles: true }));
+          }
+
+          function matchesTranscriptArea(node) {
+            const hint = getElementHint(node);
+            return (
+              hint.includes("transcript") ||
+              hint.includes("字幕文本") ||
+              hint.includes("粘贴") ||
+              hint.includes("把浏览器扩展提取到的字幕文本粘贴到这里")
+            );
+          }
+
+          function matchesSourceInput(node) {
+            const hint = getElementHint(node);
+            return (
+              hint.includes("来源链接") ||
+              hint.includes("youtube") ||
+              hint.includes("bilibili") ||
+              hint.includes("watch?v=") ||
+              hint.includes("/video/bv")
+            );
+          }
+
+          async function run() {
+            for (let i = 0; i < 20; i += 1) {
+              const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'))
+                .filter(isVisibleElement);
+              const pasteTab = tabButtons.find((node) => (node.textContent || "").includes("粘贴字幕"));
+              if (pasteTab) {
+                pasteTab.click();
+                await sleep(900);
+                break;
+              }
+              await sleep(500);
+            }
+
+            let lastDebug = "";
+            for (let attempt = 0; attempt < 24; attempt += 1) {
+              const textareas = Array.from(document.querySelectorAll("textarea")).filter(isVisibleElement);
+              const transcriptArea = textareas.find(matchesTranscriptArea) || textareas[textareas.length - 1];
+              const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisibleElement);
+              const sourceInput = textInputs.find(matchesSourceInput);
+
+              lastDebug = `attempt=${attempt}; textareas=${textareas.length}; inputs=${textInputs.length}; transcriptHint=${transcriptArea ? getElementHint(transcriptArea).slice(0, 80) : "none"}; sourceHint=${sourceInput ? getElementHint(sourceInput).slice(0, 80) : "none"}`;
+
+              if (transcriptArea) {
+                if (sourceInput) {
+                  setNativeValue(sourceInput, payload.sourceUrl || "");
+                }
+                setNativeValue(transcriptArea, payload.transcript || "");
+                await sleep(1200);
+
+                const transcriptLen = (transcriptArea.value || "").trim().length;
+                const sourceLen = sourceInput ? (sourceInput.value || "").trim().length : 0;
+
+                if (transcriptLen < Math.min(20, payload.transcript.length)) {
+                  await sleep(800);
+                  continue;
+                }
+
+                for (let j = 0; j < 10; j += 1) {
+                  const actionButtons = Array.from(document.querySelectorAll("button")).filter(isVisibleElement);
+                  const summaryButton = actionButtons.find((node) => {
+                    const text = (node.textContent || "").trim();
+                    return text.includes("总结字幕文本") || text.includes("总结字幕");
+                  });
+                  if (summaryButton) {
+                    summaryButton.click();
+                    await sleep(1200);
+                    return { filled: true, submitted: true, debug: `${lastDebug}; transcriptLen=${transcriptLen}; sourceLen=${sourceLen}` };
+                  }
+                  await sleep(500);
+                }
+                return { filled: true, submitted: false, debug: `${lastDebug}; transcriptLen=${transcriptLen}; sourceLen=${sourceLen}; no_visible_summary_button` };
+              }
+              await sleep(900);
+            }
+            return { filled: false, submitted: false, debug: lastDebug || "no_visible_fields" };
+          }
+
+          return run();
+        },
+        args: [{ transcript, sourceUrl }]
+      });
+      return execResults?.[0]?.result || { filled: false, submitted: false, debug: "no_exec_result" };
+    } catch (_error) {
+      return { filled: false, submitted: false, debug: "execute_script_failed" };
+    }
+  };
+
+  const listener = async (tabId, changeInfo) => {
+    if (tabId !== targetTab.id || changeInfo.status !== "complete") {
+      return;
+    }
+    chrome.tabs.onUpdated.removeListener(listener);
+    const injected = await injectPayload();
+    if (injected.submitted) {
+      setStatus("已打开主站并触发总结；如果页面没显示，请检查主站是否部署到最新版本。");
+    } else if (injected.filled) {
+      setStatus(`主站已尝试自动填入，但未自动触发总结。字幕也已复制到剪贴板。${injected.debug || ""}`, true);
+    } else {
+      setStatus(`主站已打开，但自动填充失败。字幕已复制到剪贴板，请手动粘贴。${injected.debug || ""}`, true);
+    }
+  };
+
+  chrome.tabs.onUpdated.addListener(listener);
 });
