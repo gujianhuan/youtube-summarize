@@ -100,6 +100,12 @@
       }
     }
     if (!lines.length) {
+      const byVisibleNodes = extractYouTubeTranscriptFromVisibleTextNodes();
+      if (byVisibleNodes) {
+        return byVisibleNodes;
+      }
+    }
+    if (!lines.length) {
       const fallback = extractYouTubeTranscriptFromPanelText();
       if (fallback) {
         return fallback;
@@ -138,6 +144,26 @@
       }
     }
     return containers;
+  }
+
+  function collectTextNodesFromRoot(root, output) {
+    if (!root || !root.createTreeWalker) {
+      return;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      output.push(node);
+      node = walker.nextNode();
+    }
+  }
+
+  function getDeepTextNodes() {
+    const nodes = [];
+    for (const root of getSearchRoots()) {
+      collectTextNodesFromRoot(root, nodes);
+    }
+    return nodes;
   }
 
   function cleanTranscriptLine(line) {
@@ -214,6 +240,86 @@
       }
     }
     return "";
+  }
+
+  function extractYouTubeTranscriptFromVisibleTextNodes() {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const candidates = [];
+    const skipExact = new Set([
+      "在此视频中",
+      "转写文稿",
+      "内容转文字",
+      "章节",
+      "搜索",
+      "在视频中搜索",
+      "英语",
+      "english"
+    ]);
+
+    for (const textNode of getDeepTextNodes()) {
+      const text = normalizeWhitespace(textNode.textContent || "");
+      if (!text) {
+        continue;
+      }
+      const parent = textNode.parentElement;
+      if (!parent || !isVisibleElement(parent)) {
+        continue;
+      }
+      const rect = parent.getBoundingClientRect();
+      if (!rect.width || !rect.height) {
+        continue;
+      }
+      // Transcript panel is usually on the right side when visible.
+      if (viewportWidth && rect.left < viewportWidth * 0.45) {
+        continue;
+      }
+      const cleaned = cleanTranscriptLine(text);
+      if (!cleaned && !isLikelyTimestamp(text)) {
+        continue;
+      }
+      if (skipExact.has(text.toLowerCase())) {
+        continue;
+      }
+      candidates.push({
+        text,
+        cleaned,
+        isTimestamp: isLikelyTimestamp(text),
+        top: Math.round(rect.top),
+        left: Math.round(rect.left)
+      });
+    }
+
+    if (!candidates.length) {
+      return "";
+    }
+
+    candidates.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+
+    const result = [];
+    let buffer = [];
+
+    const flushBuffer = () => {
+      const merged = normalizeWhitespace(buffer.join(" "));
+      if (merged && result[result.length - 1] !== merged) {
+        result.push(merged);
+      }
+      buffer = [];
+    };
+
+    for (const item of candidates) {
+      if (item.isTimestamp) {
+        flushBuffer();
+        continue;
+      }
+      if (!item.cleaned) {
+        continue;
+      }
+      buffer.push(item.cleaned);
+    }
+    flushBuffer();
+
+    const transcript = normalizeWhitespace(result.join("\n"));
+    return transcript.length >= 40 ? transcript : "";
   }
 
   function extractYouTubeTranscriptFromPanelText() {
