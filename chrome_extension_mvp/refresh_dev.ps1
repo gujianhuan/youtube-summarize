@@ -2,6 +2,8 @@ param(
     [string]$ProjectRoot = "D:\Program Files\Trae\YouTubeSummarizer"
 )
 
+$ProgressPreference = "SilentlyContinue"
+
 $extensionDir = Join-Path $ProjectRoot "chrome_extension_mvp"
 $zipPath = Join-Path $ProjectRoot "chrome_extension_mvp.zip"
 $manifestPath = Join-Path $extensionDir "manifest.json"

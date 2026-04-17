@@ -32,6 +32,9 @@
     const segmentSelectors = [
       "ytd-transcript-segment-renderer .segment-text",
       "ytd-transcript-segment-renderer .cue",
+      "ytd-transcript-segment-renderer yt-formatted-string",
+      "ytd-transcript-search-panel-renderer ytd-transcript-segment-renderer yt-formatted-string",
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] ytd-transcript-segment-renderer yt-formatted-string",
       "[target-id] .segment-text",
       "[target-id] .cue"
     ];
@@ -51,7 +54,60 @@
         break;
       }
     }
+    if (!lines.length) {
+      const fallback = extractYouTubeTranscriptFromPanelText();
+      if (fallback) {
+        return fallback;
+      }
+    }
     return normalizeWhitespace(lines.join("\n"));
+  }
+
+  function isLikelyTimestamp(text) {
+    return /^(\d{1,2}:)?\d{1,2}:\d{2}$/.test(text.trim());
+  }
+
+  function extractYouTubeTranscriptFromPanelText() {
+    const panel = document.querySelector(
+      "ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer[target-id*='transcript'], ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']"
+    );
+    if (!panel) {
+      return "";
+    }
+    const rawLines = normalizeWhitespace(panel.textContent || "")
+      .split("\n")
+      .map((line) => normalizeWhitespace(line))
+      .filter(Boolean);
+
+    const skipFragments = [
+      "在此视频中",
+      "转写文稿",
+      "内容转文字",
+      "chapters",
+      "chapter",
+      "search in video",
+      "在视频中搜索",
+      "搜索",
+      "英语",
+      "english",
+      "show transcript",
+      "open transcript"
+    ];
+
+    const result = [];
+    for (const line of rawLines) {
+      const lower = line.toLowerCase();
+      if (skipFragments.some((fragment) => lower === fragment || lower.includes(fragment))) {
+        continue;
+      }
+      if (isLikelyTimestamp(line)) {
+        continue;
+      }
+      if (result[result.length - 1] !== line) {
+        result.push(line);
+      }
+    }
+    return normalizeWhitespace(result.join("\n"));
   }
 
   function decodeHtmlEntities(text) {
@@ -147,7 +203,7 @@
   }
 
   function hasPotentialTranscriptButton() {
-    const patterns = ["show transcript", "open transcript", "transcript", "显示文字稿", "显示转录稿", "转录稿", "文字稿"];
+    const patterns = ["show transcript", "open transcript", "transcript", "显示文字稿", "显示转录稿", "转录稿", "文字稿", "转写文稿", "内容转文字"];
     return Boolean(findClickableByText(patterns));
   }
 
@@ -319,7 +375,9 @@
       "显示文字稿",
       "显示转录稿",
       "转录稿",
-      "文字稿"
+      "文字稿",
+      "转写文稿",
+      "内容转文字"
     ]);
     if (await clickNode(directTranscriptButton)) {
       for (let i = 0; i < 5; i += 1) {
@@ -338,7 +396,9 @@
         "显示文字稿",
         "显示转录稿",
         "转录稿",
-        "文字稿"
+        "文字稿",
+        "转写文稿",
+        "内容转文字"
       ]);
       if (await clickNode(menuTranscriptButton)) {
         for (let i = 0; i < 6; i += 1) {
@@ -346,6 +406,22 @@
           if (extractYouTubeTranscript()) {
             return { ok: true, autoOpened: true };
           }
+        }
+      }
+    }
+
+    const transcriptTabButton = findClickableByText([
+      "transcript",
+      "转写文稿",
+      "内容转文字",
+      "文字稿",
+      "转录稿"
+    ]);
+    if (await clickNode(transcriptTabButton)) {
+      for (let i = 0; i < 6; i += 1) {
+        await sleep(700);
+        if (extractYouTubeTranscript()) {
+          return { ok: true, autoOpened: true };
         }
       }
     }
