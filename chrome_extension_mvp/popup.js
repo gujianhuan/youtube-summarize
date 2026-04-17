@@ -189,6 +189,42 @@ openBtn.addEventListener("click", async () => {
             );
           }
 
+          function findFieldNearLabel(labelTexts, selector) {
+            const labels = Array.from(document.querySelectorAll("label, p, div, span")).filter(isVisibleElement);
+            const lowered = labelTexts.map((text) => text.toLowerCase());
+            for (const label of labels) {
+              const labelText = (label.textContent || "").trim().toLowerCase();
+              if (!labelText) {
+                continue;
+              }
+              if (!lowered.some((text) => labelText.includes(text))) {
+                continue;
+              }
+
+              let container = label.parentElement;
+              for (let depth = 0; depth < 4 && container; depth += 1) {
+                const field = Array.from(container.querySelectorAll(selector)).find(isVisibleElement);
+                if (field) {
+                  return field;
+                }
+                container = container.parentElement;
+              }
+
+              let sibling = label.nextElementSibling;
+              while (sibling) {
+                if (sibling.matches && sibling.matches(selector) && isVisibleElement(sibling)) {
+                  return sibling;
+                }
+                const field = sibling.querySelector ? Array.from(sibling.querySelectorAll(selector)).find(isVisibleElement) : null;
+                if (field) {
+                  return field;
+                }
+                sibling = sibling.nextElementSibling;
+              }
+            }
+            return null;
+          }
+
           async function run() {
             for (let i = 0; i < 20; i += 1) {
               const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'))
@@ -205,9 +241,14 @@ openBtn.addEventListener("click", async () => {
             let lastDebug = "";
             for (let attempt = 0; attempt < 24; attempt += 1) {
               const textareas = Array.from(document.querySelectorAll("textarea")).filter(isVisibleElement);
-              const transcriptArea = textareas.find(matchesTranscriptArea) || textareas[textareas.length - 1];
+              const transcriptArea =
+                findFieldNearLabel(["粘贴 transcript", "字幕文本"], "textarea") ||
+                textareas.find(matchesTranscriptArea) ||
+                textareas[textareas.length - 1];
               const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisibleElement);
-              const sourceInput = textInputs.find(matchesSourceInput);
+              const sourceInput =
+                findFieldNearLabel(["来源链接"], 'input[type="text"], input:not([type])') ||
+                textInputs.find(matchesSourceInput);
 
               lastDebug = `attempt=${attempt}; textareas=${textareas.length}; inputs=${textInputs.length}; transcriptHint=${transcriptArea ? getElementHint(transcriptArea).slice(0, 80) : "none"}; sourceHint=${sourceInput ? getElementHint(sourceInput).slice(0, 80) : "none"}`;
 
