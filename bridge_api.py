@@ -17,20 +17,96 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 BRIDGE_STORE_FILE = Path(
     os.environ.get("BRIDGE_STORE_FILE", str(BASE_DIR / "bridge_store.json"))
 ).resolve()
 BRIDGE_API_HOST = os.environ.get("BRIDGE_API_HOST", "0.0.0.0")
-BRIDGE_API_PORT = int(os.environ.get("BRIDGE_API_PORT", "8765") or "8765")
+BRIDGE_API_PORT = int(os.environ.get("PORT", os.environ.get("BRIDGE_API_PORT", "8765")) or "8765")
 BRIDGE_TTL_SECONDS = int(os.environ.get("BRIDGE_TTL_SECONDS", "900") or "900")
 BRIDGE_MAX_TRANSCRIPT_CHARS = int(
     os.environ.get("BRIDGE_MAX_TRANSCRIPT_CHARS", "250000") or "250000"
 )
 BRIDGE_API_TOKEN = str(os.environ.get("BRIDGE_API_TOKEN", "") or "").strip()
+BRIDGE_STORE_BACKEND = str(os.environ.get("BRIDGE_STORE_BACKEND", "auto") or "auto").strip().lower()
+UPSTASH_REDIS_REST_URL = str(os.environ.get("UPSTASH_REDIS_REST_URL", "") or "").strip().rstrip("/")
+UPSTASH_REDIS_REST_TOKEN = str(os.environ.get("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
 STORE_LOCK = threading.Lock()
+
+
+def _is_upstash_configured() -> bool:
+    """判断 Upstash Redis REST 连接信息是否完整。"""
+    return bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+
+
+def _get_store_backend() -> str:
+    """返回当前实际启用的 bridge 存储后端。"""
+    if BRIDGE_STORE_BACKEND == "upstash" and _is_upstash_configured():
+        return "upstash"
+    if BRIDGE_STORE_BACKEND == "auto" and _is_upstash_configured():
+        return "upstash"
+    return "local_json"
+
+
+def _build_payload_key(payload_id: str) -> str:
+    """生成稳定的 payload key，避免 Redis 中键名冲突。"""
+    return f"bridge:payload:{payload_id}"
+
+
+def _upstash_request(method: str, command_path: str, *, body: str | None = None) -> dict[str, Any]:
+    """调用 Upstash Redis REST API。"""
+    if not _is_upstash_configured():
+        raise RuntimeError("upstash_not_configured")
+
+    headers = {
+        "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+
+    response = requests.request(
+        method=method.upper(),
+        url=f"{UPSTASH_REDIS_REST_URL}{command_path}",
+        headers=headers,
+        data=body.encode("utf-8") if body is not None else None,
+        timeout=10,
+    )
+    payload = response.json()
+    if response.status_code >= 400:
+        raise RuntimeError(str(payload.get("error") or f"upstash_http_{response.status_code}"))
+    return payload if isinstance(payload, dict) else {"result": payload}
+
+
+def _load_payload_from_upstash(payload_id: str) -> dict[str, Any] | None:
+    """从 Upstash 读取 payload。"""
+    key = quote(_build_payload_key(payload_id), safe="")
+    payload = _upstash_request("GET", f"/get/{key}")
+    raw_value = payload.get("result")
+    if not raw_value:
+        return None
+    if isinstance(raw_value, dict):
+        return raw_value
+    try:
+        return json.loads(str(raw_value))
+    except Exception:
+        return None
+
+
+def _delete_payload_from_upstash(payload_id: str) -> None:
+    """从 Upstash 删除 payload。"""
+    key = quote(_build_payload_key(payload_id), safe="")
+    _upstash_request("GET", f"/del/{key}")
+
+
+def _save_payload_to_upstash(payload_id: str, payload: dict[str, Any]) -> None:
+    """将 payload 写入 Upstash，并依赖 Redis TTL 自动过期。"""
+    key = quote(_build_payload_key(payload_id), safe="")
+    body = json.dumps(payload, ensure_ascii=False)
+    _upstash_request("POST", f"/set/{key}/EX/{BRIDGE_TTL_SECONDS}", body=body)
 
 
 def _load_store() -> dict[str, dict[str, Any]]:
@@ -50,6 +126,45 @@ def _save_store(data: dict[str, dict[str, Any]]) -> None:
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _load_payload(payload_id: str) -> dict[str, Any] | None:
+    """按当前配置的存储后端读取 payload。"""
+    backend = _get_store_backend()
+    if backend == "upstash":
+        return _load_payload_from_upstash(payload_id)
+
+    with STORE_LOCK:
+        store = _prune_expired(_load_store())
+        payload = store.get(payload_id)
+        _save_store(store)
+    return payload
+
+
+def _delete_payload(payload_id: str) -> None:
+    """按当前配置的存储后端删除 payload。"""
+    backend = _get_store_backend()
+    if backend == "upstash":
+        _delete_payload_from_upstash(payload_id)
+        return
+
+    with STORE_LOCK:
+        store = _prune_expired(_load_store())
+        store.pop(payload_id, None)
+        _save_store(store)
+
+
+def _save_payload(payload_id: str, payload: dict[str, Any]) -> None:
+    """按当前配置的存储后端写入 payload。"""
+    backend = _get_store_backend()
+    if backend == "upstash":
+        _save_payload_to_upstash(payload_id, payload)
+        return
+
+    with STORE_LOCK:
+        store = _prune_expired(_load_store())
+        store[payload_id] = payload
+        _save_store(store)
 
 
 def _prune_expired(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -103,6 +218,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "transcript-bridge",
+                    "store_backend": _get_store_backend(),
+                    "upstash_configured": _is_upstash_configured(),
                     "ttl_seconds": BRIDGE_TTL_SECONDS,
                     "max_transcript_chars": BRIDGE_MAX_TRANSCRIPT_CHARS,
                 },
@@ -125,12 +242,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "payload_id_required"})
             return
 
-        with STORE_LOCK:
-            store = _prune_expired(_load_store())
-            payload = store.get(payload_id)
+        try:
+            payload = _load_payload(payload_id)
             if consume and payload:
-                store.pop(payload_id, None)
-            _save_store(store)
+                _delete_payload(payload_id)
+        except Exception as exc:
+            _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": f"bridge_read_failed:{type(exc).__name__}"})
+            return
 
         if not payload:
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "payload_not_found"})
@@ -187,10 +305,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "bridgeVersion": int(body.get("bridgeVersion") or 1),
         }
 
-        with STORE_LOCK:
-            store = _prune_expired(_load_store())
-            store[payload_id] = payload
-            _save_store(store)
+        try:
+            _save_payload(payload_id, payload)
+        except Exception as exc:
+            _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": f"bridge_write_failed:{type(exc).__name__}"})
+            return
 
         _json_response(
             self,
