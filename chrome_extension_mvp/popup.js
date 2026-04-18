@@ -6,17 +6,11 @@ const extractBtn = document.getElementById("extractBtn");
 const copyBtn = document.getElementById("copyBtn");
 const openBtn = document.getElementById("openBtn");
 
-const SUMMARIZER_URL = "https://youtube-summarize-0oms.onrender.com/";
-const BRIDGE_API_URL = "https://youtube-summarize-bridge.onrender.com";
-const BRIDGE_API_TOKEN = "";
+const FLOW_STATUS_KEY = "summarizerFlowStatus";
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
   statusEl.style.color = isError ? "#dc2626" : "#4b5563";
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function buildPayloadId() {
@@ -26,61 +20,17 @@ function buildPayloadId() {
   return `bridge_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function buildBridgeUrl(payloadId, sourceUrl) {
-  const url = new URL(SUMMARIZER_URL);
-  if (payloadId) {
-    url.searchParams.set("ext_payload_id", payloadId);
-    url.searchParams.set("ext_autosubmit", "1");
-  }
-  if (sourceUrl) {
-    url.searchParams.set("ext_source_url", sourceUrl);
-  }
-  return url.toString();
-}
-
-/**
- * 将 transcript 发送到独立 bridge API，由主站再按 payload_id 拉取。
- */
-async function uploadBridgePayload(payload) {
-  const headers = {
-    "Content-Type": "application/json"
-  };
-  if (BRIDGE_API_TOKEN) {
-    headers["X-Bridge-Token"] = BRIDGE_API_TOKEN;
-  }
-
-  let response;
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 2500);
+async function loadLastFlowStatus() {
   try {
-    response = await fetch(`${BRIDGE_API_URL}/api/bridge/payload`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-  } catch (error) {
-    const name = String(error?.name || "");
-    if (name === "AbortError") {
-      throw new Error("bridge_api_timeout");
+    const result = await chrome.storage.local.get(FLOW_STATUS_KEY);
+    const status = result?.[FLOW_STATUS_KEY];
+    if (!status?.message) {
+      return;
     }
-    throw new Error(`bridge_api_request_failed:${error?.message || "network_error"}`);
-  } finally {
-    window.clearTimeout(timeoutId);
-  }
-
-  let result = null;
-  try {
-    result = await response.json();
+    setStatus(status.message, Boolean(status.isError));
   } catch (_error) {
-    throw new Error(`bridge_api_invalid_json:http_${response.status}`);
+    // Ignore storage read failures in popup.
   }
-
-  if (!response.ok || !result?.ok) {
-    throw new Error(String(result?.error || `http_${response.status}`));
-  }
-
-  return result;
 }
 
 async function getActiveTab() {
@@ -146,6 +96,18 @@ async function extractTranscript() {
   return response;
 }
 
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.action !== "summarizeFlowStatus") {
+    return;
+  }
+  const payload = message.payload || {};
+  if (payload.message) {
+    setStatus(String(payload.message), Boolean(payload.isError));
+  }
+});
+
+loadLastFlowStatus();
+
 extractBtn.addEventListener("click", extractTranscript);
 
 copyBtn.addEventListener("click", async () => {
@@ -191,18 +153,14 @@ openBtn.addEventListener("click", async () => {
     bridgeVersion: 1
   };
 
-  const targetTab = await chrome.tabs.create({ url: buildBridgeUrl("", sourceUrl) });
-
   try {
-    setStatus("主站已打开，正在后台发送 transcript...");
-    const result = await uploadBridgePayload(payload);
-    const finalPayloadId = String(result?.payload_id || payloadId);
-    if (targetTab.id) {
-      await chrome.tabs.update(targetTab.id, { url: buildBridgeUrl(finalPayloadId, sourceUrl) });
-    }
-    setStatus("已发送 transcript，主站正在自动拉取并开始总结。");
+    setStatus("任务已交给后台，正在打开主站并发送 transcript...");
+    await chrome.runtime.sendMessage({
+      action: "startSummarizeFlow",
+      payload
+    });
   } catch (error) {
     const message = String(error?.message || "");
-    setStatus(`主站已打开并带上来源链接；bridge 上传失败，字幕已复制到剪贴板，可手动粘贴。${message ? ` ${message}` : ""}`, true);
+    setStatus(`后台任务启动失败。${message ? ` ${message}` : ""}`, true);
   }
 });
