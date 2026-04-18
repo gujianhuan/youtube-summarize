@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Extension Bridge Reader</title>
+</head>
+<body>
+  <script>
+    function sendMessageToStreamlitClient(type, data) {
+      window.parent.postMessage(
+        {
+          isStreamlitMessage: true,
+          type: type,
+          ...((data && typeof data === "object") ? data : {})
+        },
+        "*"
+      );
+    }
+
+    function setFrameHeight(height) {
+      sendMessageToStreamlitClient("streamlit:setFrameHeight", { height: height });
+    }
+
+    function setComponentValue(value) {
+      sendMessageToStreamlitClient("streamlit:setComponentValue", { value: value });
+    }
+
+    function markReady() {
+      sendMessageToStreamlitClient("streamlit:componentReady", { apiVersion: 1 });
+      setFrameHeight(0);
+    }
+
+    function parsePayload(rawValue) {
+      if (!rawValue) {
+        return null;
+      }
+      try {
+        return JSON.parse(rawValue);
+      } catch (_error) {
+        return {
+          ok: false,
+          error: "invalid_json"
+        };
+      }
+    }
+
+    function readPayload(storageKey, consume) {
+      const sources = [window.localStorage, window.sessionStorage];
+      for (const store of sources) {
+        try {
+          const rawValue = store.getItem(storageKey);
+          if (!rawValue) {
+            continue;
+          }
+          const parsed = parsePayload(rawValue);
+          if (consume) {
+            store.removeItem(storageKey);
+          }
+          return parsed || null;
+        } catch (error) {
+          return {
+            ok: false,
+            error: String((error && error.message) || error || "storage_read_failed")
+          };
+        }
+      }
+      return null;
+    }
+
+    function watchBridgePayload(args) {
+      const payloadId = String((args && args.payloadId) || "");
+      const storageKeyPrefix = String((args && args.storageKeyPrefix) || "");
+      const consume = Boolean(args && args.consume);
+      const storageKey = storageKeyPrefix + payloadId;
+      const startedAt = Date.now();
+      const timeoutMs = 15000;
+      const intervalMs = 300;
+
+      function tick() {
+        const payload = readPayload(storageKey, consume);
+        if (payload) {
+          setComponentValue(payload);
+          return;
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          setComponentValue(null);
+          return;
+        }
+        window.setTimeout(tick, intervalMs);
+      }
+
+      tick();
+    }
+
+    window.addEventListener("message", (event) => {
+      if (!event || !event.data || event.data.type !== "streamlit:render") {
+        return;
+      }
+      const args = event.data.args || {};
+      watchBridgePayload(args);
+    });
+
+    markReady();
+  </script>
+</body>
+</html>

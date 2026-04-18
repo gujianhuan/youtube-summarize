@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Video Transcript Helper MVP",
-  "version": "0.1.14",
-  "description": "Extract transcript text from YouTube or Bilibili pages and send it to the summarizer site manually.",
+  "version": "0.1.17",
+  "description": "Extract transcript text from YouTube or Bilibili pages and send it to the summarizer site through a bridge flow.",
   "permissions": [
     "activeTab",
     "scripting",

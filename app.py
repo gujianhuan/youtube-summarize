@@ -1,5 +1,6 @@
 
 import streamlit as st
+import streamlit.components.v1 as components
 import threading
 import time
 import traceback
@@ -30,6 +31,7 @@ from core_logic import (
     get_channel_recent_videos,
     search_channels,
     get_remote_worker_status,
+    build_runtime_version_diagnostics,
 )
 
 # --- 常量定义 ---
@@ -38,6 +40,13 @@ SUBSCRIPTIONS_FILE = os.path.join(BASE_DIR, "subscriptions.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 GUESTBOOK_FILE = os.path.join(BASE_DIR, "guestbook.json")
+BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
+BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
+
+extension_bridge_reader = components.declare_component(
+    "extension_bridge_reader",
+    path=BRIDGE_COMPONENT_DIR,
+)
 
 @st.cache_resource
 def _get_shared_lock():
@@ -76,6 +85,26 @@ def load_guestbook():
 
 def save_guestbook(guestbook):
     save_json_file(GUESTBOOK_FILE, guestbook)
+
+def read_extension_bridge_payload(payload_id: str, consume: bool = True) -> dict | None:
+    """从主站同域 bridge storage 读取扩展预先写入的 transcript 载荷。"""
+    if not payload_id:
+        return None
+
+    payload = extension_bridge_reader(
+        payloadId=payload_id,
+        storageKeyPrefix=BRIDGE_STORAGE_PREFIX,
+        consume=consume,
+        height=0,
+        key=f"extension_bridge_{payload_id}",
+        default=None,
+    )
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
 
 
 @st.cache_data(ttl=8, show_spinner=False)
@@ -881,6 +910,16 @@ ext_payload_id = str(query_params.get("ext_payload_id", "") or "").strip()
 ext_source_url = str(query_params.get("ext_source_url", "") or "").strip()
 ext_transcript = str(query_params.get("ext_transcript", "") or "").strip()
 ext_autosubmit = str(query_params.get("ext_autosubmit", "") or "").strip().lower() in {"1", "true", "yes"}
+bridge_payload_waiting = False
+
+if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id and not ext_transcript:
+    bridge_payload = read_extension_bridge_payload(ext_payload_id, consume=True)
+    bridge_transcript = str((bridge_payload or {}).get("transcript") or "").strip() if isinstance(bridge_payload, dict) else ""
+    if bridge_transcript:
+        ext_transcript = bridge_transcript
+        ext_source_url = str(bridge_payload.get("sourceUrl") or ext_source_url).strip()
+    else:
+        bridge_payload_waiting = True
 
 if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id != ext_payload_id:
     st.session_state.manual_source_url = ext_source_url
@@ -896,6 +935,7 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
 # --- 主界面 ---
 st.title("🎬 Video Summarizer")
 st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
+st.caption(f"运行版本诊断：`{build_runtime_version_diagnostics()}`")
 
 # 使用 Tabs 分割功能
 if st.session_state.prefer_paste_tab:
@@ -1420,6 +1460,8 @@ with tab_single:
 # ==========================
 with tab_paste:
     st.info("💡 适合浏览器扩展、第三方 transcript 或你手动复制的字幕文本。这里不负责抓取，只负责基于文本做总结。")
+    if bridge_payload_waiting:
+        st.caption("正在等待浏览器扩展通过 bridge 发送 transcript...")
     manual_source_url = st.text_input(
         "来源链接（可选）",
         key="manual_source_url",

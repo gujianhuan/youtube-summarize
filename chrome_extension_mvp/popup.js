@@ -7,10 +7,127 @@ const copyBtn = document.getElementById("copyBtn");
 const openBtn = document.getElementById("openBtn");
 
 const SUMMARIZER_URL = "https://youtube-summarize-0oms.onrender.com/";
+const BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:";
+const BRIDGE_WRITE_RETRY_COUNT = 25;
+const BRIDGE_WRITE_RETRY_DELAY_MS = 700;
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
   statusEl.style.color = isError ? "#dc2626" : "#4b5563";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function buildPayloadId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `bridge_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function buildBridgeStorageKey(payloadId) {
+  return `${BRIDGE_STORAGE_PREFIX}${payloadId}`;
+}
+
+function buildBridgeUrl(payloadId, sourceUrl) {
+  const url = new URL(SUMMARIZER_URL);
+  url.searchParams.set("ext_payload_id", payloadId);
+  url.searchParams.set("ext_autosubmit", "1");
+  if (sourceUrl) {
+    url.searchParams.set("ext_source_url", sourceUrl);
+  }
+  return url.toString();
+}
+
+/**
+ * 将 transcript 写入主站同域 storage，避免继续依赖脆弱的 DOM 自动填表。
+ */
+async function writeBridgePayload(tabId, payloadId, payload) {
+  if (!tabId) {
+    throw new Error("missing_tab_id");
+  }
+
+  const storageKey = buildBridgeStorageKey(payloadId);
+  const payloadJson = JSON.stringify(payload);
+  let lastError = "";
+
+  for (let attempt = 0; attempt < BRIDGE_WRITE_RETRY_COUNT; attempt += 1) {
+    try {
+      const execResults = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: ({ key, value }) => {
+          try {
+            window.localStorage.setItem(key, value);
+            window.sessionStorage.setItem(key, value);
+            return { ok: true };
+          } catch (error) {
+            return {
+              ok: false,
+              error: String(error?.message || error || "storage_write_failed")
+            };
+          }
+        },
+        args: [{ key: storageKey, value: payloadJson }]
+      });
+      const result = execResults?.[0]?.result;
+      if (result?.ok) {
+        return;
+      }
+      lastError = String(result?.error || "bridge_write_failed");
+    } catch (error) {
+      lastError = String(error?.message || error || "bridge_write_failed");
+    }
+
+    await sleep(BRIDGE_WRITE_RETRY_DELAY_MS);
+  }
+
+  throw new Error(lastError || "bridge_write_failed");
+}
+
+/**
+ * 等待目标页初步可用，降低页面尚未初始化时写 storage 失败的概率。
+ */
+async function waitForBridgeReady(tabId) {
+  if (!tabId) {
+    throw new Error("missing_tab_id");
+  }
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      const execResults = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          try {
+            const readyState = document.readyState;
+            const hasBody = Boolean(document.body);
+            const canUseStorage = typeof window.localStorage !== "undefined" && typeof window.sessionStorage !== "undefined";
+            return {
+              ok: hasBody && canUseStorage && (readyState === "interactive" || readyState === "complete"),
+              readyState,
+              hasBody,
+              canUseStorage
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              error: String(error?.message || error || "bridge_probe_failed")
+            };
+          }
+        }
+      });
+      const result = execResults?.[0]?.result;
+      if (result?.ok) {
+        return;
+      }
+    } catch (_error) {
+      // Continue retrying until the page becomes scriptable.
+    }
+    await sleep(400);
+  }
+
+  throw new Error("bridge_target_not_ready");
 }
 
 async function getActiveTab() {
@@ -111,236 +228,24 @@ openBtn.addEventListener("click", async () => {
     // Clipboard is best-effort fallback.
   }
 
-  setStatus("正在打开主站并尝试自动填入 transcript...");
-  const targetTab = await chrome.tabs.create({ url: SUMMARIZER_URL });
-
-  const injectPayload = async () => {
-    if (!targetTab.id) {
-      return { filled: false, submitted: false, debug: "missing_tab_id" };
-    }
-    try {
-      const execResults = await chrome.scripting.executeScript({
-        target: { tabId: targetTab.id },
-        func: (payload) => {
-          function sleep(ms) {
-            return new Promise((resolve) => window.setTimeout(resolve, ms));
-          }
-
-          function isVisibleElement(node) {
-            if (!node) {
-              return false;
-            }
-            const rect = node.getBoundingClientRect();
-            const style = window.getComputedStyle(node);
-            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-          }
-
-          function getElementHint(node) {
-            if (!node) {
-              return "";
-            }
-            const parts = [
-              node.getAttribute("aria-label") || "",
-              node.getAttribute("placeholder") || "",
-              node.getAttribute("name") || "",
-              node.id || "",
-              node.textContent || ""
-            ];
-            return parts.join(" ").toLowerCase();
-          }
-
-          function setNativeValue(element, value) {
-            const nextValue = String(value || "");
-            const previousValue = String(element.value || "");
-            const proto = element instanceof HTMLTextAreaElement
-              ? HTMLTextAreaElement.prototype
-              : element instanceof HTMLInputElement
-                ? HTMLInputElement.prototype
-                : Object.getPrototypeOf(element);
-            const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
-            element.dispatchEvent(new Event("focus", { bubbles: true }));
-
-            try {
-              if (typeof element.setSelectionRange === "function") {
-                element.setSelectionRange(0, previousValue.length);
-              }
-              if (typeof element.setRangeText === "function") {
-                element.setRangeText(nextValue, 0, previousValue.length, "end");
-              } else if (descriptor && descriptor.set) {
-                descriptor.set.call(element, nextValue);
-              } else {
-                element.value = nextValue;
-              }
-            } catch (_error) {
-              if (descriptor && descriptor.set) {
-                descriptor.set.call(element, nextValue);
-              } else {
-                element.value = nextValue;
-              }
-            }
-
-            const tracker = element._valueTracker;
-            if (tracker && typeof tracker.setValue === "function") {
-              tracker.setValue(previousValue);
-            }
-
-            try {
-              const clipboardData = new DataTransfer();
-              clipboardData.setData("text/plain", nextValue);
-              element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData }));
-            } catch (_error) {
-              // Some environments do not allow constructing ClipboardEvent/DataTransfer.
-            }
-
-            element.dispatchEvent(new InputEvent("input", { bubbles: true, data: nextValue, inputType: "insertFromPaste" }));
-            element.dispatchEvent(new Event("change", { bubbles: true }));
-            element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
-            element.dispatchEvent(new Event("blur", { bubbles: true }));
-          }
-
-          function matchesTranscriptArea(node) {
-            const hint = getElementHint(node);
-            return (
-              hint.includes("transcript") ||
-              hint.includes("字幕文本") ||
-              hint.includes("粘贴") ||
-              hint.includes("把浏览器扩展提取到的字幕文本粘贴到这里")
-            );
-          }
-
-          function matchesSourceInput(node) {
-            const hint = getElementHint(node);
-            return (
-              hint.includes("来源链接") ||
-              hint.includes("youtube") ||
-              hint.includes("bilibili") ||
-              hint.includes("watch?v=") ||
-              hint.includes("/video/bv")
-            );
-          }
-
-          function findFieldNearLabel(labelTexts, selector) {
-            const labels = Array.from(document.querySelectorAll("label, p, div, span")).filter(isVisibleElement);
-            const lowered = labelTexts.map((text) => text.toLowerCase());
-            for (const label of labels) {
-              const labelText = (label.textContent || "").trim().toLowerCase();
-              if (!labelText) {
-                continue;
-              }
-              if (!lowered.some((text) => labelText.includes(text))) {
-                continue;
-              }
-
-              let container = label.parentElement;
-              for (let depth = 0; depth < 4 && container; depth += 1) {
-                const field = Array.from(container.querySelectorAll(selector)).find(isVisibleElement);
-                if (field) {
-                  return field;
-                }
-                container = container.parentElement;
-              }
-
-              let sibling = label.nextElementSibling;
-              while (sibling) {
-                if (sibling.matches && sibling.matches(selector) && isVisibleElement(sibling)) {
-                  return sibling;
-                }
-                const field = sibling.querySelector ? Array.from(sibling.querySelectorAll(selector)).find(isVisibleElement) : null;
-                if (field) {
-                  return field;
-                }
-                sibling = sibling.nextElementSibling;
-              }
-            }
-            return null;
-          }
-
-          async function run() {
-            for (let i = 0; i < 20; i += 1) {
-              const tabButtons = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button, button'))
-                .filter(isVisibleElement);
-              const pasteTab = tabButtons.find((node) => (node.textContent || "").includes("粘贴字幕"));
-              if (pasteTab) {
-                pasteTab.click();
-                await sleep(900);
-                break;
-              }
-              await sleep(500);
-            }
-
-            let lastDebug = "";
-            for (let attempt = 0; attempt < 24; attempt += 1) {
-              const textareas = Array.from(document.querySelectorAll("textarea")).filter(isVisibleElement);
-              const transcriptArea =
-                findFieldNearLabel(["粘贴 transcript", "字幕文本"], "textarea") ||
-                textareas.find(matchesTranscriptArea) ||
-                textareas[textareas.length - 1];
-              const textInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisibleElement);
-              const sourceInput =
-                findFieldNearLabel(["来源链接"], 'input[type="text"], input:not([type])') ||
-                textInputs.find(matchesSourceInput);
-
-              lastDebug = `attempt=${attempt}; textareas=${textareas.length}; inputs=${textInputs.length}; transcriptHint=${transcriptArea ? getElementHint(transcriptArea).slice(0, 80) : "none"}; sourceHint=${sourceInput ? getElementHint(sourceInput).slice(0, 80) : "none"}`;
-
-              if (transcriptArea) {
-                if (sourceInput) {
-                  setNativeValue(sourceInput, payload.sourceUrl || "");
-                }
-                setNativeValue(transcriptArea, payload.transcript || "");
-                await sleep(1200);
-
-                const transcriptLen = (transcriptArea.value || "").trim().length;
-                const sourceLen = sourceInput ? (sourceInput.value || "").trim().length : 0;
-
-                if (transcriptLen < Math.min(20, payload.transcript.length)) {
-                  await sleep(800);
-                  continue;
-                }
-
-                for (let j = 0; j < 10; j += 1) {
-                  const actionButtons = Array.from(document.querySelectorAll("button")).filter(isVisibleElement);
-                  const summaryButton = actionButtons.find((node) => {
-                    const text = (node.textContent || "").trim();
-                    return text.includes("总结字幕文本") || text.includes("总结字幕");
-                  });
-                  if (summaryButton) {
-                    summaryButton.click();
-                    await sleep(1200);
-                    return { filled: true, submitted: true, debug: `${lastDebug}; transcriptLen=${transcriptLen}; sourceLen=${sourceLen}` };
-                  }
-                  await sleep(500);
-                }
-                return { filled: true, submitted: false, debug: `${lastDebug}; transcriptLen=${transcriptLen}; sourceLen=${sourceLen}; no_visible_summary_button` };
-              }
-              await sleep(900);
-            }
-            return { filled: false, submitted: false, debug: lastDebug || "no_visible_fields" };
-          }
-
-          return run();
-        },
-        args: [{ transcript, sourceUrl }]
-      });
-      return execResults?.[0]?.result || { filled: false, submitted: false, debug: "no_exec_result" };
-    } catch (_error) {
-      return { filled: false, submitted: false, debug: "execute_script_failed" };
-    }
+  const payloadId = buildPayloadId();
+  const payload = {
+    payloadId,
+    transcript,
+    sourceUrl,
+    title: titleInput.value.trim(),
+    createdAt: new Date().toISOString(),
+    bridgeVersion: 1
   };
 
-  const listener = async (tabId, changeInfo) => {
-    if (tabId !== targetTab.id || changeInfo.status !== "complete") {
-      return;
-    }
-    chrome.tabs.onUpdated.removeListener(listener);
-    const injected = await injectPayload();
-    if (injected.submitted) {
-      setStatus("已打开主站并触发总结；如果页面没显示，请检查主站是否部署到最新版本。");
-    } else if (injected.filled) {
-      setStatus(`主站已尝试自动填入，但未自动触发总结。字幕也已复制到剪贴板。${injected.debug || ""}`, true);
-    } else {
-      setStatus(`主站已打开，但自动填充失败。字幕已复制到剪贴板，请手动粘贴。${injected.debug || ""}`, true);
-    }
-  };
+  setStatus("正在打开主站并通过 bridge 发送 transcript...");
+  const targetTab = await chrome.tabs.create({ url: buildBridgeUrl(payloadId, sourceUrl) });
 
-  chrome.tabs.onUpdated.addListener(listener);
+  try {
+    await waitForBridgeReady(targetTab.id);
+    await writeBridgePayload(targetTab.id, payloadId, payload);
+    setStatus("已发送到主站 bridge，主站将自动接收并开始总结。");
+  } catch (error) {
+    setStatus(`bridge 发送失败，字幕已复制到剪贴板，可手动粘贴。${error?.message ? ` ${error.message}` : ""}`, true);
+  }
 });

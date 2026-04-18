@@ -20,11 +20,6 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, quote
 
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    DDGS = None
-
 def _configure_ffmpeg_path() -> str | None:
     """跨平台注册 imageio-ffmpeg 提供的二进制，兼容 Windows 和 Linux 部署环境。"""
     try:
@@ -2954,73 +2949,27 @@ def perform_web_search(queries: list[str], proxy: str = None) -> str:
     
     results_text = []
     
-    # 定义生成回退链接的辅助函数
-    def add_fallback_links(q_term):
+    # 事实核查统一收敛为可人工复核的 Google/Bing 新闻检索入口，
+    # 避免第三方聚合搜索在不同部署环境下出现不稳定结果。
+    def add_search_links(q_term: str) -> None:
         try:
             encoded_q = quote(q_term)
             google_url = f"https://www.google.com/search?q={encoded_q}"
             bing_url = f"https://www.bing.com/search?q={encoded_q}"
-            results_text.append(f"### 搜索关键字: {q_term} (自动抓取受限)")
-            results_text.append(f"- [🔍 Google 验证]({google_url})")
-            results_text.append(f"- [🔍 Bing 验证]({bing_url})")
+            google_news_url = f"https://www.google.com/search?tbm=nws&q={encoded_q}"
+            bing_news_url = f"https://www.bing.com/news/search?q={encoded_q}"
+            results_text.append(f"### 搜索关键字: {q_term}")
+            results_text.append(f"- [Google 新闻核查]({google_news_url})")
+            results_text.append(f"- [Google 网页核查]({google_url})")
+            results_text.append(f"- [Bing 新闻核查]({bing_news_url})")
+            results_text.append(f"- [Bing 网页核查]({bing_url})")
             results_text.append("")
         except Exception:
             pass
 
-    # 如果没有安装 DDGS，直接生成回退链接
-    if not DDGS:
-        for q in queries:
-            add_fallback_links(q)
-        return "\n".join(results_text)
+    for q in queries:
+        add_search_links(q)
 
-    try:
-        ddgs = DDGS(proxy=proxy, timeout=10)
-        for q in queries:
-            found_something = False
-            seen_links = set()
-            try:
-                results_text.append(f"### 搜索关键字: {q}")
-
-                news_res = []
-                try:
-                    news_res = ddgs.news(q, max_results=3) or []
-                except Exception as news_err:
-                    print(f"News search failed for {q}: {news_err}")
-
-                text_res = []
-                try:
-                    text_res = ddgs.text(q, max_results=5) or []
-                except Exception as text_err:
-                    print(f"Text search failed for {q}: {text_err}")
-
-                merged_res = list(news_res) + list(text_res)
-                for r in merged_res:
-                    title = (r.get('title', '') or '').strip()
-                    href = (r.get('url') or r.get('href') or '').strip()
-                    body = (r.get('body', '') or '').strip()
-                    if not href or href in seen_links:
-                        continue
-                    seen_links.add(href)
-                    found_something = True
-                    domain = urlparse(href).netloc or "unknown"
-                    results_text.append(f"- [{title}]({href}) ({domain}): {body}")
-
-                if found_something:
-                    results_text.append("")
-            except Exception as e:
-                print(f"Search failed for {q}: {e}")
-            
-            # 如果该关键字没查到结果，生成回退链接
-            if not found_something:
-                add_fallback_links(q)
-
-    except Exception as e:
-        # DDGS 初始化失败（如代理问题），全部回退
-        print(f"DDGS init failed: {e}")
-        results_text.append(f"> ⚠️ 自动搜索服务暂时不可用 ({str(e)})，已为您生成手动验证链接：\n")
-        for q in queries:
-            add_fallback_links(q)
-            
     return "\n".join(results_text)
 
 
@@ -4141,8 +4090,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
 
         # --- Step 1: Analyze & Generate Search Queries ---
         search_context = ""
-        # Only perform search if DDGS is available and content is substantial
-        if DDGS and len(content) > 100:
+        if len(content) > 100:
             try:
                 analysis_prompt = (
                     f"当前日期: {current_date}。\n"
