@@ -50,14 +50,23 @@ async function uploadBridgePayload(payload) {
   }
 
   let response;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 2500);
   try {
     response = await fetch(`${BRIDGE_API_URL}/api/bridge/payload`, {
       method: "POST",
       headers,
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: controller.signal
     });
   } catch (error) {
+    const name = String(error?.name || "");
+    if (name === "AbortError") {
+      throw new Error("bridge_api_timeout");
+    }
     throw new Error(`bridge_api_request_failed:${error?.message || "network_error"}`);
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 
   let result = null;
@@ -182,14 +191,18 @@ openBtn.addEventListener("click", async () => {
     bridgeVersion: 1
   };
 
+  const targetTab = await chrome.tabs.create({ url: buildBridgeUrl("", sourceUrl) });
+
   try {
-    setStatus("正在上传 transcript 到 Bridge API...");
+    setStatus("主站已打开，正在后台发送 transcript...");
     const result = await uploadBridgePayload(payload);
     const finalPayloadId = String(result?.payload_id || payloadId);
-    await chrome.tabs.create({ url: buildBridgeUrl(finalPayloadId, sourceUrl) });
-    setStatus("已上传到 Bridge API，主站将自动拉取并开始总结。");
+    if (targetTab.id) {
+      await chrome.tabs.update(targetTab.id, { url: buildBridgeUrl(finalPayloadId, sourceUrl) });
+    }
+    setStatus("已发送 transcript，主站正在自动拉取并开始总结。");
   } catch (error) {
-    await chrome.tabs.create({ url: buildBridgeUrl("", sourceUrl) });
-    setStatus(`Bridge API 上传失败，已仅打开主站并保留来源链接；字幕已复制到剪贴板，可手动粘贴。${error?.message ? ` ${error.message}` : ""}`, true);
+    const message = String(error?.message || "");
+    setStatus(`主站已打开并带上来源链接；bridge 上传失败，字幕已复制到剪贴板，可手动粘贴。${message ? ` ${message}` : ""}`, true);
   }
 });

@@ -964,6 +964,10 @@ ext_autosubmit = str(query_params.get("ext_autosubmit", "") or "").strip().lower
 bridge_payload_waiting = False
 bridge_payload_error = ""
 
+if ext_source_url and not st.session_state.manual_source_url:
+    st.session_state.manual_source_url = ext_source_url
+    st.session_state.prefer_paste_tab = True
+
 if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id and not ext_transcript:
     bridge_payload, bridge_payload_error = wait_for_extension_bridge_payload(ext_payload_id)
     if not bridge_payload and bridge_payload_error != "payload_not_found":
