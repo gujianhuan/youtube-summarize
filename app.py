@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 import calendar
+import requests
 from datetime import datetime, timedelta, time as dt_time
 from core_logic import (
     get_effective_proxy,
@@ -42,6 +43,8 @@ HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 GUESTBOOK_FILE = os.path.join(BASE_DIR, "guestbook.json")
 BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
+BRIDGE_API_URL = str(os.environ.get("BRIDGE_API_URL", "https://youtube-summarize-bridge.onrender.com") or "").strip().rstrip("/")
+BRIDGE_API_TOKEN = str(os.environ.get("BRIDGE_API_TOKEN", "") or "").strip()
 
 extension_bridge_reader = components.declare_component(
     "extension_bridge_reader",
@@ -105,6 +108,34 @@ def read_extension_bridge_payload(payload_id: str, consume: bool = True) -> dict
         except Exception:
             return None
     return payload if isinstance(payload, dict) else None
+
+
+def fetch_extension_bridge_payload(payload_id: str, consume: bool = True) -> tuple[dict | None, str]:
+    """优先从独立 bridge API 拉取 payload，失败时返回错误原因。"""
+    if not payload_id:
+        return None, "payload_id_required"
+    if not BRIDGE_API_URL:
+        return None, "bridge_api_url_missing"
+
+    try:
+        headers = {}
+        if BRIDGE_API_TOKEN:
+            headers["X-Bridge-Token"] = BRIDGE_API_TOKEN
+        response = requests.get(
+            f"{BRIDGE_API_URL}/api/bridge/payload",
+            params={"payload_id": payload_id, "consume": "1" if consume else "0"},
+            headers=headers,
+            timeout=10,
+        )
+        payload = response.json()
+    except Exception as exc:
+        return None, f"bridge_api_request_failed:{type(exc).__name__}"
+
+    if response.status_code != 200 or not isinstance(payload, dict) or not payload.get("ok"):
+        return None, str((payload or {}).get("error") or f"http_{response.status_code}")
+
+    result = payload.get("payload")
+    return result if isinstance(result, dict) else None, ""
 
 
 @st.cache_data(ttl=8, show_spinner=False)
@@ -911,9 +942,12 @@ ext_source_url = str(query_params.get("ext_source_url", "") or "").strip()
 ext_transcript = str(query_params.get("ext_transcript", "") or "").strip()
 ext_autosubmit = str(query_params.get("ext_autosubmit", "") or "").strip().lower() in {"1", "true", "yes"}
 bridge_payload_waiting = False
+bridge_payload_error = ""
 
 if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id and not ext_transcript:
-    bridge_payload = read_extension_bridge_payload(ext_payload_id, consume=True)
+    bridge_payload, bridge_payload_error = fetch_extension_bridge_payload(ext_payload_id, consume=True)
+    if not bridge_payload:
+        bridge_payload = read_extension_bridge_payload(ext_payload_id, consume=True)
     bridge_transcript = str((bridge_payload or {}).get("transcript") or "").strip() if isinstance(bridge_payload, dict) else ""
     if bridge_transcript:
         ext_transcript = bridge_transcript
@@ -1462,6 +1496,8 @@ with tab_paste:
     st.info("💡 适合浏览器扩展、第三方 transcript 或你手动复制的字幕文本。这里不负责抓取，只负责基于文本做总结。")
     if bridge_payload_waiting:
         st.caption("正在等待浏览器扩展通过 bridge 发送 transcript...")
+        if bridge_payload_error:
+            st.caption(f"bridge 诊断：`{bridge_payload_error}`")
     manual_source_url = st.text_input(
         "来源链接（可选）",
         key="manual_source_url",

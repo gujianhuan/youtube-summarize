@@ -7,9 +7,8 @@ const copyBtn = document.getElementById("copyBtn");
 const openBtn = document.getElementById("openBtn");
 
 const SUMMARIZER_URL = "https://youtube-summarize-0oms.onrender.com/";
-const BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:";
-const BRIDGE_WRITE_RETRY_COUNT = 25;
-const BRIDGE_WRITE_RETRY_DELAY_MS = 700;
+const BRIDGE_API_URL = "https://youtube-summarize-bridge.onrender.com";
+const BRIDGE_API_TOKEN = "";
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
@@ -27,10 +26,6 @@ function buildPayloadId() {
   return `bridge_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function buildBridgeStorageKey(payloadId) {
-  return `${BRIDGE_STORAGE_PREFIX}${payloadId}`;
-}
-
 function buildBridgeUrl(payloadId, sourceUrl) {
   const url = new URL(SUMMARIZER_URL);
   url.searchParams.set("ext_payload_id", payloadId);
@@ -42,92 +37,39 @@ function buildBridgeUrl(payloadId, sourceUrl) {
 }
 
 /**
- * 将 transcript 写入主站同域 storage，避免继续依赖脆弱的 DOM 自动填表。
+ * 将 transcript 发送到独立 bridge API，由主站再按 payload_id 拉取。
  */
-async function writeBridgePayload(tabId, payloadId, payload) {
-  if (!tabId) {
-    throw new Error("missing_tab_id");
+async function uploadBridgePayload(payload) {
+  const headers = {
+    "Content-Type": "application/json"
+  };
+  if (BRIDGE_API_TOKEN) {
+    headers["X-Bridge-Token"] = BRIDGE_API_TOKEN;
   }
 
-  const storageKey = buildBridgeStorageKey(payloadId);
-  const payloadJson = JSON.stringify(payload);
-  let lastError = "";
-
-  for (let attempt = 0; attempt < BRIDGE_WRITE_RETRY_COUNT; attempt += 1) {
-    try {
-      const execResults = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: ({ key, value }) => {
-          try {
-            window.localStorage.setItem(key, value);
-            window.sessionStorage.setItem(key, value);
-            return { ok: true };
-          } catch (error) {
-            return {
-              ok: false,
-              error: String(error?.message || error || "storage_write_failed")
-            };
-          }
-        },
-        args: [{ key: storageKey, value: payloadJson }]
-      });
-      const result = execResults?.[0]?.result;
-      if (result?.ok) {
-        return;
-      }
-      lastError = String(result?.error || "bridge_write_failed");
-    } catch (error) {
-      lastError = String(error?.message || error || "bridge_write_failed");
-    }
-
-    await sleep(BRIDGE_WRITE_RETRY_DELAY_MS);
+  let response;
+  try {
+    response = await fetch(`${BRIDGE_API_URL}/api/bridge/payload`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    throw new Error(`bridge_api_request_failed:${error?.message || "network_error"}`);
   }
 
-  throw new Error(lastError || "bridge_write_failed");
-}
-
-/**
- * 等待目标页初步可用，降低页面尚未初始化时写 storage 失败的概率。
- */
-async function waitForBridgeReady(tabId) {
-  if (!tabId) {
-    throw new Error("missing_tab_id");
+  let result = null;
+  try {
+    result = await response.json();
+  } catch (_error) {
+    throw new Error(`bridge_api_invalid_json:http_${response.status}`);
   }
 
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    try {
-      const execResults = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          try {
-            const readyState = document.readyState;
-            const hasBody = Boolean(document.body);
-            const canUseStorage = typeof window.localStorage !== "undefined" && typeof window.sessionStorage !== "undefined";
-            return {
-              ok: hasBody && canUseStorage && (readyState === "interactive" || readyState === "complete"),
-              readyState,
-              hasBody,
-              canUseStorage
-            };
-          } catch (error) {
-            return {
-              ok: false,
-              error: String(error?.message || error || "bridge_probe_failed")
-            };
-          }
-        }
-      });
-      const result = execResults?.[0]?.result;
-      if (result?.ok) {
-        return;
-      }
-    } catch (_error) {
-      // Continue retrying until the page becomes scriptable.
-    }
-    await sleep(400);
+  if (!response.ok || !result?.ok) {
+    throw new Error(String(result?.error || `http_${response.status}`));
   }
 
-  throw new Error("bridge_target_not_ready");
+  return result;
 }
 
 async function getActiveTab() {
@@ -238,14 +180,14 @@ openBtn.addEventListener("click", async () => {
     bridgeVersion: 1
   };
 
-  setStatus("正在打开主站并通过 bridge 发送 transcript...");
-  const targetTab = await chrome.tabs.create({ url: buildBridgeUrl(payloadId, sourceUrl) });
-
   try {
-    await waitForBridgeReady(targetTab.id);
-    await writeBridgePayload(targetTab.id, payloadId, payload);
-    setStatus("已发送到主站 bridge，主站将自动接收并开始总结。");
+    setStatus("正在上传 transcript 到 Bridge API...");
+    const result = await uploadBridgePayload(payload);
+    const finalPayloadId = String(result?.payload_id || payloadId);
+    await chrome.tabs.create({ url: buildBridgeUrl(finalPayloadId, sourceUrl) });
+    setStatus("已上传到 Bridge API，主站将自动拉取并开始总结。");
   } catch (error) {
-    setStatus(`bridge 发送失败，字幕已复制到剪贴板，可手动粘贴。${error?.message ? ` ${error.message}` : ""}`, true);
+    await chrome.tabs.create({ url: buildBridgeUrl(payloadId, sourceUrl) });
+    setStatus(`Bridge API 上传失败，字幕已复制到剪贴板，可手动粘贴。${error?.message ? ` ${error.message}` : ""}`, true);
   }
 });
