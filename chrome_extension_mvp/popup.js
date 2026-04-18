@@ -28,8 +28,10 @@ function buildPayloadId() {
 
 function buildBridgeUrl(payloadId, sourceUrl) {
   const url = new URL(SUMMARIZER_URL);
-  url.searchParams.set("ext_payload_id", payloadId);
-  url.searchParams.set("ext_autosubmit", "1");
+  if (payloadId) {
+    url.searchParams.set("ext_payload_id", payloadId);
+    url.searchParams.set("ext_autosubmit", "1");
+  }
   if (sourceUrl) {
     url.searchParams.set("ext_source_url", sourceUrl);
   }
@@ -187,7 +189,7 @@ openBtn.addEventListener("click", async () => {
     await chrome.tabs.create({ url: buildBridgeUrl(finalPayloadId, sourceUrl) });
     setStatus("已上传到 Bridge API，主站将自动拉取并开始总结。");
   } catch (error) {
-    await chrome.tabs.create({ url: buildBridgeUrl(payloadId, sourceUrl) });
-    setStatus(`Bridge API 上传失败，字幕已复制到剪贴板，可手动粘贴。${error?.message ? ` ${error.message}` : ""}`, true);
+    await chrome.tabs.create({ url: buildBridgeUrl("", sourceUrl) });
+    setStatus(`Bridge API 上传失败，已仅打开主站并保留来源链接；字幕已复制到剪贴板，可手动粘贴。${error?.message ? ` ${error.message}` : ""}`, true);
   }
 });

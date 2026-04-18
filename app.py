@@ -125,7 +125,7 @@ def fetch_extension_bridge_payload(payload_id: str, consume: bool = True) -> tup
             f"{BRIDGE_API_URL}/api/bridge/payload",
             params={"payload_id": payload_id, "consume": "1" if consume else "0"},
             headers=headers,
-            timeout=10,
+            timeout=3,
         )
         payload = response.json()
     except Exception as exc:
@@ -136,6 +136,26 @@ def fetch_extension_bridge_payload(payload_id: str, consume: bool = True) -> tup
 
     result = payload.get("payload")
     return result if isinstance(result, dict) else None, ""
+
+
+def wait_for_extension_bridge_payload(payload_id: str) -> tuple[dict | None, str]:
+    """短轮询 bridge API，兼顾 Render 冷启动和上传完成时序。"""
+    last_error = ""
+    for attempt in range(4):
+        consume = attempt == 3
+        payload, error = fetch_extension_bridge_payload(payload_id, consume=consume)
+        bridge_transcript = str((payload or {}).get("transcript") or "").strip() if isinstance(payload, dict) else ""
+        if bridge_transcript:
+            return payload, ""
+
+        last_error = error or last_error
+        # payload_not_found 时多给几次机会，避免扩展刚上传完成前主站抢先查询
+        if error == "payload_not_found" and attempt < 3:
+            time.sleep(0.45)
+            continue
+        break
+
+    return None, last_error
 
 
 @st.cache_data(ttl=8, show_spinner=False)
@@ -945,8 +965,8 @@ bridge_payload_waiting = False
 bridge_payload_error = ""
 
 if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id and not ext_transcript:
-    bridge_payload, bridge_payload_error = fetch_extension_bridge_payload(ext_payload_id, consume=True)
-    if not bridge_payload:
+    bridge_payload, bridge_payload_error = wait_for_extension_bridge_payload(ext_payload_id)
+    if not bridge_payload and bridge_payload_error != "payload_not_found":
         bridge_payload = read_extension_bridge_payload(ext_payload_id, consume=True)
     bridge_transcript = str((bridge_payload or {}).get("transcript") or "").strip() if isinstance(bridge_payload, dict) else ""
     if bridge_transcript:
