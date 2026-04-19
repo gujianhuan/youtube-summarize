@@ -106,7 +106,7 @@ def _save_payload_to_upstash(payload_id: str, payload: dict[str, Any]) -> None:
     """将 payload 写入 Upstash，并依赖 Redis TTL 自动过期。"""
     key = quote(_build_payload_key(payload_id), safe="")
     body = json.dumps(payload, ensure_ascii=False)
-    _upstash_request("POST", f"/set/{key}/EX/{BRIDGE_TTL_SECONDS}", body=body)
+    _upstash_request("POST", f"/set/{key}?EX={BRIDGE_TTL_SECONDS}", body=body)
 
 
 def _load_store() -> dict[str, dict[str, Any]]:
@@ -247,7 +247,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if consume and payload:
                 _delete_payload(payload_id)
         except Exception as exc:
-            _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": f"bridge_read_failed:{type(exc).__name__}"})
+            _json_response(
+                self,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": f"bridge_read_failed:{type(exc).__name__}:{str(exc) or 'unknown'}"},
+            )
             return
 
         if not payload:
@@ -308,7 +312,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             _save_payload(payload_id, payload)
         except Exception as exc:
-            _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": f"bridge_write_failed:{type(exc).__name__}"})
+            _json_response(
+                self,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": f"bridge_write_failed:{type(exc).__name__}:{str(exc) or 'unknown'}"},
+            )
             return
 
         _json_response(
