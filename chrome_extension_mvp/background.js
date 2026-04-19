@@ -2,6 +2,9 @@ const SUMMARIZER_URL = "https://youtube-summarize-0oms.onrender.com/";
 const BRIDGE_API_URL = "https://youtube-summarize-bridge.onrender.com";
 const BRIDGE_API_TOKEN = "";
 const FLOW_STATUS_KEY = "summarizerFlowStatus";
+const BRIDGE_HEALTH_TIMEOUT_MS = 15000;
+const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
+const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 
 function buildBridgeUrl(payloadId, sourceUrl) {
   const url = new URL(SUMMARIZER_URL);
@@ -30,7 +33,40 @@ async function setFlowStatus(message, isError = false, stage = "info") {
   }
 }
 
-async function uploadBridgePayload(payload) {
+function sleep(ms) {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+  }
+}
+
+async function wakeBridgeApi() {
+  try {
+    const response = await fetchWithTimeout(
+      `${BRIDGE_API_URL}/health`,
+      {
+        method: "GET",
+        cache: "no-store"
+      },
+      BRIDGE_HEALTH_TIMEOUT_MS
+    );
+    return response.ok;
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function uploadBridgePayloadOnce(payload) {
   const headers = {
     "Content-Type": "application/json"
   };
@@ -38,25 +74,25 @@ async function uploadBridgePayload(payload) {
     headers["X-Bridge-Token"] = BRIDGE_API_TOKEN;
   }
 
-  const controller = new AbortController();
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), 8000);
   let response;
 
   try {
-    response = await fetch(`${BRIDGE_API_URL}/api/bridge/payload`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
+    response = await fetchWithTimeout(
+      `${BRIDGE_API_URL}/api/bridge/payload`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        cache: "no-store"
+      },
+      BRIDGE_UPLOAD_TIMEOUT_MS
+    );
   } catch (error) {
     const name = String(error?.name || "");
     if (name === "AbortError") {
       throw new Error("bridge_api_timeout");
     }
     throw new Error(`bridge_api_request_failed:${error?.message || "network_error"}`);
-  } finally {
-    globalThis.clearTimeout(timeoutId);
   }
 
   let result = null;
@@ -73,13 +109,41 @@ async function uploadBridgePayload(payload) {
   return result;
 }
 
+async function uploadBridgePayload(payload) {
+  const errors = [];
+
+  await setFlowStatus("正在唤醒 bridge 服务...", false, "warming");
+  await wakeBridgeApi();
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      if (attempt > 0) {
+        await setFlowStatus("bridge 首次上传超时，正在自动重试...", false, "retrying");
+      } else {
+        await setFlowStatus("主站已打开，正在上传 transcript...", false, "uploading");
+      }
+      return await uploadBridgePayloadOnce(payload);
+    } catch (error) {
+      const message = String(error?.message || "");
+      errors.push(message);
+      const retryable = message === "bridge_api_timeout" || message.startsWith("bridge_api_request_failed:");
+      if (!retryable || attempt >= 1) {
+        throw new Error(errors.join(" | "));
+      }
+      await sleep(BRIDGE_UPLOAD_RETRY_DELAY_MS);
+      await wakeBridgeApi();
+    }
+  }
+
+  throw new Error(errors.join(" | ") || "bridge_api_upload_failed");
+}
+
 async function startSummarizeFlow(payload) {
   const sourceUrl = String(payload?.sourceUrl || "");
   await setFlowStatus("正在打开主站...", false, "opening");
   const targetTab = await chrome.tabs.create({ url: buildBridgeUrl("", sourceUrl) });
 
   try {
-    await setFlowStatus("主站已打开，正在上传 transcript...", false, "uploading");
     const result = await uploadBridgePayload(payload);
     const finalPayloadId = String(result?.payload_id || payload?.payloadId || "");
     if (targetTab.id && finalPayloadId) {
