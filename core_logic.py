@@ -2943,32 +2943,195 @@ def fetch_available_models(api_key: str, base_url: str, proxy_url: str = None) -
 
     raise RuntimeError(f"获取模型列表失败: {error_msg}")
 
+AUTHORITATIVE_SOURCE_RULES = [
+    {
+        "label": "乌克兰国防部官网",
+        "url": "https://mod.gov.ua/en",
+        "aliases": ["乌克兰国防部", "ukrainian ministry of defence", "ministry of defence of ukraine", "mod ukraine"],
+    },
+    {
+        "label": "Defense News",
+        "url": "https://www.defensenews.com/",
+        "aliases": ["defense news", "defensenews"],
+    },
+    {
+        "label": "斯洛伐克政府官网",
+        "url": "https://www.vlada.gov.sk/en/",
+        "aliases": ["斯洛伐克政府", "slovak government", "government of slovakia", "government office of the slovak republic"],
+    },
+    {
+        "label": "斯洛伐克国防部官网",
+        "url": "https://www.mosr.sk/mo-sr-en/",
+        "aliases": ["斯洛伐克国防部", "slovak ministry of defense", "ministry of defense of the slovak republic"],
+    },
+    {
+        "label": "塔斯社",
+        "url": "https://tass.com/",
+        "aliases": ["塔斯社", "tass"],
+    },
+    {
+        "label": "美国国务院",
+        "url": "https://www.state.gov/",
+        "aliases": ["美国国务院", "u.s. department of state", "us department of state", "state department"],
+    },
+    {
+        "label": "古巴外交部",
+        "url": "https://cubaminrex.cu/en",
+        "aliases": ["古巴外交部", "cuban ministry of foreign affairs", "ministry of foreign affairs of cuba", "cubaminrex"],
+    },
+    {
+        "label": "匈牙利国家选举办公室",
+        "url": "https://www.valasztas.hu/",
+        "aliases": ["匈牙利国家选举办公室", "hungarian national election office", "national election office hungary", "valasztas"],
+    },
+    {
+        "label": "UKMTO",
+        "url": "https://www.ukmto.org/",
+        "aliases": ["ukmto", "united kingdom maritime trade operations", "英国海事贸易行动中心"],
+    },
+    {
+        "label": "路透社",
+        "url": "https://www.reuters.com/",
+        "aliases": ["路透社", "reuters"],
+    },
+]
+
+
+def _build_search_url(query: str, *, engine: str = "google", news: bool = False) -> str:
+    """构造通用搜索链接，优先返回可人工复核的检索入口。"""
+    encoded_q = quote(query)
+    if engine == "bing":
+        if news:
+            return f"https://www.bing.com/news/search?q={encoded_q}"
+        return f"https://www.bing.com/search?q={encoded_q}"
+    if news:
+        return f"https://www.google.com/search?tbm=nws&q={encoded_q}"
+    return f"https://www.google.com/search?q={encoded_q}"
+
+
+def _find_authoritative_sources(text: str) -> list[dict]:
+    """根据文本中的机构名/媒体名匹配官网与权威媒体站点。"""
+    haystack = str(text or "").lower()
+    if not haystack:
+        return []
+    matched: list[dict] = []
+    seen_urls: set[str] = set()
+    for rule in AUTHORITATIVE_SOURCE_RULES:
+        aliases = [str(alias or "").lower() for alias in rule.get("aliases", [])]
+        if not any(alias and alias in haystack for alias in aliases):
+            continue
+        url = str(rule.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        matched.append(rule)
+    return matched
+
+
+def _extract_year_tokens(text: str) -> list[str]:
+    """提取文本中的年份，用于约束强时效搜索。"""
+    years = re.findall(r"\b(?:19|20)\d{2}\b", str(text or ""))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for year in years:
+        if year in seen:
+            continue
+        seen.add(year)
+        deduped.append(year)
+    return deduped
+
+
+def _prepare_fact_check_queries(claim: str, queries: list[str] | None) -> list[str]:
+    """为事实核查生成更精确的检索词，补充时间与站点限定。"""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add_query(value: str) -> None:
+        query = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not query:
+            return
+        lowered = query.lower()
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        candidates.append(query)
+
+    claim_text = str(claim or "").strip()
+    add_query(claim_text)
+    for item in queries or []:
+        add_query(item)
+
+    years = _extract_year_tokens(" ".join(candidates))
+    authoritative_sources = _find_authoritative_sources(" ".join(candidates))
+
+    for base_query in list(candidates):
+        if re.search(r"(大选|选举|election)", base_query, re.I):
+            add_query(f"{base_query} 官方结果")
+            add_query(f"{base_query} official result")
+        if re.search(r"(声明|通报|公告|会谈|访问|statement|announcement|meeting|visit)", base_query, re.I):
+            add_query(f"{base_query} 官方声明")
+            add_query(f"{base_query} official statement")
+        if re.search(r"(国防部|外交部|政府|minister|ministry|government)", base_query, re.I):
+            add_query(f"{base_query} 官网")
+
+        for year in years[:2]:
+            if year not in base_query:
+                add_query(f"{base_query} {year}")
+
+        for source in authoritative_sources[:3]:
+            source_url = str(source.get("url") or "").strip()
+            domain = urlparse(source_url).netloc
+            if domain:
+                add_query(f"site:{domain} {base_query}")
+
+    return candidates[:8]
+
+
 def perform_web_search(queries: list[str], proxy: str = None) -> str:
     if not queries:
         return ""
-    
+
     results_text = []
-    
+    global_source_links: list[str] = []
+    seen_source_urls: set[str] = set()
+
     # 事实核查统一收敛为可人工复核的 Google/Bing 新闻检索入口，
-    # 避免第三方聚合搜索在不同部署环境下出现不稳定结果。
+    # 同时附上已识别到的官网/权威媒体站点，避免模型只输出模糊机构名。
     def add_search_links(q_term: str) -> None:
         try:
-            encoded_q = quote(q_term)
-            google_url = f"https://www.google.com/search?q={encoded_q}"
-            bing_url = f"https://www.bing.com/search?q={encoded_q}"
-            google_news_url = f"https://www.google.com/search?tbm=nws&q={encoded_q}"
-            bing_news_url = f"https://www.bing.com/news/search?q={encoded_q}"
             results_text.append(f"### 搜索关键字: {q_term}")
-            results_text.append(f"- [Google 新闻核查]({google_news_url})")
-            results_text.append(f"- [Google 网页核查]({google_url})")
-            results_text.append(f"- [Bing 新闻核查]({bing_news_url})")
-            results_text.append(f"- [Bing 网页核查]({bing_url})")
+            results_text.append(f"- [Google 新闻核查]({_build_search_url(q_term, engine='google', news=True)})")
+            results_text.append(f"- [Google 网页核查]({_build_search_url(q_term, engine='google', news=False)})")
+            results_text.append(f"- [Bing 新闻核查]({_build_search_url(q_term, engine='bing', news=True)})")
+            results_text.append(f"- [Bing 网页核查]({_build_search_url(q_term, engine='bing', news=False)})")
+
+            matched_sources = _find_authoritative_sources(q_term)
+            if matched_sources:
+                results_text.append("- 权威站点参考：")
+                for source in matched_sources[:4]:
+                    label = str(source.get("label") or "").strip()
+                    url = str(source.get("url") or "").strip()
+                    if not label or not url:
+                        continue
+                    results_text.append(f"  - [{label}]({url})")
+                    if url not in seen_source_urls:
+                        seen_source_urls.add(url)
+                        global_source_links.append(f"- [{label}]({url})")
+                    domain = urlparse(url).netloc
+                    if domain:
+                        site_query = f"site:{domain} {q_term}"
+                        results_text.append(f"  - [{label} 定向搜索]({_build_search_url(site_query, engine='google', news=True)})")
             results_text.append("")
         except Exception:
             pass
 
     for q in queries:
         add_search_links(q)
+
+    if global_source_links:
+        results_text.append("### 已识别的权威站点")
+        results_text.extend(global_source_links[:8])
+        results_text.append("")
 
     return "\n".join(results_text)
 
@@ -3980,10 +4143,11 @@ def search_claim_sources(claim_items: list[dict], proxy_url: str = None) -> list
         queries = item.get("queries") or []
         if not queries:
             queries = [claim]
-        search_markdown = perform_web_search(queries[:2], proxy=proxy_url)
+        prepared_queries = _prepare_fact_check_queries(claim, queries[:3])
+        search_markdown = perform_web_search(prepared_queries, proxy=proxy_url)
         results.append({
             "claim": claim,
-            "queries": queries[:2],
+            "queries": prepared_queries,
             "search_markdown": search_markdown,
         })
     return results
@@ -4041,6 +4205,7 @@ def fact_check_document_claims(
         "- 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
         "- 判断依据：...\n"
         "- 来源/出处：给出 1-3 个外部来源链接，格式如 [新华社](https://...)\n"
+        "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
         "- 禁止把文档本身当来源。\n"
         "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
         "- 避免使用“手动搜索未发现”“未搜索到”这类空泛表述，改为说明“现有公开候选来源不足以直接支撑该说法”，并保留候选链接。\n"
@@ -4133,7 +4298,8 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                         search_context = (
                             f"\n\n**【实时搜索结果（用于事实核查）】**\n{search_res_str}\n\n"
                             "请优先使用以上搜索结果中的外部来源进行核查。"
-                            "来源/出处必须尽量给出具体 URL 链接，严禁把“视频内容本身”“视频字幕”当作来源。"
+                            "来源/出处必须尽量给出具体 URL 链接；如果提到具体机构或媒体名称，优先附上其官网或栏目页链接。"
+                            "严禁把“视频内容本身”“视频字幕”当作来源。"
                         )
             except Exception as e:
                 print(f"Search step failed: {e}")
@@ -4170,6 +4336,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
             "     - 依据：简要说明为什么这样判断\n"
             "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
+            "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
             "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
             "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
             "   - 如果某条暂时缺乏直接证据，也要明确写出当前候选来源，并说明“现有公开候选来源不足以直接支撑该说法”，不要只写“未发现”。\n\n"
@@ -4192,6 +4359,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "   - 必须逐条列出可核查新闻，不要使用表格。\n"
                 "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`来源/出处`。\n"
                 "   - `来源/出处` 必须尽量给出具体 URL，禁止把视频本身当作来源。\n"
+                "   - 如果提到具体机构、政府部门或媒体名，优先附上其官网或栏目页链接，不要只写机构名称。\n"
                 "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”，并保留候选来源链接。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
