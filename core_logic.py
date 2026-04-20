@@ -3222,6 +3222,20 @@ def _normalize_summary_payload(payload: dict | None) -> dict | None:
     }
 
 
+def _is_placeholder_fact_check(text: str) -> bool:
+    """判断事实核查内容是否仍是空洞占位文案。"""
+    value = str(text or "").strip()
+    if not value:
+        return True
+    placeholder_markers = [
+        "暂未成功生成结构化事实核查结果",
+        "未成功拆出结构化事实核查结果",
+        "AI 未能稳定输出结构化事实核查结果",
+        "模型未返回事实核查结果",
+    ]
+    return any(marker in value for marker in placeholder_markers)
+
+
 def _extract_markdown_links(markdown_text: str) -> list[tuple[str, str]]:
     text = str(markdown_text or "")
     if not text:
@@ -3328,6 +3342,51 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
         updated_sections.append(stripped)
 
     return "\n\n".join(updated_sections)
+
+
+def _build_fact_check_fallback_markdown(
+    *,
+    claim_sources: list[dict] | None = None,
+    search_results_md: str = "",
+) -> str:
+    """在模型未稳定输出时，基于候选来源生成最小可用的事实核查稿。"""
+    sections = [
+        "### 条目1",
+        "- 新闻/声明：本次事实核查未能稳定生成完整逐条结论，以下保留系统整理的候选核查线索。",
+        "- 核查结论：待进一步核查",
+        "- 依据：模型本次未稳定返回结构化核查结果，系统已保留搜索入口和权威站点，方便继续人工复核。",
+    ]
+
+    if claim_sources:
+        rendered_sections: list[str] = []
+        for idx, item in enumerate(claim_sources, start=1):
+            claim = str(item.get("claim") or f"候选声明{idx}").strip()
+            query_list = item.get("queries") or []
+            search_md = str(item.get("search_markdown") or "")
+            links = _extract_markdown_links(search_md)
+            source_text = "；".join(f"[{label}]({url})" for label, url in links[:4]) if links else "当前未提取到可点击来源链接。"
+            search_text = " | ".join(str(query).strip() for query in query_list if str(query).strip()) or "未生成搜索词"
+            rendered_sections.append(
+                "\n".join(
+                    [
+                        f"### 条目{idx}",
+                        f"- 新闻/声明：{claim}",
+                        "- 核查结论：待进一步核查",
+                        f"- 依据：本条为系统兜底生成结果。当前已保留候选搜索词 `{search_text}` 与可人工复核来源，建议结合最新报道继续确认。",
+                        f"- 来源/出处： {source_text}",
+                    ]
+                )
+            )
+        if rendered_sections:
+            return "\n\n".join(rendered_sections)
+
+    search_links = _extract_markdown_links(search_results_md)
+    if search_links:
+        source_text = "；".join(f"[{label}]({url})" for label, url in search_links[:6])
+        sections.append(f"- 来源/出处： {source_text}")
+    else:
+        sections.append("- 来源/出处：当前未提取到可点击来源链接。")
+    return "\n".join(sections)
 
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown", ".pptx"}
@@ -4226,8 +4285,11 @@ def fact_check_document_claims(
     if callable(progress_callback):
         progress_callback(100, "关键声明事实核查完成。")
     if not content:
-        raise RuntimeError("模型未返回事实核查结果。")
-    return _enrich_fact_check_items_with_claim_sources(content, claim_sources)
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
+    final_markdown = _enrich_fact_check_items_with_claim_sources(content, claim_sources)
+    if _is_placeholder_fact_check(final_markdown):
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
+    return final_markdown
 
 def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
     if not text or not text.strip():
@@ -4416,6 +4478,8 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
         if normalized_payload:
             fact_md = normalized_payload.get("fact_check_markdown", "")
+            if _is_placeholder_fact_check(fact_md):
+                fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
             fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
             fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
             normalized_payload["fact_check_markdown"] = fact_md
@@ -4444,6 +4508,8 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
             if normalized_payload:
                 fact_md = normalized_payload.get("fact_check_markdown", "")
+                if _is_placeholder_fact_check(fact_md):
+                    fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
                 fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
                 fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
                 normalized_payload["fact_check_markdown"] = fact_md
@@ -4453,7 +4519,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
 
         return json.dumps({
             "summary_markdown": content_str,
-            "fact_check_markdown": "- AI 未能稳定输出结构化事实核查结果。\n- 请重新尝试生成；系统已尽量修复 JSON，但本次返回仍不完整。"
+            "fact_check_markdown": _build_fact_check_fallback_markdown(search_results_md=search_context),
         }, ensure_ascii=False)
 
     except Exception as e:
