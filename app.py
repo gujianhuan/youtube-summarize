@@ -9,6 +9,8 @@ import os
 import re
 import uuid
 import calendar
+from html import escape
+from urllib.parse import urlparse
 import requests
 from datetime import datetime, timedelta, time as dt_time
 from core_logic import (
@@ -294,6 +296,152 @@ def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _extract_markdown_links(markdown_text: str) -> list[tuple[str, str]]:
+    """提取 Markdown 链接，供来源卡片渲染复用。"""
+    return [
+        (str(label or "").strip(), str(url or "").strip())
+        for label, url in re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", str(markdown_text or ""))
+        if str(label or "").strip() and str(url or "").strip()
+    ]
+
+
+def _split_fact_check_sections(fact_check_md: str) -> list[str]:
+    """按条目拆分事实核查结果，兼容标题块和编号列表两种格式。"""
+    text = str(fact_check_md or "").strip()
+    if not text:
+        return []
+    parts = re.split(
+        r"(?=^(?:###\s*条目\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻)[:：]))",
+        text,
+        flags=re.M,
+    )
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def _classify_source_type(label: str, url: str) -> str:
+    """根据来源名称和域名粗分来源类型，便于卡片展示。"""
+    label_text = str(label or "").lower()
+    domain = urlparse(str(url or "")).netloc.lower()
+    official_tokens = [
+        "gov",
+        "mod.gov",
+        "state.gov",
+        "minrex",
+        "外交部",
+        "国防部",
+        "政府",
+        "官网",
+        "election office",
+        "选举办公室",
+        "official",
+    ]
+    search_tokens = ["google", "bing", "search", "news/search"]
+    if any(token in domain for token in ["google.", "bing."]) or any(token in label_text for token in search_tokens):
+        return "搜索"
+    if any(token in domain for token in ["gov", "state.gov", "mod.gov", "cubaminrex"]) or any(
+        token in label_text for token in official_tokens
+    ):
+        return "官方"
+    return "媒体"
+
+
+def _parse_fact_check_section(section_text: str) -> dict[str, object]:
+    """解析单条事实核查，拆出标题、正文和来源链接。"""
+    section = str(section_text or "").strip()
+    lines = [line.rstrip() for line in section.splitlines()]
+    title = ""
+    conclusion = ""
+    body_lines: list[str] = []
+    source_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not title:
+            claim_match = re.search(r"(?:新闻/声明|关键声明|声明|新闻)[:：]\s*(.+)", stripped)
+            if claim_match:
+                title = claim_match.group(1).strip()
+            elif stripped.startswith("###"):
+                title = stripped.lstrip("#").strip()
+        conclusion_match = re.search(r"核查结论[:：]\s*(.+)", stripped)
+        if conclusion_match and not conclusion:
+            conclusion = conclusion_match.group(1).strip()
+        if re.search(r"来源(?:链接|/出处|出处)?[:：]", stripped):
+            source_lines.append(stripped)
+            continue
+        body_lines.append(line)
+
+    if not title:
+        title = "事实核查"
+
+    source_links = _extract_markdown_links(section)
+    body_markdown = "\n".join(body_lines).strip()
+    source_summary = "\n".join(source_lines).strip()
+    return {
+        "title": title,
+        "conclusion": conclusion,
+        "body_markdown": body_markdown,
+        "source_links": source_links,
+        "source_summary": source_summary,
+    }
+
+
+def _render_source_cards(source_links: list[tuple[str, str]]) -> None:
+    """将来源列表渲染为紧凑卡片。"""
+    if not source_links:
+        st.caption("未提取到可点击来源链接。")
+        return
+
+    cards_html: list[str] = ['<div class="factcheck-source-grid">']
+    for label, url in source_links[:8]:
+        domain = urlparse(url).netloc or url
+        source_type = _classify_source_type(label, url)
+        cards_html.append(
+            (
+                '<div class="factcheck-source-card">'
+                f'<div class="factcheck-source-head"><div class="factcheck-source-name">{escape(label)}</div>'
+                f'<div class="factcheck-source-tag">{escape(source_type)}</div></div>'
+                f'<div class="factcheck-source-domain">{escape(domain)}</div>'
+                f'<a class="factcheck-source-link" href="{escape(url, quote=True)}" target="_blank">查看来源</a>'
+                "</div>"
+            )
+        )
+    cards_html.append("</div>")
+    st.markdown("".join(cards_html), unsafe_allow_html=True)
+
+
+def render_fact_check_content(fact_check_md: str, *, fact_title: str = "🕵️ 事实核查") -> None:
+    """渲染事实核查正文与来源卡片。"""
+    st.info(f"**{fact_title}**")
+    text = str(fact_check_md or "").strip()
+    if not text:
+        st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
+        return
+
+    sections = _split_fact_check_sections(text)
+    if not sections:
+        st.markdown(text)
+        return
+
+    for idx, section in enumerate(sections, start=1):
+        parsed = _parse_fact_check_section(section)
+        with st.container(border=True):
+            title = str(parsed.get("title") or f"条目 {idx}")
+            conclusion = str(parsed.get("conclusion") or "").strip()
+            st.markdown(f"#### {title}")
+            if conclusion:
+                st.caption(f"结论：{conclusion}")
+            body_markdown = str(parsed.get("body_markdown") or "").strip()
+            if body_markdown:
+                st.markdown(body_markdown)
+            st.markdown("##### 来源卡片")
+            _render_source_cards(list(parsed.get("source_links") or []))
+            source_summary = str(parsed.get("source_summary") or "").strip()
+            if source_summary and not parsed.get("source_links"):
+                st.caption(source_summary)
+
+
 def render_summary_fact_check(
     summary_md: str,
     fact_check_md: str,
@@ -307,11 +455,7 @@ def render_summary_fact_check(
     with tab_sum:
         st.markdown(summary_md)
     with tab_check:
-        st.info(f"**{fact_title}**")
-        if fact_check_md:
-            st.markdown(fact_check_md)
-        else:
-            st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
+        render_fact_check_content(fact_check_md, fact_title=fact_title)
 
 def update_settings_partial(patch):
     with _get_shared_lock():
@@ -886,6 +1030,65 @@ st.markdown(
     }
     div[data-testid="stTabs"] button[role="tab"] {
         white-space: normal;
+    }
+    .factcheck-source-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.75rem;
+        margin-top: 0.5rem;
+    }
+    .factcheck-source-card {
+        border: 1px solid #dbe4f0;
+        border-radius: 0.9rem;
+        padding: 0.85rem 0.95rem;
+        background: #fbfdff;
+        min-width: 0;
+    }
+    .factcheck-source-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 0.6rem;
+        margin-bottom: 0.45rem;
+    }
+    .factcheck-source-name {
+        font-weight: 700;
+        color: #1e293b;
+        line-height: 1.4;
+    }
+    .factcheck-source-tag {
+        flex-shrink: 0;
+        font-size: 0.75rem;
+        line-height: 1;
+        padding: 0.32rem 0.55rem;
+        border-radius: 999px;
+        background: #eef4ff;
+        color: #1d4ed8;
+    }
+    .factcheck-source-domain {
+        color: #64748b;
+        font-size: 0.86rem;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+    }
+    .factcheck-source-link {
+        display: inline-block;
+        margin-top: 0.5rem;
+        color: #2563eb;
+        text-decoration: none;
+        font-weight: 600;
+    }
+    .factcheck-source-link:hover {
+        text-decoration: underline;
+    }
+    @media (max-width: 900px) {
+        .block-container {
+            padding-left: 0.85rem;
+            padding-right: 0.85rem;
+        }
+        .factcheck-source-grid {
+            grid-template-columns: 1fr;
+        }
     }
     </style>
     """,
@@ -2264,12 +2467,11 @@ with tab_sub:
                                             
                                             summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
                                             if summary_md:
-                                                # 使用 Tabs 替代分栏，解决拥挤问题
-                                                tab_sum, tab_check = st.tabs(["📝 核心总结", "🕵️ 事实核查"])
-                                                with tab_sum:
-                                                    st.markdown(summary_md)
-                                                with tab_check:
-                                                    st.markdown(fact_check_md or "- 本次未成功拆出结构化事实核查结果。")
+                                                render_summary_fact_check(
+                                                    summary_md,
+                                                    fact_check_md,
+                                                    fact_title="🕵️ 新闻事实核查",
+                                                )
                                             else:
                                                 st.markdown(summary_content)
                                                 
