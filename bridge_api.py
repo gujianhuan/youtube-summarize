@@ -33,9 +33,21 @@ BRIDGE_MAX_TRANSCRIPT_CHARS = int(
 )
 BRIDGE_API_TOKEN = str(os.environ.get("BRIDGE_API_TOKEN", "") or "").strip()
 BRIDGE_STORE_BACKEND = str(os.environ.get("BRIDGE_STORE_BACKEND", "auto") or "auto").strip().lower()
+BRIDGE_UPSTASH_FALLBACK_ENABLED = str(
+    os.environ.get("BRIDGE_UPSTASH_FALLBACK_ENABLED", "1") or "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 UPSTASH_REDIS_REST_URL = str(os.environ.get("UPSTASH_REDIS_REST_URL", "") or "").strip().rstrip("/")
 UPSTASH_REDIS_REST_TOKEN = str(os.environ.get("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
 STORE_LOCK = threading.Lock()
+
+
+def _log(event: str, **kwargs: Any) -> None:
+    """输出结构化桥接日志，便于 Render 上排障。"""
+    detail = " ".join(f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in kwargs.items())
+    if detail:
+        print(f"[bridge_api] {event} {detail}")
+        return
+    print(f"[bridge_api] {event}")
 
 
 def _is_upstash_configured() -> bool:
@@ -68,15 +80,26 @@ def _upstash_request(method: str, command_path: str, *, body: str | None = None)
     if body is not None:
         headers["Content-Type"] = "application/json; charset=utf-8"
 
-    response = requests.request(
-        method=method.upper(),
-        url=f"{UPSTASH_REDIS_REST_URL}{command_path}",
-        headers=headers,
-        data=body.encode("utf-8") if body is not None else None,
-        timeout=10,
-    )
-    payload = response.json()
-    if response.status_code >= 400:
+    try:
+        response = requests.request(
+            method=method.upper(),
+            url=f"{UPSTASH_REDIS_REST_URL}{command_path}",
+            headers=headers,
+            data=body.encode("utf-8") if body is not None else None,
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"upstash_request_error:{type(exc).__name__}:{str(exc) or 'unknown'}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        snippet = (response.text or "").strip().replace("\n", " ")[:300]
+        raise RuntimeError(
+            f"upstash_invalid_json:http_{response.status_code}:{snippet or 'empty_response'}"
+        ) from exc
+
+    if response.status_code >= 400 or payload.get("error"):
         raise RuntimeError(str(payload.get("error") or f"upstash_http_{response.status_code}"))
     return payload if isinstance(payload, dict) else {"result": payload}
 
@@ -128,12 +151,8 @@ def _save_store(data: dict[str, dict[str, Any]]) -> None:
     )
 
 
-def _load_payload(payload_id: str) -> dict[str, Any] | None:
-    """按当前配置的存储后端读取 payload。"""
-    backend = _get_store_backend()
-    if backend == "upstash":
-        return _load_payload_from_upstash(payload_id)
-
+def _load_payload_from_local_json(payload_id: str) -> dict[str, Any] | None:
+    """从本地 JSON 存储读取 payload。"""
     with STORE_LOCK:
         store = _prune_expired(_load_store())
         payload = store.get(payload_id)
@@ -141,30 +160,81 @@ def _load_payload(payload_id: str) -> dict[str, Any] | None:
     return payload
 
 
-def _delete_payload(payload_id: str) -> None:
-    """按当前配置的存储后端删除 payload。"""
-    backend = _get_store_backend()
-    if backend == "upstash":
-        _delete_payload_from_upstash(payload_id)
-        return
-
+def _delete_payload_from_local_json(payload_id: str) -> None:
+    """从本地 JSON 存储删除 payload。"""
     with STORE_LOCK:
         store = _prune_expired(_load_store())
         store.pop(payload_id, None)
         _save_store(store)
 
 
-def _save_payload(payload_id: str, payload: dict[str, Any]) -> None:
-    """按当前配置的存储后端写入 payload。"""
-    backend = _get_store_backend()
-    if backend == "upstash":
-        _save_payload_to_upstash(payload_id, payload)
-        return
-
+def _save_payload_to_local_json(payload_id: str, payload: dict[str, Any]) -> None:
+    """将 payload 写入本地 JSON 存储。"""
     with STORE_LOCK:
         store = _prune_expired(_load_store())
         store[payload_id] = payload
         _save_store(store)
+
+
+def _load_payload(payload_id: str) -> dict[str, Any] | None:
+    """按当前配置的存储后端读取 payload。"""
+    backend = _get_store_backend()
+    if backend == "upstash":
+        try:
+            return _load_payload_from_upstash(payload_id)
+        except Exception as exc:
+            if not BRIDGE_UPSTASH_FALLBACK_ENABLED:
+                raise
+            _log(
+                "upstash_read_failed_fallback_to_local_json",
+                payload_id=payload_id,
+                error=f"{type(exc).__name__}:{str(exc) or 'unknown'}",
+            )
+            return _load_payload_from_local_json(payload_id)
+
+    return _load_payload_from_local_json(payload_id)
+
+
+def _delete_payload(payload_id: str) -> None:
+    """按当前配置的存储后端删除 payload。"""
+    backend = _get_store_backend()
+    if backend == "upstash":
+        try:
+            _delete_payload_from_upstash(payload_id)
+            return
+        except Exception as exc:
+            if not BRIDGE_UPSTASH_FALLBACK_ENABLED:
+                raise
+            _log(
+                "upstash_delete_failed_fallback_to_local_json",
+                payload_id=payload_id,
+                error=f"{type(exc).__name__}:{str(exc) or 'unknown'}",
+            )
+            _delete_payload_from_local_json(payload_id)
+        return
+
+    _delete_payload_from_local_json(payload_id)
+
+
+def _save_payload(payload_id: str, payload: dict[str, Any]) -> None:
+    """按当前配置的存储后端写入 payload。"""
+    backend = _get_store_backend()
+    if backend == "upstash":
+        try:
+            _save_payload_to_upstash(payload_id, payload)
+            return
+        except Exception as exc:
+            if not BRIDGE_UPSTASH_FALLBACK_ENABLED:
+                raise
+            _log(
+                "upstash_write_failed_fallback_to_local_json",
+                payload_id=payload_id,
+                error=f"{type(exc).__name__}:{str(exc) or 'unknown'}",
+            )
+            _save_payload_to_local_json(payload_id, payload)
+        return
+
+    _save_payload_to_local_json(payload_id, payload)
 
 
 def _prune_expired(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -220,6 +290,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "service": "transcript-bridge",
                     "store_backend": _get_store_backend(),
                     "upstash_configured": _is_upstash_configured(),
+                    "upstash_fallback_enabled": BRIDGE_UPSTASH_FALLBACK_ENABLED,
                     "ttl_seconds": BRIDGE_TTL_SECONDS,
                     "max_transcript_chars": BRIDGE_MAX_TRANSCRIPT_CHARS,
                 },

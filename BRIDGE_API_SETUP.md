@@ -47,6 +47,7 @@ python bridge_api.py
 - `BRIDGE_TTL_SECONDS=900`
 - `BRIDGE_MAX_TRANSCRIPT_CHARS=250000`
 - `BRIDGE_API_TOKEN=`
+- `BRIDGE_UPSTASH_FALLBACK_ENABLED=1`
 - `UPSTASH_REDIS_REST_URL=你从 Upstash 复制的 REST URL`
 - `UPSTASH_REDIS_REST_TOKEN=你从 Upstash 复制的 REST TOKEN`
 
@@ -54,6 +55,7 @@ python bridge_api.py
 
 - **不要手动设置 `PORT`**，Render 会自动注入。
 - `BRIDGE_API_TOKEN` 现在可以先留空，先把主链路跑通。
+- `BRIDGE_UPSTASH_FALLBACK_ENABLED=1` 表示 Upstash 临时失败时自动回退到本地 JSON，先保证桥接可用；排障完成后如果你想强制只走 Upstash，再改成 `0`。
 - 如果后面要加安全校验，再把主站和扩展一起切到同一个 token。
 
 ## 第四步：验证 Bridge API 是否启动成功
@@ -71,7 +73,8 @@ GET https://你的-bridge-服务.onrender.com/health
   "ok": true,
   "service": "transcript-bridge",
   "store_backend": "upstash",
-  "upstash_configured": true
+  "upstash_configured": true,
+  "upstash_fallback_enabled": true
 }
 ```
 
