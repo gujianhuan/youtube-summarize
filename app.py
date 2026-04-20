@@ -293,6 +293,26 @@ def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
 
     return "", ""
 
+
+def render_summary_fact_check(
+    summary_md: str,
+    fact_check_md: str,
+    *,
+    fact_title: str = "🕵️ 事实核查",
+    summary_tab_label: str = "📝 核心总结",
+    fact_tab_label: str = "🕵️ 事实核查",
+) -> None:
+    """统一渲染总结与事实核查，避免双栏布局把页面撑宽。"""
+    tab_sum, tab_check = st.tabs([summary_tab_label, fact_tab_label])
+    with tab_sum:
+        st.markdown(summary_md)
+    with tab_check:
+        st.info(f"**{fact_title}**")
+        if fact_check_md:
+            st.markdown(fact_check_md)
+        else:
+            st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
+
 def update_settings_partial(patch):
     with _get_shared_lock():
         settings = load_settings()
@@ -845,6 +865,31 @@ st.set_page_config(
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+        max-width: 1400px;
+    }
+    div[data-testid="stMarkdownContainer"],
+    div[data-testid="stMarkdownContainer"] p,
+    div[data-testid="stMarkdownContainer"] li,
+    div[data-testid="stMarkdownContainer"] a,
+    div[data-testid="stMarkdownContainer"] code {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        white-space: normal;
+    }
+    div[data-testid="stTabs"] button[role="tab"] {
+        white-space: normal;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # --- Session State 初始化 ---
@@ -1458,15 +1503,11 @@ with tab_single:
         summary_content = st.session_state.summary_text
         summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
         if summary_md:
-            col_sum, col_check = st.columns([1.2, 1])
-            with col_sum:
-                st.markdown(summary_md)
-            with col_check:
-                st.info("🕵️ **新闻事实核查**")
-                if fact_check_md:
-                    st.markdown(fact_check_md)
-                else:
-                    st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
+            render_summary_fact_check(
+                summary_md,
+                fact_check_md,
+                fact_title="🕵️ 新闻事实核查",
+            )
         else:
             # 兼容旧的纯文本总结
             st.markdown(summary_content)
@@ -1581,15 +1622,11 @@ with tab_paste:
             st.caption(f"⏱️ AI生成耗时: {manual_dur:.1f}s")
         manual_summary_md, manual_fact_md = _parse_summary_for_ui(st.session_state.manual_summary_text)
         if manual_summary_md:
-            col_sum, col_check = st.columns([1.2, 1])
-            with col_sum:
-                st.markdown(manual_summary_md)
-            with col_check:
-                st.info("🕵️ **新闻事实核查**")
-                if manual_fact_md:
-                    st.markdown(manual_fact_md)
-                else:
-                    st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
+            render_summary_fact_check(
+                manual_summary_md,
+                manual_fact_md,
+                fact_title="🕵️ 新闻事实核查",
+            )
         else:
             st.markdown(st.session_state.manual_summary_text)
         with st.expander("查看粘贴的字幕原文", expanded=False):
@@ -1663,12 +1700,12 @@ with tab_doc:
             st.caption(f"事实核查判定：{'已开启' if should_fact_check else '已跳过'}。{fact_check_reason}")
 
         if fact_check_content:
-            col_doc_sum, col_doc_check = st.columns([1.2, 1])
-            with col_doc_sum:
-                st.markdown(summary_text)
-            with col_doc_check:
-                st.info("🕵️ **关键声明事实核查**")
-                st.markdown(fact_check_content)
+            render_summary_fact_check(
+                summary_text,
+                fact_check_content,
+                fact_title="🕵️ 关键声明事实核查",
+                fact_tab_label="🕵️ 关键声明核查",
+            )
         else:
             st.markdown(summary_text)
             if should_fact_check and recommended_claim_count > 0:
@@ -2470,12 +2507,11 @@ with tab_batch:
                                 summary_content = item.get("summary") or ""
                                 summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
                                 if summary_md:
-                                    col_sum, col_check = st.columns([1.2, 1])
-                                    with col_sum:
-                                        st.markdown(summary_md)
-                                    with col_check:
-                                        st.info("🕵️ **新闻事实核查**")
-                                        st.markdown(fact_check_md or "- 本次未成功拆出结构化事实核查结果。")
+                                    render_summary_fact_check(
+                                        summary_md,
+                                        fact_check_md,
+                                        fact_title="🕵️ 新闻事实核查",
+                                    )
                                 else:
                                     st.markdown(summary_content)
                         else:
@@ -2688,12 +2724,11 @@ with tab_history:
                 summary_content = entry.get("summary_text") or ""
                 summary_md, fact_check_md = _parse_summary_for_ui(summary_content)
                 if summary_md:
-                    h_col1, h_col2 = st.columns([1.2, 1])
-                    with h_col1:
-                        st.markdown(summary_md)
-                    with h_col2:
-                        st.info("🕵️ **新闻事实核查**")
-                        st.markdown(fact_check_md or "- 本次未成功拆出结构化事实核查结果。")
+                    render_summary_fact_check(
+                        summary_md,
+                        fact_check_md,
+                        fact_title="🕵️ 新闻事实核查",
+                    )
                 else:
                     st.markdown(summary_content)
 
