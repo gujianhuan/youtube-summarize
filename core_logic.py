@@ -3114,7 +3114,14 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
     if not claim_sources:
         return fact_text
 
-    sections = re.split(r"(?=^###\s*条目\d+)", _soften_fact_check_wording(fact_text), flags=re.M)
+    # 兼容两种常见输出：
+    # 1. `### 条目1` 这种结构化块
+    # 2. `1. 新闻/声明：...` 这种编号列表
+    sections = re.split(
+        r"(?=^(?:###\s*条目\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻)[:：]))",
+        _soften_fact_check_wording(fact_text),
+        flags=re.M,
+    )
     updated_sections: list[str] = []
     claim_idx = 0
 
@@ -3122,7 +3129,10 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
         stripped = section.strip()
         if not stripped:
             continue
-        if not stripped.startswith("### 条目"):
+        is_structured_item = bool(
+            re.match(r"^(?:###\s*条目\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻)[:：])", stripped)
+        )
+        if not is_structured_item:
             updated_sections.append(stripped)
             continue
 
@@ -3136,15 +3146,17 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
             updated_sections.append(stripped)
             continue
 
-        if re.search(r"-\s*来源/出处：.*\[[^\]]+\]\(https?://", stripped):
+        if re.search(r"\[[^\]]+\]\(https?://", stripped):
             updated_sections.append(stripped)
             continue
 
         source_text = "；".join(f"[{label}]({url})" for label, url in source_links[:3])
-        if "- 来源/出处：" in stripped:
+
+        # 如果模型已经输出了“来源/出处”但没有链接，保留原有文字说明并额外补一行可点击链接。
+        if re.search(r"来源/出处[:：]", stripped):
             stripped = re.sub(
-                r"(-\s*来源/出处：)(.*)",
-                lambda m: f"{m.group(1)} {source_text}",
+                r"(来源/出处[:：][^\n]*)",
+                lambda m: f"{m.group(1)}\n- 来源链接： {source_text}",
                 stripped,
                 count=1,
             )
