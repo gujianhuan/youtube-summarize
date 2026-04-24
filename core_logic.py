@@ -196,6 +196,9 @@ def build_runtime_version_diagnostics() -> str:
 
 def get_remote_worker_status(timeout_seconds: float = 4.0) -> dict:
     """检查远程抓取节点配置、健康状态和 Render ASR 兜底策略。"""
+    remote_enabled = str(
+        os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes"}
     worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
     remote_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
     worker_token = str(os.environ.get("REMOTE_TRANSCRIBE_TOKEN", "") or "").strip()
@@ -205,8 +208,9 @@ def get_remote_worker_status(timeout_seconds: float = 4.0) -> dict:
     ).strip().lower() not in {"0", "false", "no"}
 
     status = {
-        "configured": bool(worker_url),
-        "remote_mode": remote_mode or "disabled",
+        "configured": remote_enabled and bool(worker_url),
+        "remote_enabled": remote_enabled,
+        "remote_mode": remote_mode if remote_enabled else "disabled",
         "worker_url": worker_url,
         "worker_host": "",
         "worker_health_url": "",
@@ -218,6 +222,10 @@ def get_remote_worker_status(timeout_seconds: float = 4.0) -> dict:
         "health_error": "",
         "health_payload": {},
     }
+
+    if not remote_enabled:
+        status["health_error"] = "REMOTE_TRANSCRIBE_ENABLED=0"
+        return status
 
     if not worker_url:
         status["health_error"] = "未配置 REMOTE_TRANSCRIBE_URL"
@@ -260,6 +268,12 @@ def try_fetch_transcript_via_remote_worker(
 
     仅返回 transcript 文本，不负责总结。
     """
+    remote_enabled = str(
+        os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes"}
+    if not remote_enabled:
+        raise RuntimeError("远程抓取节点已禁用（REMOTE_TRANSCRIBE_ENABLED=0）")
+
     worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
     worker_token = str(os.environ.get("REMOTE_TRANSCRIBE_TOKEN", "") or "").strip()
     if not worker_url:
@@ -4548,7 +4562,10 @@ def get_video_transcript(
         status_cb = getattr(api, "_status_callback", None)
         local_fetch_node_mode = bool(str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip())
         remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
-        prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
+        remote_worker_enabled = str(
+            os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes"}
+        prefer_remote_first = remote_worker_enabled and remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
         remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
         remote_worker_summary = "disabled"
         running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
@@ -4660,7 +4677,10 @@ def get_video_transcript(
         and str(os.environ.get("LOCAL_FETCH_SKIP_TRANSCRIPT_API", "1") or "1").strip().lower() not in {"0", "false", "no"}
     )
     remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
-    prefer_remote_first = remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
+    remote_worker_enabled = str(
+        os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes"}
+    prefer_remote_first = remote_worker_enabled and remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
     remote_worker_summary = "disabled"
     try:
         if prefer_remote_first and not str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip():
