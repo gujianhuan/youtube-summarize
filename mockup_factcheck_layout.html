@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>事实核查排版预览</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f7fb;
+        --panel: #ffffff;
+        --muted: #64748b;
+        --text: #1e293b;
+        --border: #dbe4f0;
+        --chip: #eef4ff;
+        --chip-text: #1d4ed8;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      .page {
+        max-width: 1360px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .title {
+        font-size: 28px;
+        font-weight: 700;
+        margin: 0 0 8px;
+      }
+      .desc {
+        margin: 0 0 20px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1.3fr 0.9fr;
+        gap: 20px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 20px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.05);
+      }
+      .panel h2 {
+        margin: 0 0 14px;
+        font-size: 20px;
+      }
+      .summary-list {
+        margin: 0;
+        padding-left: 20px;
+        line-height: 1.8;
+      }
+      .fact-item {
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 16px;
+        margin-bottom: 14px;
+        background: #fcfdff;
+      }
+      .fact-item:last-child { margin-bottom: 0; }
+      .fact-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+      .fact-title {
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.5;
+      }
+      .badge {
+        flex-shrink: 0;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: #fff7ed;
+        color: #c2410c;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .meta {
+        color: var(--muted);
+        line-height: 1.7;
+        margin-bottom: 12px;
+      }
+      .source-cards {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .source-card {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+        background: #fff;
+        min-width: 0;
+      }
+      .source-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+      .source-name {
+        font-weight: 700;
+        min-width: 0;
+      }
+      .source-tag {
+        flex-shrink: 0;
+        font-size: 12px;
+        background: var(--chip);
+        color: var(--chip-text);
+        border-radius: 999px;
+        padding: 4px 8px;
+      }
+      .source-url {
+        color: var(--muted);
+        font-size: 13px;
+        overflow-wrap: anywhere;
+      }
+      .source-link {
+        display: inline-block;
+        margin-top: 8px;
+        color: #2563eb;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      .source-link:hover { text-decoration: underline; }
+      .mobile-preview {
+        max-width: 430px;
+        margin: 0 auto;
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 26px;
+        padding: 14px;
+        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+      }
+      .mobile-section {
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 14px;
+        margin-bottom: 12px;
+      }
+      .mobile-section:last-child { margin-bottom: 0; }
+      .mobile-section h3 {
+        margin: 0 0 10px;
+        font-size: 15px;
+      }
+      .mobile-tabs {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .mobile-tab {
+        flex: 1;
+        text-align: center;
+        padding: 10px 12px;
+        border-radius: 999px;
+        background: #e8eefc;
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .mobile-tab.secondary {
+        background: #f8fafc;
+        color: var(--muted);
+      }
+      .mobile-source-list {
+        display: grid;
+        gap: 8px;
+      }
+      .mobile-source-item {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: #fbfdff;
+      }
+      .mobile-source-item strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+      .mobile-source-item span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      @media (max-width: 1000px) {
+        .grid { grid-template-columns: 1fr; }
+        .source-cards { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <h1 class="title">页面优化方向预览</h1>
+      <p class="desc">左侧展示“事实核查来源紧凑卡片”，右侧展示“窄屏/小窗口自适应”的预期效果。</p>
+      <div class="grid">
+        <section class="panel">
+          <h2>方案 A：来源紧凑卡片</h2>
+          <ol class="summary-list">
+            <li>事实核查条目保留正文与结论。</li>
+            <li>来源不再混在长段落里，单独提成卡片区。</li>
+            <li>每个来源卡片显示来源名、类型、域名、跳转入口。</li>
+          </ol>
+          <div style="height: 16px;"></div>
+          <div class="fact-item">
+            <div class="fact-head">
+              <div class="fact-title">乌克兰国防部计划采购 2.5 万辆无人地面车辆</div>
+              <div class="badge">存疑/待核查</div>
+            </div>
+            <div class="meta">
+              依据：当前公开报道能确认乌军持续推进无人化后勤与无人平台采购，但“2.5 万辆”这一具体数字仍需进一步核实。
+            </div>
+            <div class="source-cards">
+              <div class="source-card">
+                <div class="source-top">
+                  <div class="source-name">乌克兰国防部官网</div>
+                  <div class="source-tag">官方</div>
+                </div>
+                <div class="source-url">mod.gov.ua/en/news</div>
+                <a class="source-link" href="#">查看来源</a>
+              </div>
+              <div class="source-card">
+                <div class="source-top">
+                  <div class="source-name">Defense News</div>
+                  <div class="source-tag">媒体</div>
+                </div>
+                <div class="source-url">defensenews.com</div>
+                <a class="source-link" href="#">查看来源</a>
+              </div>
+              <div class="source-card">
+                <div class="source-top">
+                  <div class="source-name">Google 新闻核查</div>
+                  <div class="source-tag">搜索</div>
+                </div>
+                <div class="source-url">google.com/search?tbm=nws&q=...</div>
+                <a class="source-link" href="#">查看来源</a>
+              </div>
+              <div class="source-card">
+                <div class="source-top">
+                  <div class="source-name">Bing 新闻核查</div>
+                  <div class="source-tag">搜索</div>
+                </div>
+                <div class="source-url">bing.com/news/search?q=...</div>
+                <a class="source-link" href="#">查看来源</a>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>方案 B：窄屏/小窗口自适应</h2>
+          <div class="mobile-preview">
+            <div class="mobile-tabs">
+              <div class="mobile-tab">核心总结</div>
+              <div class="mobile-tab secondary">事实核查</div>
+            </div>
+            <div class="mobile-section">
+              <h3>核心结论</h3>
+              <div class="meta">页面不再左右并排挤压，而是优先纵向阅读，保证手机或窄窗口不用横向拖动。</div>
+            </div>
+            <div class="mobile-section">
+              <h3>来源卡片</h3>
+              <div class="mobile-source-list">
+                <div class="mobile-source-item">
+                  <strong>美国国务院</strong>
+                  <span>state.gov</span>
+                </div>
+                <div class="mobile-source-item">
+                  <strong>古巴外交部</strong>
+                  <span>cubaminrex.cu/en</span>
+                </div>
+                <div class="mobile-source-item">
+                  <strong>塔斯社</strong>
+                  <span>tass.com</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </body>
+  </html>

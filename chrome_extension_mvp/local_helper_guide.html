@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>本地转写助手引导</title>
+    <link rel="stylesheet" href="local_helper_guide.css">
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="hero">
+        <p class="eyebrow">YouTubeSummarizer</p>
+        <h1>本地转写助手引导</h1>
+        <p class="subtext">
+          当前视频没有可直接提取的公开文本时，才需要使用本地转写助手做兜底转写。
+        </p>
+        <div id="contextNotice" class="context-notice context-notice-hidden" aria-live="polite"></div>
+      </header>
+
+      <section class="card">
+        <h2>什么时候需要它</h2>
+        <ul>
+          <li>视频没有公开字幕，也没有可提取的 transcript。</li>
+          <li>扩展已经明确提示“建议使用本地转写助手”。</li>
+          <li>你需要先本地转写，再回主站继续总结。</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>你现在要做什么</h2>
+        <ol>
+          <li>复制当前视频链接。</li>
+          <li>打开本地转写助手。</li>
+          <li>把视频链接粘贴进去。</li>
+          <li>点击开始转写。</li>
+          <li>转写完成后自动回到主站继续总结。</li>
+        </ol>
+      </section>
+
+      <section class="card">
+        <h2>当前视频链接</h2>
+        <textarea id="sourceUrlInput" rows="4" readonly placeholder="这里会显示从扩展带过来的视频链接"></textarea>
+        <p id="sourceUrlHint" class="muted">
+          如果这里没有链接，请回到视频页面后重新点击扩展里的“查看本地工具说明”。
+        </p>
+        <div class="actions">
+          <button id="copySourceUrlBtn">复制视频链接</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>版本选择建议</h2>
+        <ul>
+          <li><strong>在线安装版</strong>：首包更小，首次运行需要联网下载完整运行包。</li>
+          <li><strong>便携瘦身版</strong>：包更大，但适合离线分发和测试。</li>
+          <li><strong>开发命令行版</strong>：只适合开发者调试，不适合普通用户。</li>
+        </ul>
+      </section>
+
+      <section class="card warning">
+        <h2>注意</h2>
+        <ul>
+          <li>如果扩展提示的是“提取失败”，不要急着装本地工具，先重试或手动展开 transcript 面板。</li>
+          <li>本地工具只处理“确实没有可提取文本”的视频，不应该拿来掩盖扩展故障。</li>
+          <li>如果视频需要登录验证，可能还需要读取浏览器 cookies。</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>补充说明</h2>
+        <ul>
+          <li>在线安装版更适合直接发给朋友，首包更小，但第一次运行必须联网。</li>
+          <li>便携瘦身版适合离线分发，但包体更大。</li>
+          <li>如果你只是想继续总结，不需要手动复制 transcript，本地工具完成后会自动回到主站。</li>
+        </ul>
+      </section>
+    </main>
+    <script src="local_helper_guide.js"></script>
+  </body>
+</html>

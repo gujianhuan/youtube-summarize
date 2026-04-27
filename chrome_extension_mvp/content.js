@@ -50,6 +50,23 @@
       .trim();
   }
 
+  function dedupeTranscriptLines(lines) {
+    const result = [];
+    const seen = new Set();
+    for (const rawLine of Array.isArray(lines) ? lines : []) {
+      const line = normalizeWhitespace(rawLine);
+      if (!line) {
+        continue;
+      }
+      if (seen.has(line)) {
+        continue;
+      }
+      seen.add(line);
+      result.push(line);
+    }
+    return result;
+  }
+
   function getTitle() {
     const selectors = [
       "h1.ytd-watch-metadata",
@@ -73,9 +90,7 @@
       "ytd-transcript-segment-renderer .cue",
       "ytd-transcript-segment-renderer yt-formatted-string",
       "ytd-transcript-search-panel-renderer ytd-transcript-segment-renderer yt-formatted-string",
-      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] ytd-transcript-segment-renderer yt-formatted-string",
-      "[target-id] .segment-text",
-      "[target-id] .cue"
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] ytd-transcript-segment-renderer yt-formatted-string"
     ];
     const lines = [];
     for (const selector of segmentSelectors) {
@@ -94,15 +109,15 @@
       }
     }
     if (!lines.length) {
-      const byTimestampBlocks = extractYouTubeTranscriptFromTimestampBlocks();
-      if (byTimestampBlocks) {
-        return byTimestampBlocks;
+      const modernSegments = extractYouTubeTranscriptFromModernSegments();
+      if (modernSegments) {
+        return modernSegments;
       }
     }
     if (!lines.length) {
-      const byVisibleNodes = extractYouTubeTranscriptFromVisibleTextNodes();
-      if (byVisibleNodes) {
-        return byVisibleNodes;
+      const byTimestampBlocks = extractYouTubeTranscriptFromTimestampBlocks();
+      if (byTimestampBlocks) {
+        return byTimestampBlocks;
       }
     }
     if (!lines.length) {
@@ -111,7 +126,7 @@
         return fallback;
       }
     }
-    return normalizeWhitespace(lines.join("\n"));
+    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
   }
 
   function isLikelyTimestamp(text) {
@@ -122,10 +137,7 @@
     const selectors = [
       "ytd-transcript-search-panel-renderer",
       "ytd-engagement-panel-section-list-renderer[target-id*='transcript']",
-      "ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']",
-      "#panels",
-      "#secondary",
-      "#secondary-inner"
+      "ytd-engagement-panel-section-list-renderer[target-id='PAmodern_transcript_view']"
     ];
     const containers = [];
     for (const selector of selectors) {
@@ -192,7 +204,61 @@
     if (isLikelyTimestamp(normalized)) {
       return "";
     }
+    if (
+      /^\d+\s*(seconds?|second|secs?|sec|秒钟|秒)$/.test(lower) ||
+      /^(?:\d+\s*(?:hours?|hour|hrs?|hr|小时)\s*)?(?:\d+\s*(?:minutes?|minute|mins?|min|分钟)\s*)?(?:\d+\s*(?:seconds?|second|secs?|sec|秒钟|秒))$/.test(lower)
+    ) {
+      return "";
+    }
     return normalized;
+  }
+
+  /**
+   * 兼容新版 YouTube transcript 面板。
+   *
+   * 新版页面不会渲染 `ytd-transcript-segment-renderer`，而是使用
+   * `transcript-segment-view-model`。每个节点文本通常形如：
+   * `0:10\n10秒钟\n实际字幕内容`
+   *
+   * 这里会移除前置时间戳/时长提示，只保留真正的字幕正文。
+   *
+   * @returns {string}
+   */
+  function extractYouTubeTranscriptFromModernSegments() {
+    const nodes = querySelectorAllDeep("transcript-segment-view-model");
+    if (!nodes.length) {
+      return "";
+    }
+
+    const lines = [];
+    for (const node of nodes) {
+      if (!isVisibleElement(node)) {
+        continue;
+      }
+
+      const rawLines = normalizeWhitespace(node.innerText || node.textContent || "")
+        .split("\n")
+        .map((line) => normalizeWhitespace(line))
+        .filter(Boolean);
+
+      if (!rawLines.length) {
+        continue;
+      }
+
+      const contentLines = rawLines.filter((line, index) => {
+        if (index === 0 && isLikelyTimestamp(line)) {
+          return false;
+        }
+        return Boolean(cleanTranscriptLine(line));
+      });
+
+      const content = normalizeWhitespace(contentLines.join(" "));
+      if (content) {
+        lines.push(content);
+      }
+    }
+
+    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
   }
 
   function extractYouTubeTranscriptFromTimestampBlocks() {
@@ -242,89 +308,13 @@
     return "";
   }
 
-  function extractYouTubeTranscriptFromVisibleTextNodes() {
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-    const candidates = [];
-    const skipExact = new Set([
-      "在此视频中",
-      "转写文稿",
-      "内容转文字",
-      "章节",
-      "搜索",
-      "在视频中搜索",
-      "英语",
-      "english"
-    ]);
-
-    for (const textNode of getDeepTextNodes()) {
-      const text = normalizeWhitespace(textNode.textContent || "");
-      if (!text) {
-        continue;
-      }
-      const parent = textNode.parentElement;
-      if (!parent || !isVisibleElement(parent)) {
-        continue;
-      }
-      const rect = parent.getBoundingClientRect();
-      if (!rect.width || !rect.height) {
-        continue;
-      }
-      // Transcript panel is usually on the right side when visible.
-      if (viewportWidth && rect.left < viewportWidth * 0.45) {
-        continue;
-      }
-      const cleaned = cleanTranscriptLine(text);
-      if (!cleaned && !isLikelyTimestamp(text)) {
-        continue;
-      }
-      if (skipExact.has(text.toLowerCase())) {
-        continue;
-      }
-      candidates.push({
-        text,
-        cleaned,
-        isTimestamp: isLikelyTimestamp(text),
-        top: Math.round(rect.top),
-        left: Math.round(rect.left)
-      });
-    }
-
-    if (!candidates.length) {
-      return "";
-    }
-
-    candidates.sort((a, b) => (a.top - b.top) || (a.left - b.left));
-
-    const result = [];
-    let buffer = [];
-
-    const flushBuffer = () => {
-      const merged = normalizeWhitespace(buffer.join(" "));
-      if (merged && result[result.length - 1] !== merged) {
-        result.push(merged);
-      }
-      buffer = [];
-    };
-
-    for (const item of candidates) {
-      if (item.isTimestamp) {
-        flushBuffer();
-        continue;
-      }
-      if (!item.cleaned) {
-        continue;
-      }
-      buffer.push(item.cleaned);
-    }
-    flushBuffer();
-
-    const transcript = normalizeWhitespace(result.join("\n"));
-    return transcript.length >= 40 ? transcript : "";
-  }
-
   function extractYouTubeTranscriptFromPanelText() {
     const panel = querySelectorDeep(
-      "ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer[target-id*='transcript'], ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']"
+      [
+        "ytd-transcript-search-panel-renderer",
+        "ytd-engagement-panel-section-list-renderer[target-id*='transcript']",
+        "ytd-engagement-panel-section-list-renderer[target-id='PAmodern_transcript_view']"
+      ].join(", ")
     );
     if (!panel) {
       return "";
@@ -341,7 +331,7 @@
         result.push(cleaned);
       }
     }
-    return normalizeWhitespace(result.join("\n"));
+    return normalizeWhitespace(dedupeTranscriptLines(result).join("\n"));
   }
 
   function decodeHtmlEntities(text) {
@@ -350,7 +340,7 @@
     return textarea.value;
   }
 
-  function extractBalancedJson(source, startIndex) {
+  function extractBalancedBlock(source, startIndex, openChar, closeChar) {
     let depth = 0;
     let inString = false;
     let escaped = false;
@@ -370,9 +360,9 @@
         inString = true;
         continue;
       }
-      if (ch === "{") {
+      if (ch === openChar) {
         depth += 1;
-      } else if (ch === "}") {
+      } else if (ch === closeChar) {
         depth -= 1;
         if (depth === 0) {
           return source.slice(startIndex, i + 1);
@@ -380,6 +370,14 @@
       }
     }
     return "";
+  }
+
+  function extractBalancedJson(source, startIndex) {
+    return extractBalancedBlock(source, startIndex, "{", "}");
+  }
+
+  function extractBalancedJsonArray(source, startIndex) {
+    return extractBalancedBlock(source, startIndex, "[", "]");
   }
 
   function parseJsonObjectAfterMarker(source, marker) {
@@ -402,28 +400,247 @@
     }
   }
 
-  function getYouTubeCaptionTracks() {
-    const scriptNodes = Array.from(document.scripts || []);
+  function extractCaptionTracksFromPlayerResponse(playerResponse) {
+    const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (Array.isArray(tracks) && tracks.length) {
+      return tracks;
+    }
+    return [];
+  }
+
+  function extractCaptionTracksFromSource(source) {
+    if (!source || !source.includes("captionTracks")) {
+      return [];
+    }
+
     const markers = [
       "ytInitialPlayerResponse =",
       "var ytInitialPlayerResponse =",
       "window[\"ytInitialPlayerResponse\"] =",
-      "ytInitialPlayerResponse="
+      "ytInitialPlayerResponse=",
+      "\"ytInitialPlayerResponse\":"
     ];
 
-    for (const scriptNode of scriptNodes) {
-      const source = scriptNode.textContent || "";
-      if (!source || !source.includes("captionTracks")) {
-        continue;
-      }
-      for (const marker of markers) {
-        const playerResponse = parseJsonObjectAfterMarker(source, marker);
-        const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (Array.isArray(tracks) && tracks.length) {
-          return tracks;
-        }
+    for (const marker of markers) {
+      const playerResponse = parseJsonObjectAfterMarker(source, marker);
+      const tracks = extractCaptionTracksFromPlayerResponse(playerResponse);
+      if (tracks.length) {
+        return tracks;
       }
     }
+
+    const captionTrackKeys = ["\"captionTracks\":", "\"captionTracks\" :"];
+    for (const key of captionTrackKeys) {
+      let searchIndex = 0;
+      while (searchIndex < source.length) {
+        const markerIndex = source.indexOf(key, searchIndex);
+        if (markerIndex === -1) {
+          break;
+        }
+        const arrayStart = source.indexOf("[", markerIndex);
+        if (arrayStart === -1) {
+          break;
+        }
+        const rawArray = extractBalancedJsonArray(source, arrayStart);
+        if (!rawArray) {
+          searchIndex = markerIndex + key.length;
+          continue;
+        }
+        try {
+          const tracks = JSON.parse(rawArray);
+          if (Array.isArray(tracks) && tracks.length) {
+            return tracks;
+          }
+        } catch (_error) {
+          // Continue searching next occurrence.
+        }
+        searchIndex = arrayStart + rawArray.length;
+      }
+    }
+
+    return [];
+  }
+
+  async function fetchCurrentPageHtml() {
+    try {
+      const resp = await fetch(location.href, {
+        credentials: "include",
+        cache: "no-store"
+      });
+      if (!resp.ok) {
+        return "";
+      }
+      return await resp.text();
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  /**
+   * 在页面原生上下文中读取 YouTube 的播放器响应。
+   *
+   * Content script 运行在隔离环境里，直接访问 `window.ytInitialPlayerResponse`
+   * 这类页面全局对象并不稳定，所以这里通过注入脚本桥接回真实页面上下文。
+   *
+   * @returns {Promise<Array<object>>}
+   */
+  async function getYouTubeCaptionTracksFromPageContext() {
+    const eventName = `yt_caption_tracks_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+    return new Promise((resolve) => {
+      let settled = false;
+
+      const finalize = (tracks) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.removeEventListener(eventName, handleEvent);
+        resolve(Array.isArray(tracks) ? tracks : []);
+      };
+
+      const handleEvent = (event) => {
+        const detail = event?.detail || {};
+        finalize(detail.tracks);
+      };
+
+      window.addEventListener(eventName, handleEvent, { once: true });
+
+      const script = document.createElement("script");
+      script.textContent = `
+        (() => {
+          const eventName = ${JSON.stringify(eventName)};
+          const emit = (tracks) => {
+            window.dispatchEvent(new CustomEvent(eventName, {
+              detail: { tracks: Array.isArray(tracks) ? tracks : [] }
+            }));
+          };
+          const parseMaybeJson = (value) => {
+            if (!value) {
+              return null;
+            }
+            if (typeof value === "string") {
+              try {
+                return JSON.parse(value);
+              } catch (_error) {
+                return null;
+              }
+            }
+            return value;
+          };
+
+          const normalizeCaptionTracks = (value) => {
+            if (Array.isArray(value)) {
+              return value.filter((track) => track && typeof track === "object");
+            }
+            if (Array.isArray(value?.captionTracks)) {
+              return value.captionTracks.filter((track) => track && typeof track === "object");
+            }
+            if (value && typeof value === "object" && value.baseUrl) {
+              return [value];
+            }
+            return [];
+          };
+
+          const getTracksFromResponse = (response) => {
+            const tracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            return Array.isArray(tracks) ? tracks : [];
+          };
+
+          try {
+            const candidates = [];
+            candidates.push(window.ytInitialPlayerResponse || null);
+            candidates.push(parseMaybeJson(window?.ytplayer?.config?.args?.player_response));
+            candidates.push(parseMaybeJson(window?.ytcfg?.data_?.PLAYER_VARS?.player_response));
+            if (typeof window?.ytcfg?.get === "function") {
+              candidates.push(parseMaybeJson(window.ytcfg.get("PLAYER_VARS")?.player_response));
+              candidates.push(parseMaybeJson(window.ytcfg.get("PLAYER_RESPONSE")));
+            }
+            const moviePlayer = document.getElementById("movie_player");
+            if (moviePlayer && typeof moviePlayer.getPlayerResponse === "function") {
+              candidates.push(moviePlayer.getPlayerResponse());
+            }
+
+            for (const candidate of candidates) {
+              const tracks = getTracksFromResponse(candidate);
+              if (tracks.length) {
+                emit(tracks);
+                return;
+              }
+            }
+
+            if (moviePlayer && typeof moviePlayer.getOption === "function") {
+              const optionCandidates = [
+                moviePlayer.getOption("captions", "tracklist"),
+                moviePlayer.getOption("captions", "playerCaptionsTracklistRenderer"),
+                moviePlayer.getOption("captions", "track")
+              ];
+              for (const candidate of optionCandidates) {
+                const tracks = normalizeCaptionTracks(candidate);
+                if (tracks.length) {
+                  emit(tracks);
+                  return;
+                }
+              }
+            }
+          } catch (_error) {
+            // Ignore bridge read errors and fall back to other strategies.
+          }
+
+          emit([]);
+        })();
+      `;
+
+      const parent = document.documentElement || document.head || document.body;
+      if (!parent) {
+        finalize([]);
+        return;
+      }
+
+      parent.appendChild(script);
+      script.remove();
+      window.setTimeout(() => finalize([]), 1200);
+    });
+  }
+
+  let cachedYouTubeCaptionTracks = null;
+  let cachedYouTubeCaptionTracksUrl = "";
+
+  async function getYouTubeCaptionTracks() {
+    const currentUrl = location.href;
+    if (
+      Array.isArray(cachedYouTubeCaptionTracks) &&
+      cachedYouTubeCaptionTracks.length &&
+      cachedYouTubeCaptionTracksUrl === currentUrl
+    ) {
+      return cachedYouTubeCaptionTracks;
+    }
+
+    const pageContextTracks = await getYouTubeCaptionTracksFromPageContext();
+    if (pageContextTracks.length) {
+      cachedYouTubeCaptionTracks = pageContextTracks;
+      cachedYouTubeCaptionTracksUrl = currentUrl;
+      return pageContextTracks;
+    }
+
+    const scriptNodes = Array.from(document.scripts || []);
+    for (const scriptNode of scriptNodes) {
+      const tracks = extractCaptionTracksFromSource(scriptNode.textContent || "");
+      if (tracks.length) {
+        cachedYouTubeCaptionTracks = tracks;
+        cachedYouTubeCaptionTracksUrl = currentUrl;
+        return tracks;
+      }
+    }
+
+    const htmlSource = await fetchCurrentPageHtml();
+    const htmlTracks = extractCaptionTracksFromSource(htmlSource);
+    if (htmlTracks.length) {
+      cachedYouTubeCaptionTracks = htmlTracks;
+      cachedYouTubeCaptionTracksUrl = currentUrl;
+      return htmlTracks;
+    }
+
     return [];
   }
 
@@ -431,8 +648,9 @@
     return Boolean(
       querySelectorDeep("ytd-transcript-segment-renderer .segment-text") ||
       querySelectorDeep("ytd-transcript-segment-renderer .cue") ||
-      querySelectorDeep("[target-id] .segment-text") ||
-      querySelectorDeep("[target-id] .cue") ||
+      querySelectorDeep("ytd-engagement-panel-section-list-renderer[target-id*='transcript'] .segment-text") ||
+      querySelectorDeep("ytd-engagement-panel-section-list-renderer[target-id*='transcript'] .cue") ||
+      querySelectorDeep("transcript-segment-view-model") ||
       collectVisibleTranscriptContainers().length > 0
     );
   }
@@ -447,10 +665,10 @@
       const parser = new DOMParser();
       const xml = parser.parseFromString(xmlText, "text/xml");
       const textNodes = Array.from(xml.getElementsByTagName("text"));
-      const lines = textNodes
+      const lines = dedupeTranscriptLines(textNodes
         .map((node) => decodeHtmlEntities(node.textContent || ""))
         .map((line) => normalizeWhitespace(line))
-        .filter(Boolean);
+        .filter(Boolean));
       return normalizeWhitespace(lines.join("\n"));
     } catch (_error) {
       return "";
@@ -468,7 +686,7 @@
         lines.push(cleaned);
       }
     }
-    return normalizeWhitespace(lines.join("\n"));
+    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
   }
 
   async function fetchYouTubeCaptionTrack(track) {
@@ -517,23 +735,175 @@
   }
 
   async function extractYouTubeTranscriptFromData() {
-    const tracks = getYouTubeCaptionTracks();
-    if (!tracks.length) {
-      return "";
-    }
-    const sortedTracks = [...tracks].sort((a, b) => {
-      const aPenalty = a?.kind === "asr" ? 1 : 0;
-      const bPenalty = b?.kind === "asr" ? 1 : 0;
-      return aPenalty - bPenalty;
-    });
-    for (const track of sortedTracks) {
-      const transcript = await fetchYouTubeCaptionTrack(track);
-      if (transcript) {
-        return transcript;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const tracks = await getYouTubeCaptionTracks();
+      if (tracks.length) {
+        const sortedTracks = [...tracks].sort((a, b) => {
+          const aPenalty = a?.kind === "asr" ? 1 : 0;
+          const bPenalty = b?.kind === "asr" ? 1 : 0;
+          return aPenalty - bPenalty;
+        });
+        for (const track of sortedTracks) {
+          const transcript = await fetchYouTubeCaptionTrack(track);
+          if (transcript) {
+            return transcript;
+          }
+        }
       }
+      cachedYouTubeCaptionTracks = null;
+      cachedYouTubeCaptionTracksUrl = "";
+      await sleep(600);
     }
     return "";
   }
+
+  function clearYouTubeExtractionCacheIfUrlChanged() {
+    if (cachedYouTubeCaptionTracksUrl && cachedYouTubeCaptionTracksUrl !== location.href) {
+      cachedYouTubeCaptionTracks = null;
+      cachedYouTubeCaptionTracksUrl = "";
+    }
+  }
+
+  function isYouTubeWatchPage() {
+    return location.host.includes("youtube.com") && (location.pathname === "/watch" || location.pathname.startsWith("/live/"));
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (!message || message.action !== "extractTranscript") {
+      return;
+    }
+    clearYouTubeExtractionCacheIfUrlChanged();
+    (async () => {
+      const host = location.host;
+      const title = getTitle();
+      let transcript = "";
+      let platform = "unknown";
+      let helperMessage = "";
+      let detailedError = "";
+      let detection = {
+        hasText: false,
+        sourceType: "none",
+        confidence: 0,
+        reason: "unknown",
+        canFallbackToLocal: false
+      };
+
+      if (host.includes("youtube.com")) {
+        platform = "youtube";
+        const tracks = await getYouTubeCaptionTracks();
+        transcript = await extractYouTubeTranscriptFromData();
+        if (transcript) {
+          helperMessage = "已优先从 YouTube 页面内嵌字幕数据中提取 transcript。";
+          detection = {
+            hasText: true,
+            sourceType: "transcript",
+            confidence: 0.98,
+            reason: "transcript_panel_available",
+            canFallbackToLocal: false
+          };
+        }
+        if (!transcript) {
+          transcript = extractYouTubeTranscript();
+          if (transcript) {
+            detection = {
+              hasText: true,
+              sourceType: "subtitle",
+              confidence: 0.9,
+              reason: "subtitle_panel_available",
+              canFallbackToLocal: false
+            };
+          }
+        }
+        if (!transcript) {
+          const ensureResult = await ensureYouTubeTranscriptVisible();
+          transcript = extractYouTubeTranscript();
+          if (ensureResult.autoOpened) {
+            helperMessage = "已自动尝试展开 YouTube transcript 面板。";
+          }
+          if (transcript) {
+            detection = {
+              hasText: true,
+              sourceType: "subtitle",
+              confidence: 0.85,
+              reason: "subtitle_panel_available",
+              canFallbackToLocal: false
+            };
+          }
+        }
+        if (!transcript && tracks.length === 0 && !hasVisibleYouTubeTranscriptPanel() && !hasPotentialTranscriptButton()) {
+          detailedError = isYouTubeWatchPage()
+            ? "当前视频页未发现可直接读取的 YouTube transcript / captionTracks。请先确认该视频是否真的开放了平台字幕，若页面肉眼可见 transcript 但扩展仍失败，说明是页面结构差异，需要继续补适配。"
+            : "当前页面疑似不是标准 YouTube 视频详情页，暂时无法稳定读取 transcript。";
+          detection = {
+            hasText: false,
+            sourceType: "none",
+            confidence: 1,
+            reason: "no_text_source_found",
+            canFallbackToLocal: true
+          };
+        } else if (!transcript) {
+          detection = {
+            hasText: false,
+            sourceType: "none",
+            confidence: 0.4,
+            reason: "extract_failed",
+            canFallbackToLocal: false
+          };
+        }
+      } else if (host.includes("bilibili.com") || host.includes("b23.tv")) {
+        platform = "bilibili";
+        transcript = extractBilibiliTranscript();
+        detection = transcript
+          ? {
+              hasText: true,
+              sourceType: "subtitle",
+              confidence: 0.8,
+              reason: "subtitle_panel_available",
+              canFallbackToLocal: false
+            }
+          : {
+              hasText: false,
+              sourceType: "none",
+              confidence: 0.5,
+              reason: "extract_failed",
+              canFallbackToLocal: false
+            };
+      } else {
+        detection = {
+          hasText: false,
+          sourceType: "none",
+          confidence: 1,
+          reason: "page_not_supported",
+          canFallbackToLocal: false
+        };
+      }
+
+      if (!transcript) {
+        sendResponse({
+          ok: false,
+          platform,
+          title,
+          url: location.href,
+          transcript: "",
+          helperMessage,
+          error: detailedError || "当前页面未提取到可见字幕。YouTube 已自动尝试展开 transcript 面板；如果仍失败，请手动展开 transcript/字幕面板后再试。",
+          detection
+        });
+        return;
+      }
+
+      sendResponse({
+        ok: true,
+        platform,
+        title,
+        url: location.href,
+        transcript,
+        helperMessage,
+        detection
+      });
+    })();
+    return true;
+  });
 
   function findClickableByText(patterns) {
     const nodes = querySelectorAllDeep('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer');
@@ -692,66 +1062,4 @@
     }
     return normalizeWhitespace(lines.join("\n"));
   }
-
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (!message || message.action !== "extractTranscript") {
-      return;
-    }
-    (async () => {
-      const host = location.host;
-      const title = getTitle();
-      let transcript = "";
-      let platform = "unknown";
-      let helperMessage = "";
-      let detailedError = "";
-
-      if (host.includes("youtube.com")) {
-        platform = "youtube";
-        transcript = extractYouTubeTranscript();
-        const tracks = getYouTubeCaptionTracks();
-        if (!transcript) {
-          transcript = await extractYouTubeTranscriptFromData();
-          if (transcript) {
-            helperMessage = "已从 YouTube 页面内嵌字幕数据中提取 transcript。";
-          }
-        }
-        if (!transcript) {
-          const ensureResult = await ensureYouTubeTranscriptVisible();
-          transcript = extractYouTubeTranscript();
-          if (ensureResult.autoOpened) {
-            helperMessage = "已自动尝试展开 YouTube transcript 面板。";
-          }
-        }
-        if (!transcript && tracks.length === 0 && !hasVisibleYouTubeTranscriptPanel() && !hasPotentialTranscriptButton()) {
-          detailedError = "当前视频疑似没有公开的 YouTube transcript / captionTracks。页面里看到的可能是视频画面内硬字幕，而不是平台可提取字幕。建议改走本地转写兜底。";
-        }
-      } else if (host.includes("bilibili.com") || host.includes("b23.tv")) {
-        platform = "bilibili";
-        transcript = extractBilibiliTranscript();
-      }
-
-      if (!transcript) {
-        sendResponse({
-          ok: false,
-          platform,
-          title,
-          url: location.href,
-          transcript: "",
-          helperMessage,
-          error: detailedError || "当前页面未提取到可见字幕。YouTube 已自动尝试展开 transcript 面板；如果仍失败，请手动展开 transcript/字幕面板后再试。"
-        });
-        return;
-      }
-
-      sendResponse({
-        ok: true,
-        platform,
-        title,
-        url: location.href,
-        transcript,
-        helperMessage
-      });
-    })();
-    return true;
-  });
 })();

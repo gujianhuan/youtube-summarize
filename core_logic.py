@@ -20,8 +20,21 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, quote
 
+from portable_runtime import configure_portable_environment, get_models_dir
+
+
+configure_portable_environment()
+
 def _configure_ffmpeg_path() -> str | None:
     """跨平台注册 imageio-ffmpeg 提供的二进制，兼容 Windows 和 Linux 部署环境。"""
+    bundled_ffmpeg = str(os.environ.get("IMAGEIO_FFMPEG_EXE", "") or "").strip()
+    if bundled_ffmpeg and os.path.exists(bundled_ffmpeg):
+        ffmpeg_dir = os.path.dirname(bundled_ffmpeg)
+        if ffmpeg_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+            print(f"Added bundled ffmpeg to PATH: {ffmpeg_dir}")
+        return bundled_ffmpeg
+
     try:
         import imageio_ffmpeg
 
@@ -1808,7 +1821,7 @@ def transcribe_audio_with_whisper(audio_path: str, model_name: str, language: st
                     # 静默尝试 GPU (float16)
                     # 增加 download_root 参数，确保模型下载到项目目录下，方便管理且避免权限问题
                     # 使用 os.getcwd() 可能会变，建议用固定相对路径 "models"
-                    model_dir = os.path.join(os.getcwd(), "models")
+                    model_dir = str(get_models_dir())
                     os.makedirs(model_dir, exist_ok=True)
                     
                     print(f"Attempting to load on GPU (cuda)... Download root: {model_dir}")
@@ -1844,7 +1857,7 @@ def transcribe_audio_with_whisper(audio_path: str, model_name: str, language: st
                     if status_callback: status_callback(f"❌ GPU failed ({str(e)[:50]}...). Falling back to CPU.")
                     cache[f"{cache_key}_gpu_failed_reason"] = str(e)
                     # 3. 回退到 CPU int8
-                    model_dir = os.path.join(os.getcwd(), "models")
+                    model_dir = str(get_models_dir())
                     model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=model_dir)
                     device = "cpu"
                     compute_type = "int8"
@@ -2031,7 +2044,7 @@ def transcribe_audio_with_whisper(audio_path: str, model_name: str, language: st
                     cache[f"{cache_key}_gpu_failed"] = True
                     cache[f"{cache_key}_gpu_retry_once"] = True
                     cpu_threads = os.cpu_count() or 4
-                    model_dir = os.path.join(os.getcwd(), "models")
+                    model_dir = str(get_models_dir())
                     os.makedirs(model_dir, exist_ok=True)
                     model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads, download_root=model_dir)
                     cache[cache_key] = model

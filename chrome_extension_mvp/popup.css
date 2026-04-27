@@ -27,6 +27,36 @@ h1 {
   margin-bottom: 12px;
 }
 
+.helper-panel {
+  margin-bottom: 12px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  background: #fff7ed;
+}
+
+.helper-panel-hidden {
+  display: none;
+}
+
+.helper-panel h2 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  color: #9a3412;
+}
+
+.helper-desc {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #7c2d12;
+  line-height: 1.5;
+}
+
+.helper-actions {
+  display: flex;
+  gap: 8px;
+}
+
 button {
   flex: 1;
   border: 0;
@@ -35,6 +65,12 @@ button {
   background: #ff5b5b;
   color: #fff;
   cursor: pointer;
+}
+
+.secondary-btn {
+  background: #ffffff;
+  color: #9a3412;
+  border: 1px solid #fdba74;
 }
 
 button:disabled {

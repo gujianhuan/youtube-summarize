@@ -37,6 +37,287 @@ function sleep(ms) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
+function normalizeWhitespace(text) {
+  return String(text || "")
+    .replace(/\u200b/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || "")
+    .replace(/&#(\d+);/g, (_match, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCharCode(parseInt(code, 16)))
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
+}
+
+function dedupeTranscriptLines(lines) {
+  const result = [];
+  const seen = new Set();
+  for (const rawLine of Array.isArray(lines) ? lines : []) {
+    const line = normalizeWhitespace(rawLine);
+    if (!line || seen.has(line)) {
+      continue;
+    }
+    seen.add(line);
+    result.push(line);
+  }
+  return result;
+}
+
+function extractBalancedBlock(source, startIndex, openChar, closeChar) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = startIndex; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === openChar) {
+      depth += 1;
+    } else if (ch === closeChar) {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(startIndex, i + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function parseJsonObjectAfterMarker(source, marker) {
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex === -1) {
+    return null;
+  }
+  const braceIndex = source.indexOf("{", markerIndex);
+  if (braceIndex === -1) {
+    return null;
+  }
+  const rawJson = extractBalancedBlock(source, braceIndex, "{", "}");
+  if (!rawJson) {
+    return null;
+  }
+  try {
+    return JSON.parse(rawJson);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function extractCaptionTracksFromSource(source) {
+  if (!source || !source.includes("captionTracks")) {
+    return [];
+  }
+
+  const markers = [
+    "ytInitialPlayerResponse =",
+    "var ytInitialPlayerResponse =",
+    "window[\"ytInitialPlayerResponse\"] =",
+    "ytInitialPlayerResponse=",
+    "\"ytInitialPlayerResponse\":"
+  ];
+
+  for (const marker of markers) {
+    const playerResponse = parseJsonObjectAfterMarker(source, marker);
+    const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (Array.isArray(tracks) && tracks.length) {
+      return tracks;
+    }
+  }
+
+  const key = "\"captionTracks\":";
+  let searchIndex = 0;
+  while (searchIndex < source.length) {
+    const markerIndex = source.indexOf(key, searchIndex);
+    if (markerIndex === -1) {
+      break;
+    }
+    const arrayStart = source.indexOf("[", markerIndex);
+    if (arrayStart === -1) {
+      break;
+    }
+    const rawArray = extractBalancedBlock(source, arrayStart, "[", "]");
+    if (!rawArray) {
+      searchIndex = markerIndex + key.length;
+      continue;
+    }
+    try {
+      const tracks = JSON.parse(rawArray);
+      if (Array.isArray(tracks) && tracks.length) {
+        return tracks;
+      }
+    } catch (_error) {
+      // Continue searching later occurrences.
+    }
+    searchIndex = arrayStart + rawArray.length;
+  }
+
+  return [];
+}
+
+function parseYouTubeJsonTranscript(payload) {
+  const events = Array.isArray(payload?.events) ? payload.events : [];
+  const lines = [];
+  for (const event of events) {
+    const segs = Array.isArray(event?.segs) ? event.segs : [];
+    const line = segs.map((seg) => decodeHtmlEntities(seg?.utf8 || "")).join("");
+    const cleaned = normalizeWhitespace(line);
+    if (cleaned) {
+      lines.push(cleaned);
+    }
+  }
+  return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+}
+
+function parseYouTubeXmlTranscript(xmlText) {
+  const lines = [];
+  const matches = String(xmlText || "").matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/g);
+  for (const match of matches) {
+    const cleaned = normalizeWhitespace(decodeHtmlEntities(match[1] || ""));
+    if (cleaned) {
+      lines.push(cleaned);
+    }
+  }
+  return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+}
+
+async function fetchYouTubeWatchHtml(url) {
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers: {
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+      }
+    },
+    20000
+  );
+  if (!response.ok) {
+    throw new Error(`watch_page_http_${response.status}`);
+  }
+  return response.text();
+}
+
+async function fetchYouTubeCaptionTrack(track) {
+  const baseUrl = String(track?.baseUrl || "").trim();
+  if (!baseUrl) {
+    return "";
+  }
+
+  const candidates = [];
+  try {
+    const jsonUrl = new URL(baseUrl);
+    jsonUrl.searchParams.set("fmt", "json3");
+    candidates.push(jsonUrl.toString());
+  } catch (_error) {
+    // Ignore malformed URL and try original value.
+  }
+  candidates.push(baseUrl);
+
+  for (const candidate of candidates) {
+    try {
+      const response = await fetchWithTimeout(
+        candidate,
+        {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store"
+        },
+        20000
+      );
+      if (!response.ok) {
+        continue;
+      }
+      const rawText = await response.text();
+      const trimmed = rawText.trim();
+      if (!trimmed) {
+        continue;
+      }
+      if (trimmed.startsWith("{")) {
+        const transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
+        if (transcript) {
+          return transcript;
+        }
+      }
+      const transcript = parseYouTubeXmlTranscript(trimmed);
+      if (transcript) {
+        return transcript;
+      }
+    } catch (_error) {
+      // Try next candidate.
+    }
+  }
+
+  return "";
+}
+
+async function extractYouTubeTranscriptByUrl(sourceUrl) {
+  const html = await fetchYouTubeWatchHtml(sourceUrl);
+  const tracks = extractCaptionTracksFromSource(html);
+  if (!tracks.length) {
+    return {
+      ok: false,
+      error: "background_no_caption_tracks",
+      debug: {
+        htmlContainsCaptionTracks: html.includes("captionTracks"),
+        trackCount: 0
+      }
+    };
+  }
+
+  const sortedTracks = [...tracks].sort((a, b) => {
+    const aPenalty = a?.kind === "asr" ? 1 : 0;
+    const bPenalty = b?.kind === "asr" ? 1 : 0;
+    return aPenalty - bPenalty;
+  });
+
+  for (const track of sortedTracks) {
+    const transcript = await fetchYouTubeCaptionTrack(track);
+    if (transcript) {
+      return {
+        ok: true,
+        transcript,
+        debug: {
+          htmlContainsCaptionTracks: true,
+          trackCount: tracks.length,
+          languageCode: String(track?.languageCode || ""),
+          kind: String(track?.kind || "")
+        }
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    error: "background_caption_fetch_failed",
+    debug: {
+      htmlContainsCaptionTracks: true,
+      trackCount: tracks.length
+    }
+  };
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   const controller = new AbortController();
   const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs);
@@ -161,18 +442,37 @@ async function startSummarizeFlow(payload) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.action !== "startSummarizeFlow") {
+  if (!message?.action) {
     return undefined;
   }
 
-  (async () => {
-    try {
-      await startSummarizeFlow(message.payload || {});
-      sendResponse({ ok: true });
-    } catch (error) {
-      sendResponse({ ok: false, error: String(error?.message || error || "start_flow_failed") });
-    }
-  })();
+  if (message.action === "startSummarizeFlow") {
+    (async () => {
+      try {
+        await startSummarizeFlow(message.payload || {});
+        sendResponse({ ok: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error?.message || error || "start_flow_failed") });
+      }
+    })();
+    return true;
+  }
 
-  return true;
+  if (message.action === "extractYouTubeTranscriptByUrl") {
+    (async () => {
+      try {
+        const sourceUrl = String(message.url || "");
+        const result = await extractYouTubeTranscriptByUrl(sourceUrl);
+        sendResponse(result);
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          error: String(error?.message || error || "background_extract_failed")
+        });
+      }
+    })();
+    return true;
+  }
+
+  return undefined;
 });

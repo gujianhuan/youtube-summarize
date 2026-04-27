@@ -39,6 +39,9 @@ BRIDGE_UPSTASH_FALLBACK_ENABLED = str(
 UPSTASH_REDIS_REST_URL = str(os.environ.get("UPSTASH_REDIS_REST_URL", "") or "").strip().rstrip("/")
 UPSTASH_REDIS_REST_TOKEN = str(os.environ.get("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
 STORE_LOCK = threading.Lock()
+BRIDGE_SCHEMA_VERSION = "1.0"
+BRIDGE_PAYLOAD_VERSION_V1 = 1
+BRIDGE_PAYLOAD_VERSION_V2 = 2
 
 
 def _log(event: str, **kwargs: Any) -> None:
@@ -258,6 +261,83 @@ def _require_token(headers) -> str | None:
     return None
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """尽量将值转换成 int，失败时回落到默认值。"""
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _extract_envelope_text(envelope: dict[str, Any]) -> str:
+    """从 Transcript Envelope 中提取 transcript 文本。"""
+    transcript = envelope.get("transcript")
+    if not isinstance(transcript, dict):
+        return ""
+    return str(transcript.get("text") or "").strip()
+
+
+def _normalize_bridge_payload(body: dict[str, Any], *, now_ts: float) -> tuple[str, dict[str, Any]]:
+    """兼容 V1/V2 请求体并统一为桥接存储格式。"""
+
+    payload_id = str(body.get("payloadId") or body.get("payload_id") or secrets.token_hex(16)).strip()
+    if not payload_id:
+        payload_id = secrets.token_hex(16)
+
+    envelope_raw = body.get("envelope")
+    envelope = envelope_raw if isinstance(envelope_raw, dict) else None
+    bridge_version = _safe_int(
+        body.get("bridgeVersion") or body.get("bridge_version") or (BRIDGE_PAYLOAD_VERSION_V2 if envelope else BRIDGE_PAYLOAD_VERSION_V1),
+        BRIDGE_PAYLOAD_VERSION_V1,
+    )
+
+    transcript = str(body.get("transcript") or "").strip()
+    source_url = str(body.get("sourceUrl") or body.get("source_url") or "").strip()
+    title = str(body.get("title") or "").strip()
+    created_at = str(body.get("createdAt") or body.get("created_at") or "").strip()
+
+    if envelope is not None:
+        transcript = transcript or _extract_envelope_text(envelope)
+        video = envelope.get("video") if isinstance(envelope.get("video"), dict) else {}
+        source_url = source_url or str(video.get("url") or "").strip()
+        title = title or str(video.get("title") or "").strip()
+        created_at = created_at or str(envelope.get("createdAt") or "").strip()
+        if bridge_version < BRIDGE_PAYLOAD_VERSION_V2:
+            bridge_version = BRIDGE_PAYLOAD_VERSION_V2
+
+    payload: dict[str, Any] = {
+        "payloadId": payload_id,
+        "payload_id": payload_id,
+        "transcript": transcript,
+        "sourceUrl": source_url,
+        "source_url": source_url,
+        "title": title,
+        "createdAt": created_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+        "created_at": created_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+        "expires_at": now_ts + BRIDGE_TTL_SECONDS,
+        "bridgeVersion": bridge_version,
+        "bridge_version": bridge_version,
+    }
+
+    if envelope is not None:
+        payload["schemaVersion"] = str(envelope.get("schemaVersion") or BRIDGE_SCHEMA_VERSION)
+        payload["schema_version"] = str(envelope.get("schemaVersion") or BRIDGE_SCHEMA_VERSION)
+        payload["envelope"] = envelope
+
+        source = envelope.get("source") if isinstance(envelope.get("source"), dict) else {}
+        diagnostics = envelope.get("diagnostics") if isinstance(envelope.get("diagnostics"), dict) else {}
+        payload["requestId"] = str(envelope.get("requestId") or "").strip()
+        payload["request_id"] = str(envelope.get("requestId") or "").strip()
+        payload["sourceKind"] = str(source.get("kind") or "").strip()
+        payload["source_kind"] = str(source.get("kind") or "").strip()
+        payload["sourceType"] = str(source.get("sourceType") or "").strip()
+        payload["source_type"] = str(source.get("sourceType") or "").strip()
+        payload["fallbackUsed"] = bool(diagnostics.get("fallbackUsed"))
+        payload["fallback_used"] = bool(diagnostics.get("fallbackUsed"))
+
+    return payload_id, payload
+
+
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
     """返回 JSON 响应。"""
     encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -293,6 +373,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "upstash_fallback_enabled": BRIDGE_UPSTASH_FALLBACK_ENABLED,
                     "ttl_seconds": BRIDGE_TTL_SECONDS,
                     "max_transcript_chars": BRIDGE_MAX_TRANSCRIPT_CHARS,
+                    "supported_bridge_versions": [BRIDGE_PAYLOAD_VERSION_V1, BRIDGE_PAYLOAD_VERSION_V2],
+                    "schema_version": BRIDGE_SCHEMA_VERSION,
                 },
             )
             return
@@ -329,7 +411,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "payload_not_found"})
             return
 
-        _json_response(self, HTTPStatus.OK, {"ok": True, "payload": payload})
+        _json_response(
+            self,
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "payload_id": payload_id,
+                "bridge_version": _safe_int(payload.get("bridgeVersion"), BRIDGE_PAYLOAD_VERSION_V1),
+                "payload": payload,
+            },
+        )
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -353,10 +444,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
             return
 
-        transcript = str(body.get("transcript") or "").strip()
-        source_url = str(body.get("sourceUrl") or "").strip()
-        title = str(body.get("title") or "").strip()
-        payload_id = str(body.get("payloadId") or secrets.token_hex(16)).strip()
+        now_ts = time.time()
+        payload_id, payload = _normalize_bridge_payload(body, now_ts=now_ts)
+        transcript = str(payload.get("transcript") or "").strip()
 
         if not transcript:
             _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "transcript_required"})
@@ -368,17 +458,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "transcript_too_large", "max_chars": BRIDGE_MAX_TRANSCRIPT_CHARS},
             )
             return
-
-        now_ts = time.time()
-        payload = {
-            "payloadId": payload_id,
-            "transcript": transcript,
-            "sourceUrl": source_url,
-            "title": title,
-            "createdAt": body.get("createdAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
-            "expires_at": now_ts + BRIDGE_TTL_SECONDS,
-            "bridgeVersion": int(body.get("bridgeVersion") or 1),
-        }
 
         try:
             _save_payload(payload_id, payload)
@@ -396,6 +475,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "payload_id": payload_id,
+                "bridge_version": _safe_int(payload.get("bridgeVersion"), BRIDGE_PAYLOAD_VERSION_V1),
                 "expires_in": BRIDGE_TTL_SECONDS,
             },
         )

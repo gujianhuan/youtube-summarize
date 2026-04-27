@@ -1,98 +1,91 @@
+"""
+本地转写助手 CLI 入口。
+
+瘦身版仅保留最小本地转写闭环：
+- yt-dlp 下载音频
+- faster-whisper CPU 转写
+- 可选上传 bridge 并打开主站
+"""
+
+from __future__ import annotations
+
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
 
-from core_logic import build_api, format_error, get_transcript_from_input, get_video_transcript, summarize_text
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from portable_runtime import configure_portable_environment
+from local_cli_mvp.local_helper_core import (
+    DEFAULT_BRIDGE_API_URL,
+    DEFAULT_MAIN_URL,
+    DEFAULT_OUT_DIR,
+    LocalHelperConfig,
+    format_local_helper_error,
+    result_to_json,
+    run_local_helper,
+)
+
+
+configure_portable_environment()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="本地视频 transcript / 总结助手 MVP")
+    """解析命令行参数。"""
+
+    parser = argparse.ArgumentParser(description="本地视频 transcript 助手（瘦身版）")
     parser.add_argument("url", help="YouTube 或 Bilibili 视频链接/ID")
-    parser.add_argument("--out-dir", default="local_cli_mvp_output", help="输出目录")
+    parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="输出目录")
     parser.add_argument("--languages", default="zh-Hans,zh,en", help="优先语言，逗号分隔")
     parser.add_argument("--cookies-browser", default="auto", help="浏览器 cookies 来源，如 auto/chrome/edge/firefox")
     parser.add_argument("--cookies-file", default="", help="可选 cookies 文件")
     parser.add_argument("--timeout", type=float, default=180.0, help="整体超时时间（秒）")
     parser.add_argument("--retries", type=int, default=1, help="重试次数")
     parser.add_argument("--asr-model", default="base", help="Whisper 模型，如 tiny/base/small")
-    parser.add_argument("--asr-force-cpu", action="store_true", help="强制 CPU 转写")
-    parser.add_argument("--summary", action="store_true", help="抓到 transcript 后顺手生成总结")
-    parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo"), help="总结模型名")
-    parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"), help="OpenAI 兼容接口地址")
-    parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", ""), help="OpenAI 兼容 API Key")
+    parser.add_argument("--push-to-main", action="store_true", help="转写完成后上传 bridge payload 并打开主站")
+    parser.add_argument("--main-url", default=DEFAULT_MAIN_URL, help="主站地址")
+    parser.add_argument("--bridge-api-url", default=DEFAULT_BRIDGE_API_URL, help="Bridge API 地址")
+    parser.add_argument("--bridge-api-token", default=os.environ.get("BRIDGE_API_TOKEN", ""), help="Bridge API Token")
+    parser.add_argument("--no-open-browser", action="store_true", help="上传成功后不自动打开主站")
     return parser.parse_args()
 
 
-def safe_name(text: str) -> str:
-    value = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text.strip())
-    return value[:80] or "transcript"
+def config_from_args(args: argparse.Namespace) -> LocalHelperConfig:
+    """将命令行参数转成统一配置对象。"""
+
+    return LocalHelperConfig(
+        url=args.url,
+        out_dir=args.out_dir,
+        languages=args.languages,
+        cookies_browser=args.cookies_browser,
+        cookies_file=args.cookies_file,
+        timeout=float(args.timeout),
+        retries=int(args.retries),
+        asr_model=args.asr_model,
+        asr_force_cpu=True,
+        push_to_main=bool(args.push_to_main),
+        main_url=args.main_url,
+        bridge_api_url=args.bridge_api_url,
+        bridge_api_token=args.bridge_api_token,
+        no_open_browser=bool(args.no_open_browser),
+    )
 
 
 def main():
+    """CLI 主入口。"""
+
     args = parse_args()
-    out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 强制走本地链路，不使用 Render 远程节点/tunnel
-    os.environ["LOCAL_FETCH_NODE_MODE"] = "1"
-    os.environ["REMOTE_TRANSCRIBE_MODE"] = ""
-
+    config = config_from_args(args)
     try:
-        video_id, video_url, languages_effective = get_transcript_from_input(args.url, args.languages)
-        api = build_api(proxy_url="", timeout_seconds=float(args.timeout), use_system_proxy=False, retries=int(args.retries))
-        setattr(api, "_cookies_file", args.cookies_file.strip())
-        setattr(api, "_cookies_content", "")
-        setattr(api, "_cookies_content_b64", "")
-        setattr(api, "_cookies_from_browser", args.cookies_browser.strip())
-        setattr(api, "_asr_enabled", True)
-        setattr(api, "_asr_model", args.asr_model.strip() or "base")
-        setattr(api, "_asr_language", "auto")
-        setattr(api, "_asr_fast_mode", True)
-        setattr(api, "_asr_force_cpu", bool(args.asr_force_cpu))
-        setattr(api, "_status_callback", lambda msg: print(f"[status] {msg}"))
-
-        transcript = get_video_transcript(
-            api=api,
-            video_id=video_id,
-            video_url=video_url,
-            languages=[part.strip() for part in languages_effective.split(",") if part.strip()],
-        )
-        base_name = safe_name(video_id or video_url)
-        transcript_path = out_dir / f"{base_name}.transcript.txt"
-        transcript_path.write_text(transcript, encoding="utf-8")
-        print(json.dumps({
-            "ok": True,
-            "video_id": video_id,
-            "video_url": video_url,
-            "transcript_file": str(transcript_path),
-        }, ensure_ascii=False, indent=2))
-
-        if args.summary:
-            if not args.api_key.strip():
-                print("[warn] 未提供 API Key，跳过总结。")
-                return 0
-            summary = summarize_text(
-                transcript,
-                api_key=args.api_key.strip(),
-                base_url=args.base_url.strip(),
-                model=args.model.strip(),
-                proxy_url=None,
-                stream=False,
-            )
-            summary_path = out_dir / f"{base_name}.summary.json"
-            summary_path.write_text(summary, encoding="utf-8")
-            print(json.dumps({
-                "ok": True,
-                "summary_file": str(summary_path),
-            }, ensure_ascii=False, indent=2))
+        result_payload = run_local_helper(config)
+        print(result_to_json(result_payload))
         return 0
     except Exception as exc:
-        print(json.dumps({
-            "ok": False,
-            "error": format_error(exc),
-        }, ensure_ascii=False, indent=2))
+        print(result_to_json({"ok": False, "error": format_local_helper_error(exc)}))
         return 1
 
 
