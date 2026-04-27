@@ -25,3 +25,18 @@ settings.json
 subscriptions.json
 guestbook.json
 node_modules/
+
+# Build artifacts
+build/
+dist/
+
+# Local runtime outputs
+local_cli_mvp_output/
+
+# Temp review / diff files
+tmp_*
+*.patch
+
+# Python caches
+.pytest_cache/
+.mypy_cache/
