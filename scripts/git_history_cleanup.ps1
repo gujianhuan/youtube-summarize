@@ -66,7 +66,7 @@ function Invoke-Git {
 }
 
 function Test-GitFilterRepo {
-    & py -c "import git_filter_repo" *> $null
+    & py -m pip show git-filter-repo > $null 2>&1
     return $LASTEXITCODE -eq 0
 }
 
