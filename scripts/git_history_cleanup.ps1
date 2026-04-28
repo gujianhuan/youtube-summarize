@@ -66,7 +66,7 @@ function Invoke-Git {
 }
 
 function Test-GitFilterRepo {
-    & py -m pip show git-filter-repo > $null 2>&1
+    & py -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('git_filter_repo') else 1)" > $null 2>&1
     return $LASTEXITCODE -eq 0
 }
 
