@@ -491,20 +491,19 @@ def _render_source_links(source_links: list[tuple[str, str]]) -> None:
         seen.add(normalized)
         deduped.append((str(label or "").strip() or normalized, normalized))
     if not deduped:
-        st.caption("未提取到可点击来源链接。")
+        st.caption("当前未提取到可点击的核查来源。")
         return
-    st.markdown("**来源链接**")
+    st.markdown("**核查来源**")
     source_lines = [f"- [{label}]({url})" for label, url in deduped[:12]]
     st.markdown("\n".join(source_lines))
 
 
 def render_fact_check_content(fact_check_md: str, *, fact_title: str = "🕵️ 事实核查") -> None:
     """渲染简洁版事实核查正文与来源链接。"""
-    st.markdown(f"### {fact_title}")
     text = str(fact_check_md or "").strip()
     if not text:
-        st.warning("⚠️ 本次未成功拆出结构化事实核查结果。")
         return
+    st.markdown(f"### {fact_title}")
 
     sections = _split_fact_check_sections(text)
     if not sections:
@@ -538,6 +537,12 @@ def render_summary_fact_check(
     fact_tab_label: str = "🕵️ 事实核查",
 ) -> None:
     """统一渲染总结与事实核查，优先使用同页左右布局。"""
+    has_fact_check = bool(str(fact_check_md or "").strip())
+    if not has_fact_check:
+        st.markdown(f"### {summary_tab_label}")
+        st.markdown(summary_md)
+        return
+
     col_sum, col_check = st.columns([1.15, 0.95], gap="large")
     with col_sum:
         st.markdown(f"### {summary_tab_label}")
@@ -1745,18 +1750,20 @@ def render_task_center_page(current_bg_task_id, current_bg_task_status):
     return task_status_value, task_logs, task_runs, task_run_items
 
 
-def render_library_filters():
+def render_library_filters(history_count: int):
     """
     渲染资产库筛选栏。
     """
-    filter_col1, filter_col2 = st.columns([3, 1])
+    filter_col1, filter_col2, filter_col3 = st.columns([4.2, 0.8, 1.2])
     with filter_col1:
         hist_kw = st.text_input("搜索历史记录 (标题/URL/内容)", key="hist_kw")
     with filter_col2:
         search_body = st.checkbox("全文搜索", value=True)
-        if st.button("清空历史", use_container_width=True):
-            save_history([])
-            st.rerun()
+    with filter_col3:
+        if history_count > 0:
+            if st.button("清空历史", use_container_width=True):
+                save_history([])
+                st.rerun()
 
     return hist_kw, search_body
 
@@ -1802,15 +1809,20 @@ def render_library_page():
     st.caption("统一沉淀单次处理、手动粘贴、扩展桥接和定时任务产出的内容结果。")
 
     history = load_history() or []
-    hist_kw, search_body = render_library_filters()
+    hist_kw, search_body = render_library_filters(len(history))
 
     if not history:
-        st.info("暂无历史记录")
+        st.info("暂无历史记录，等你生成第一条总结后会自动沉淀到这里。")
         return
 
-    for entry in history:
-        if history_entry_matches(entry, hist_kw, search_body):
-            render_history_entry(entry)
+    matched_entries = [
+        entry for entry in history
+        if history_entry_matches(entry, hist_kw, search_body)
+    ]
+    st.caption(f"共 {len(history)} 条历史记录，当前命中 {len(matched_entries)} 条")
+
+    for entry in matched_entries:
+        render_history_entry(entry)
 
 
 def render_settings_metrics(task_status_value):
@@ -2861,7 +2873,9 @@ def _check_subscription_recent_videos(sub, proxy, timeout_val):
         only_streams = False
         if sub["id"] == "UC8UCbiPrm2zN9nZHKdTevZA" or "王剑" in sub["name"] or "大康" in sub["name"]:
             min_dur = 1200
-            only_streams = True
+            # 这类频道既会发直播回放，也可能在 videos tab 发布更新。
+            # 只扫 streams 会漏掉真正最新的内容，因此保留长视频过滤，但不再限制仅 streams。
+            only_streams = False
 
         eff_timeout = min(float(timeout_val), 20.0)
         return sub["id"], get_channel_recent_videos(

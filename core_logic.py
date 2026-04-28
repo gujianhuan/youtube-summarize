@@ -4318,6 +4318,63 @@ def fact_check_document_claims(
         return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
     return final_markdown
 
+
+def _should_skip_fact_check_for_video_text(text: str) -> tuple[bool, str]:
+    """识别明显属于测试/产品说明/技术链路的字幕，避免误触发新闻事实核查。"""
+    content = str(text or "").strip()
+    if not content:
+        return True, "empty_text"
+
+    lowered = content.lower()
+    strong_markers = [
+        "模拟测试",
+        "测试字幕",
+        "测试文本",
+        "回归验证",
+        "链路验证",
+        "产品主路径",
+        "自动开始总结",
+        "bridge payload",
+        "payload_id",
+        "ext_payload_id",
+    ]
+    if any(marker in content or marker in lowered for marker in strong_markers):
+        return True, "strong_test_marker"
+
+    paired_markers = [
+        (("模拟", "测试"), "simulated_test_pair"),
+        (("内部", "测试"), "internal_test_pair"),
+        (("回归", "验证"), "regression_validation_pair"),
+        (("技术", "链路"), "technical_pipeline_pair"),
+        (("产品", "验证"), "product_validation_pair"),
+    ]
+    for keywords, reason in paired_markers:
+        if all(keyword in content for keyword in keywords):
+            return True, reason
+
+    if re.search(r"(这是一次|这是一段|本次|用于).{0,24}(模拟|测试|验证|调试|演示)", content):
+        return True, "intro_test_pattern"
+
+    technical_markers = [
+        "chrome插件",
+        "render主站",
+        "render",
+        "bridge",
+        "payload",
+        "transcript",
+        "api key",
+        "自动总结",
+        "主链路",
+        "产品技术流程",
+        "技术流程",
+    ]
+    technical_hits = sum(1 for marker in technical_markers if marker in lowered or marker in content)
+    if technical_hits >= 3 and any(word in content for word in ["测试", "验证", "调试", "回归"]):
+        return True, "technical_test_context"
+
+    return False, ""
+
+
 def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
     if not text or not text.strip():
         return "没有可总结的内容（文本为空）。"
@@ -4354,9 +4411,15 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         from datetime import datetime
         current_date = datetime.now().strftime("%Y-%m-%d")
 
+        fact_check_enabled = True
+        skip_fact_check, skip_reason = _should_skip_fact_check_for_video_text(content)
+        if skip_fact_check:
+            fact_check_enabled = False
+            print(f"SummarizeText: skip fact check, reason={skip_reason}")
+
         # --- Step 1: Analyze & Generate Search Queries ---
         search_context = ""
-        if len(content) > 100:
+        if fact_check_enabled and len(content) > 100:
             try:
                 analysis_prompt = (
                     f"当前日期: {current_date}。\n"
@@ -4394,46 +4457,64 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 print(f"Search step failed: {e}")
 
         # --- Step 2: Final Summarization ---
-        prompt = (
-            f"你是一个专业的新闻分析师和事实核查专家。当前真实日期是：{current_date}。\n"
-            "请务必基于此日期进行时效性判断，不要使用你训练时的截止日期（如2023或2024）。\n"
-            "请分析以下视频字幕，生成一份结构清晰、便于阅读的报告。\n"
-            f"{search_context}\n\n"
-            "【输出格式要求】\n"
-            "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n\n"
-            "1. `summary_markdown` 的要求：\n"
-            "   - 必须是 Markdown。\n"
-            "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
-            "   - 固定结构如下：\n"
-            "     ## 核心主题\n"
-            "     - 1 句话概括视频主旨。\n"
-            "     ## 主要内容\n"
-            "     - 逐条列出 6-12 条要点。\n"
-            "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
-            "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
-            "     ## 关键信息\n"
-            "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
-            "     ## 结论（可选）\n"
-            "     - 只有当视频确实提出了明确结论时才输出本节。\n"
-            "     - 如果视频没有清晰结论，就不要硬写结论。\n\n"
-            "2. `fact_check_markdown` 的要求：\n"
-            "   - 必须是 Markdown。\n"
-            "   - 不要输出表格，改为逐条列出“新闻/声明核查项”。\n"
-            "   - 每一条都必须使用下面结构：\n"
-            "     ### 条目1\n"
-            "     - 新闻/声明：...\n"
-            "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
-            "     - 依据：简要说明为什么这样判断\n"
-            "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
-            "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
-            "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
-            "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
-            "   - 如果某条暂时缺乏直接证据，也要明确写出当前候选来源，并说明“现有公开候选来源不足以直接支撑该说法”，不要只写“未发现”。\n\n"
-            "**字幕内容输入：**\n"
-            f"{content}"
-        )
+        if fact_check_enabled:
+            prompt = (
+                f"你是一个专业的新闻分析师和事实核查专家。当前真实日期是：{current_date}。\n"
+                "请务必基于此日期进行时效性判断，不要使用你训练时的截止日期（如2023或2024）。\n"
+                "请分析以下视频字幕，生成一份结构清晰、便于阅读的报告。\n"
+                f"{search_context}\n\n"
+                "【输出格式要求】\n"
+                "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n\n"
+                "1. `summary_markdown` 的要求：\n"
+                "   - 必须是 Markdown。\n"
+                "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
+                "   - 固定结构如下：\n"
+                "     ## 核心主题\n"
+                "     - 1 句话概括视频主旨。\n"
+                "     ## 主要内容\n"
+                "     - 逐条列出 6-12 条要点。\n"
+                "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
+                "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
+                "     ## 关键信息\n"
+                "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
+                "     ## 结论（可选）\n"
+                "     - 只有当视频确实提出了明确结论时才输出本节。\n"
+                "     - 如果视频没有清晰结论，就不要硬写结论。\n\n"
+                "2. `fact_check_markdown` 的要求：\n"
+                "   - 必须是 Markdown。\n"
+                "   - 不要输出表格，改为逐条列出“新闻/声明核查项”。\n"
+                "   - 每一条都必须使用下面结构：\n"
+                "     ### 条目1\n"
+                "     - 新闻/声明：...\n"
+                "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
+                "     - 依据：简要说明为什么这样判断\n"
+                "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
+                "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
+                "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
+                "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
+                "   - 如果某条暂时缺乏直接证据，也要明确写出当前候选来源，并说明“现有公开候选来源不足以直接支撑该说法”，不要只写“未发现”。\n\n"
+                "**字幕内容输入：**\n"
+                f"{content}"
+            )
+        else:
+            prompt = (
+                f"你是一个专业的视频内容总结助手。当前真实日期是：{current_date}。\n"
+                "请总结以下视频字幕，但不要执行新闻事实核查。\n"
+                "当前文本更像测试说明、产品演示或技术链路描述，不适合输出新闻核查结论。\n\n"
+                "【输出格式要求】\n"
+                "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n"
+                "1. `summary_markdown` 的要求：\n"
+                "   - 必须是 Markdown。\n"
+                "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
+                "   - 固定结构如下：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。\n"
+                "2. `fact_check_markdown` 的要求：\n"
+                "   - 必须返回空字符串 `\"\"`。\n"
+                "   - 不要生成任何事实核查条目、来源链接或搜索建议。\n\n"
+                "**字幕内容输入：**\n"
+                f"{content}"
+            )
         max_tokens = 3000
-        if content_len >= 14000:
+        if fact_check_enabled and content_len >= 14000:
              prompt = (
                 f"你是一个专业的新闻分析师。当前日期是：{current_date}。\n"
                 "请对以下长视频字幕进行总结和事实核查。\n"
@@ -4454,14 +4535,21 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 f"{content}"
             )
              max_tokens = 2500
-        elif content_len >= 9000:
+        elif fact_check_enabled and content_len >= 9000:
             max_tokens = 2200
         print(f"SummarizeText: content_len={content_len}, max_tokens={max_tokens}, model={(model or '').strip() or 'gpt-3.5-turbo'}")
 
         response = client.chat.completions.create(
             model=model.strip() or "gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰。事实核查必须逐条列出新闻/声明，并尽可能提供外部来源链接；禁止把视频本身当作来源，也不要输出空泛的“无法独立核实”。"},
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"
+                        if not fact_check_enabled
+                        else "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰。事实核查必须逐条列出新闻/声明，并尽可能提供外部来源链接；禁止把视频本身当作来源，也不要输出空泛的“无法独立核实”。"
+                    ),
+                },
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
@@ -4505,21 +4593,29 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
         normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
         if normalized_payload:
             fact_md = normalized_payload.get("fact_check_markdown", "")
-            if _is_placeholder_fact_check(fact_md):
-                fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
-            fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
-            fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
+            if fact_check_enabled:
+                if _is_placeholder_fact_check(fact_md):
+                    fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
+                fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
+                fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
+            else:
+                fact_md = ""
             normalized_payload["fact_check_markdown"] = fact_md
             return json.dumps(normalized_payload, ensure_ascii=False)
 
         try:
+            fact_check_repair_requirement = (
+                "- `fact_check_markdown` 必须保留或补齐事实核查内容。\n"
+                if fact_check_enabled
+                else "- `fact_check_markdown` 必须返回空字符串，不要补任何事实核查内容。\n"
+            )
             repair_prompt = (
                 "请将下面内容修复为合法 JSON，并且只能包含两个字段："
-                "`summary_markdown` 和 `fact_check_markdown`。\n"
-                "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
-                "- `fact_check_markdown` 必须保留或补齐事实核查内容。\n"
-                "- 只返回 JSON，不要解释。\n\n"
-                f"原始内容：\n{content_str}"
+                + "`summary_markdown` 和 `fact_check_markdown`。\n"
+                + "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
+                + fact_check_repair_requirement
+                + "- 只返回 JSON，不要解释。\n\n"
+                + f"原始内容：\n{content_str}"
             )
             repair_resp = client.chat.completions.create(
                 model=model.strip() or "gpt-3.5-turbo",
@@ -4535,10 +4631,13 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
             if normalized_payload:
                 fact_md = normalized_payload.get("fact_check_markdown", "")
-                if _is_placeholder_fact_check(fact_md):
-                    fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
-                fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
-                fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
+                if fact_check_enabled:
+                    if _is_placeholder_fact_check(fact_md):
+                        fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
+                    fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
+                    fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
+                else:
+                    fact_md = ""
                 normalized_payload["fact_check_markdown"] = fact_md
                 return json.dumps(normalized_payload, ensure_ascii=False)
         except Exception as repair_exc:
@@ -4546,7 +4645,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
 
         return json.dumps({
             "summary_markdown": content_str,
-            "fact_check_markdown": _build_fact_check_fallback_markdown(search_results_md=search_context),
+            "fact_check_markdown": "" if not fact_check_enabled else _build_fact_check_fallback_markdown(search_results_md=search_context),
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -5333,6 +5432,33 @@ def get_channel_recent_videos(
 
     from datetime import datetime
 
+    def _build_video_item(raw_item: dict, fallback_url: str = "") -> dict:
+        """标准化视频元数据，便于统一排序与展示。"""
+        timestamp = raw_item.get("timestamp") or raw_item.get("release_timestamp") or 0
+        upload_date = raw_item.get("upload_date")
+        if not upload_date and timestamp:
+            try:
+                upload_date = datetime.fromtimestamp(int(timestamp)).strftime("%Y%m%d")
+            except Exception:
+                upload_date = ""
+        return {
+            "id": raw_item.get("id"),
+            "title": raw_item.get("title", "无标题"),
+            "url": raw_item.get("url") or raw_item.get("webpage_url") or fallback_url,
+            "upload_date": upload_date,
+            "duration": raw_item.get("duration") or 0,
+            "timestamp": int(timestamp) if timestamp else 0,
+        }
+
+    def _video_sort_key(item: dict) -> tuple[int, str, int]:
+        """优先按精确时间排序，缺失时回退到 upload_date 和时长。"""
+        upload_date = str(item.get("upload_date") or "")
+        return (
+            int(item.get("timestamp") or 0),
+            upload_date,
+            int(item.get("duration") or 0),
+        )
+
     base_url = channel_url.strip().rstrip("/")
     # 构造待扫描的 tab 列表
     # 如果是 Bilibili，直接扫描主页 (yt-dlp 会自动处理)
@@ -5389,14 +5515,10 @@ def get_channel_recent_videos(
                             
                             # 记录基础信息
                             if v_id not in candidates_map:
-                                candidates_map[v_id] = {
-                                    "id": v_id,
-                                    "title": e.get("title", "无标题"),
-                                    "url": e.get("url") or f"https://www.youtube.com/watch?v={v_id}",
-                                    # flat 模式下 upload_date 可能不准或缺失
-                                    "upload_date": e.get("upload_date"), 
-                                    "duration": e.get("duration") or 0,
-                                }
+                                candidates_map[v_id] = _build_video_item(
+                                    e,
+                                    fallback_url=f"https://www.youtube.com/watch?v={v_id}",
+                                )
                     except Exception:
                         pass
             
@@ -5411,9 +5533,10 @@ def get_channel_recent_videos(
     # 转为列表
     all_candidates = list(candidates_map.values())
 
-    # 如果不需要过滤长视频，直接尽量按原有信息排序返回
+    # 如果不需要过滤长视频，仍然必须先按发布时间排序，不能依赖抓取顺序。
     if not filter_longest:
-        return all_candidates[:limit]
+        all_candidates.sort(key=_video_sort_key, reverse=True)
+        return all_candidates[: max(1, int(limit or 1))]
 
     # === filter_longest 混合模式逻辑 ===
     # 优化：如果 all_candidates 中已经有 duration 和 upload_date，则不需要 fetch_detail
@@ -5474,13 +5597,7 @@ def get_channel_recent_videos(
             with YoutubeDL(local_opts) as ydl:
                 info = ydl.extract_info(item["url"], download=False)
                 if info:
-                    return {
-                        "id": info.get("id"),
-                        "title": info.get("title"),
-                        "url": info.get("webpage_url") or item["url"],
-                        "upload_date": info.get("upload_date"),
-                        "duration": info.get("duration") or 0,
-                    }
+                    return _build_video_item(info, fallback_url=item["url"])
         except Exception:
             pass
         # 失败则返回原始数据
@@ -5501,7 +5618,7 @@ def get_channel_recent_videos(
     detailed_results.extend(ready_results)
             
     # 过滤掉获取不到日期的（极少情况）
-    valid_results = [x for x in detailed_results if x.get("upload_date")]
+    valid_results = [x for x in detailed_results if x.get("upload_date") or x.get("timestamp")]
 
     # 基础时长过滤：默认 180s (3分钟)，如果指定了 min_duration_seconds 则使用指定值
     # 这一步更严格地排除掉 Shorts/剪辑片段/预告片等干扰项，只保留正片
@@ -5510,12 +5627,15 @@ def get_channel_recent_videos(
 
     # 按日期降序排序 (最新的在前)
     # 注意：yt-dlp 返回的日期格式是 YYYYMMDD，字符串比较即可
-    valid_results.sort(key=lambda x: x["upload_date"], reverse=True)
+    valid_results.sort(key=_video_sort_key, reverse=True)
 
     if not valid_results:
         # 如果过滤完没视频了，尝试放宽标准找一个最长的，避免完全空
         # 比如有些正片可能只有 2 分钟，或者全是短片时至少给一个
-        detailed_results.sort(key=lambda x: x.get("duration", 0), reverse=True)
+        detailed_results.sort(
+            key=lambda x: (_video_sort_key(x), int(x.get("duration") or 0)),
+            reverse=True,
+        )
         if detailed_results:
              return [detailed_results[0]]
         return []
@@ -5555,7 +5675,7 @@ def get_channel_recent_videos(
     # 返回【最近发布的】且【时长合格】的视频，最多 3 个。
     # 不做任何额外的日期分组或时长重排序，完全信任时间轴。
     
-    return valid_results[:3]
+    return valid_results[: max(1, int(limit or 1))]
 
 
 def check_network(proxy_url: str, timeout: float = 5.0) -> str | None:
