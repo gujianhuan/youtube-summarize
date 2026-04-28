@@ -44,3 +44,6 @@ tmp_*
 
 # Local packaged extension
 chrome_extension_mvp.zip
+
+# Local history rewrite backups
+.git-history-backups/

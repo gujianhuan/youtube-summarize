@@ -66,7 +66,7 @@ function Invoke-Git {
 }
 
 function Test-GitFilterRepo {
-    $null = & git filter-repo --version 2>$null
+    & py -c "import git_filter_repo" *> $null
     return $LASTEXITCODE -eq 0
 }
 
@@ -129,13 +129,16 @@ Invoke-Git clone --mirror $ProjectRoot $MirrorClonePath
 Push-Location $MirrorClonePath
 try {
     Write-Step "Rewrite history"
-    Invoke-Git filter-repo --force --invert-paths `
+    & py -m git_filter_repo --force --invert-paths `
         --path build `
         --path dist `
         --path local_cli_mvp_output `
         --path chrome_extension_mvp.zip `
         --path-glob tmp_* `
         --path-glob .tmp_*
+    if ($LASTEXITCODE -ne 0) {
+        throw "git_filter_repo execution failed."
+    }
 
     Write-Step "Run cleanup and garbage collection"
     Invoke-Git reflog expire --expire=now --all
