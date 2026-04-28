@@ -35,8 +35,12 @@ local_cli_mvp_output/
 
 # Temp review / diff files
 tmp_*
+.tmp_*
 *.patch
 
 # Python caches
 .pytest_cache/
 .mypy_cache/
+
+# Local packaged extension
+chrome_extension_mvp.zip
