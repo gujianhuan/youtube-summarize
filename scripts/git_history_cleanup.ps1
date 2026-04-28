@@ -49,7 +49,7 @@ function Assert-CommandExists {
     )
 
     if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
-        throw "缺少命令: $CommandName。$InstallHint"
+        throw "Missing command: $CommandName. $InstallHint"
     }
 }
 
@@ -61,7 +61,7 @@ function Invoke-Git {
 
     & git @Args
     if ($LASTEXITCODE -ne 0) {
-        throw "git 命令失败: git $($Args -join ' ')"
+        throw "Git command failed: git $($Args -join ' ')"
     }
 }
 
@@ -70,8 +70,8 @@ function Test-GitFilterRepo {
     return $LASTEXITCODE -eq 0
 }
 
-Assert-CommandExists -CommandName "git" -InstallHint "请先安装 Git for Windows。"
-Assert-CommandExists -CommandName "py" -InstallHint "请先安装 Python，并确保 `py` 可用。"
+Assert-CommandExists -CommandName "git" -InstallHint "Install Git for Windows first."
+Assert-CommandExists -CommandName "py" -InstallHint "Install Python first and ensure the py launcher is available."
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 if (-not $MirrorClonePath) {
@@ -84,51 +84,51 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $backupDir = Join-Path $ProjectRoot ".git-history-backups"
 $bundlePath = Join-Path $backupDir "backup_$timestamp.bundle"
 
-Write-Step "检查仓库状态"
+Write-Step "Check repository state"
 Push-Location $ProjectRoot
 try {
     $isRepo = (& git rev-parse --is-inside-work-tree 2>$null).Trim()
     if ($LASTEXITCODE -ne 0 -or $isRepo -ne "true") {
-        throw "当前目录不是 Git 仓库: $ProjectRoot"
+        throw "Current directory is not a Git repository: $ProjectRoot"
     }
 
     $statusOutput = & git status --short
     if ($LASTEXITCODE -ne 0) {
-        throw "无法读取 git status。"
+        throw "Unable to read git status."
     }
     if ($statusOutput) {
-        throw "工作区不干净。请先提交或暂存当前改动，再执行历史改写。"
+        throw "Working tree is not clean. Commit or stash changes before rewriting history."
     }
 
-    Write-Step "创建 bundle 备份"
+    Write-Step "Create bundle backup"
     New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
     Invoke-Git bundle create $bundlePath --all
-    Write-Host "备份已创建: $bundlePath" -ForegroundColor Green
+    Write-Host "Backup created: $bundlePath" -ForegroundColor Green
 
     if (-not (Test-GitFilterRepo)) {
         if (-not $InstallFilterRepo) {
-            throw "未检测到 git-filter-repo。请重新运行并加上 -InstallFilterRepo，或手动执行: py -m pip install --user git-filter-repo"
+            throw "git-filter-repo is missing. Re-run with -InstallFilterRepo, or install it manually: py -m pip install --user git-filter-repo"
         }
 
-        Write-Step "安装 git-filter-repo"
+        Write-Step "Install git-filter-repo"
         & py -m pip install --user git-filter-repo
         if ($LASTEXITCODE -ne 0 -or -not (Test-GitFilterRepo)) {
-            throw "git-filter-repo 安装失败。"
+            throw "git-filter-repo installation failed."
         }
     }
 } finally {
     Pop-Location
 }
 
-Write-Step "准备 mirror 克隆"
+Write-Step "Prepare mirror clone"
 if (Test-Path $MirrorClonePath) {
-    throw "目标 mirror 目录已存在，请先删除或传入新的 -MirrorClonePath: $MirrorClonePath"
+    throw "Mirror clone path already exists. Remove it first or pass a new -MirrorClonePath: $MirrorClonePath"
 }
 Invoke-Git clone --mirror $ProjectRoot $MirrorClonePath
 
 Push-Location $MirrorClonePath
 try {
-    Write-Step "执行历史清理"
+    Write-Step "Rewrite history"
     Invoke-Git filter-repo --force --invert-paths `
         --path build `
         --path dist `
@@ -137,21 +137,21 @@ try {
         --path-glob tmp_* `
         --path-glob .tmp_*
 
-    Write-Step "回收历史垃圾对象"
+    Write-Step "Run cleanup and garbage collection"
     Invoke-Git reflog expire --expire=now --all
     Invoke-Git gc --prune=now --aggressive
 
-    Write-Step "输出验证信息"
+    Write-Step "Print verification summary"
     & git count-objects -vH
 
     Write-Host ""
-    Write-Host "历史清理已完成。下一步请人工确认后再强推：" -ForegroundColor Yellow
+    Write-Host "History cleanup completed. Verify the mirror clone before force-pushing:" -ForegroundColor Yellow
     Write-Host "1. Set-Location `"$MirrorClonePath`""
     Write-Host "2. git log --oneline --stat -5"
     Write-Host "3. git remote -v"
     Write-Host "4. git push --force-with-lease $RemoteName refs/heads/$MainBranch:refs/heads/$MainBranch"
     Write-Host ""
-    Write-Host "风险提示: force-push 会改写远程历史，Render 会基于新历史重新拉取，协作者需要重新同步仓库。" -ForegroundColor Yellow
+    Write-Host "Risk: force-push rewrites remote history. Render will redeploy from the new history, and collaborators must resync." -ForegroundColor Yellow
 } finally {
     Pop-Location
 }
