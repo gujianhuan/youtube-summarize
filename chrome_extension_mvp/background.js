@@ -1,13 +1,35 @@
-const SUMMARIZER_URL = "https://youtube-summarize-0oms.onrender.com/";
-const BRIDGE_API_URL = "https://youtube-summarize-bridge.onrender.com";
-const BRIDGE_API_TOKEN = "";
+const DEFAULT_SUMMARIZER_URL = "https://youtube-summarize-0oms.onrender.com/";
+const DEFAULT_BRIDGE_API_URL = "https://youtube-summarize-bridge.onrender.com";
+const DEFAULT_BRIDGE_API_TOKEN = "";
+const EXTENSION_CONFIG_KEY = "summarizerExtensionConfig";
 const FLOW_STATUS_KEY = "summarizerFlowStatus";
 const BRIDGE_HEALTH_TIMEOUT_MS = 15000;
 const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 
-function buildBridgeUrl(payloadId, sourceUrl) {
-  const url = new URL(SUMMARIZER_URL);
+function normalizeBaseUrl(value, fallbackValue) {
+  const trimmed = String(value || "").trim();
+  return (trimmed || fallbackValue).replace(/\/+$/, "") + "/";
+}
+
+function normalizeApiUrl(value, fallbackValue) {
+  const trimmed = String(value || "").trim();
+  return (trimmed || fallbackValue).replace(/\/+$/, "");
+}
+
+async function getExtensionConfig() {
+  const stored = await chrome.storage.local.get(EXTENSION_CONFIG_KEY);
+  const config = stored?.[EXTENSION_CONFIG_KEY] || {};
+  return {
+    summarizerUrl: normalizeBaseUrl(config.summarizerUrl, DEFAULT_SUMMARIZER_URL),
+    bridgeApiUrl: normalizeApiUrl(config.bridgeApiUrl, DEFAULT_BRIDGE_API_URL),
+    bridgeApiToken: String(config.bridgeApiToken || DEFAULT_BRIDGE_API_TOKEN).trim()
+  };
+}
+
+async function buildBridgeUrl(payloadId, sourceUrl) {
+  const { summarizerUrl } = await getExtensionConfig();
+  const url = new URL(summarizerUrl);
   if (payloadId) {
     url.searchParams.set("ext_payload_id", payloadId);
     url.searchParams.set("ext_autosubmit", "1");
@@ -332,9 +354,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
 }
 
 async function wakeBridgeApi() {
+  const { bridgeApiUrl } = await getExtensionConfig();
   try {
     const response = await fetchWithTimeout(
-      `${BRIDGE_API_URL}/health`,
+      `${bridgeApiUrl}/health`,
       {
         method: "GET",
         cache: "no-store"
@@ -348,18 +371,19 @@ async function wakeBridgeApi() {
 }
 
 async function uploadBridgePayloadOnce(payload) {
+  const { bridgeApiUrl, bridgeApiToken } = await getExtensionConfig();
   const headers = {
     "Content-Type": "application/json"
   };
-  if (BRIDGE_API_TOKEN) {
-    headers["X-Bridge-Token"] = BRIDGE_API_TOKEN;
+  if (bridgeApiToken) {
+    headers["X-Bridge-Token"] = bridgeApiToken;
   }
 
   let response;
 
   try {
     response = await fetchWithTimeout(
-      `${BRIDGE_API_URL}/api/bridge/payload`,
+      `${bridgeApiUrl}/api/bridge/payload`,
       {
         method: "POST",
         headers,
@@ -422,13 +446,13 @@ async function uploadBridgePayload(payload) {
 async function startSummarizeFlow(payload) {
   const sourceUrl = String(payload?.sourceUrl || "");
   await setFlowStatus("正在打开主站...", false, "opening");
-  const targetTab = await chrome.tabs.create({ url: buildBridgeUrl("", sourceUrl) });
+  const targetTab = await chrome.tabs.create({ url: await buildBridgeUrl("", sourceUrl) });
 
   try {
     const result = await uploadBridgePayload(payload);
     const finalPayloadId = String(result?.payload_id || payload?.payloadId || "");
     if (targetTab.id && finalPayloadId) {
-      await chrome.tabs.update(targetTab.id, { url: buildBridgeUrl(finalPayloadId, sourceUrl) });
+      await chrome.tabs.update(targetTab.id, { url: await buildBridgeUrl(finalPayloadId, sourceUrl) });
     }
     await setFlowStatus("已发送 transcript，主站正在自动拉取并开始总结。", false, "done");
   } catch (error) {

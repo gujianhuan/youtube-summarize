@@ -3017,6 +3017,21 @@ AUTHORITATIVE_SOURCE_RULES = [
         "aliases": ["ukmto", "united kingdom maritime trade operations", "英国海事贸易行动中心"],
     },
     {
+        "label": "彭博社",
+        "url": "https://www.bloomberg.com/",
+        "aliases": ["彭博社", "彭博", "bloomberg"],
+    },
+    {
+        "label": "台湾证券交易所",
+        "url": "https://www.twse.com.tw/en/",
+        "aliases": ["台湾证券交易所", "台灣證券交易所", "台湾股市", "台灣股市", "twse", "taiwan stock exchange"],
+    },
+    {
+        "label": "美丽岛电子报",
+        "url": "https://www.my-formosa.com/",
+        "aliases": ["美丽岛电子报", "美麗島電子報", "美丽岛", "美麗島", "my-formosa"],
+    },
+    {
         "label": "路透社",
         "url": "https://www.reuters.com/",
         "aliases": ["路透社", "reuters"],
@@ -3298,6 +3313,54 @@ def _soften_fact_check_wording(text: str) -> str:
     return value
 
 
+def _soften_absolute_negative_fact_check_with_sources(
+    text: str,
+    source_links: list[tuple[str, str]] | None,
+) -> str:
+    """当条目里已附带候选来源链接时，避免保留“未发现任何报道”这类绝对否定表述。"""
+    value = str(text or "")
+    if not value or not source_links:
+        return value
+
+    link_text = " ".join(f"{label} {url}" for label, url in source_links).lower()
+    has_news_evidence = any(
+        token in link_text
+        for token in [
+            "reuters",
+            "路透",
+            "bloomberg",
+            "彭博",
+            "twse",
+            "taiwan stock exchange",
+            "台灣證券交易所",
+            "台湾证券交易所",
+            "my-formosa",
+            "美麗島",
+            "美丽岛",
+        ]
+    )
+    if not has_news_evidence:
+        return value
+
+    replacements = [
+        (
+            r"未发现任何主流财经新闻媒体[^。\n]*",
+            "当前候选来源已包含主流财经媒体或权威站点链接，不宜直接下结论为“未发现报道”，应以这些链接的具体内容为准",
+        ),
+        (
+            r"未发现来自[^。\n]*的报道",
+            "当前候选来源已提供可进一步核对的相关报道或权威站点链接，不宜直接下结论为“未发现报道”",
+        ),
+        (
+            r"未发现[^。\n]*证明",
+            "当前候选来源已提供可进一步核对的相关链接，请直接依据链接内容判断是否构成证明",
+        ),
+    ]
+    for pattern, replacement in replacements:
+        value = re.sub(pattern, replacement, value)
+    return value
+
+
 def _enrich_fact_check_markdown_with_links(fact_md: str, search_results_md: str) -> str:
     fact_text = str(fact_md or "").strip()
     if not fact_text:
@@ -3355,6 +3418,7 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
             continue
 
         source_text = "；".join(f"[{label}]({url})" for label, url in source_links[:3])
+        stripped = _soften_absolute_negative_fact_check_with_sources(stripped, source_links)
 
         # 如果模型已经输出了“来源/出处”但没有链接，保留原有文字说明并额外补一行可点击链接。
         if re.search(r"来源/出处[:：]", stripped):
@@ -4452,6 +4516,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                             "请优先使用以上搜索结果中的外部来源进行核查。"
                             "来源/出处必须尽量给出具体 URL 链接；如果提到具体机构或媒体名称，优先附上其官网或栏目页链接。"
                             "严禁把“视频内容本身”“视频字幕”当作来源。"
+                            "如果候选来源里已经出现与声明直接相关的路透社、彭博社、台湾证券交易所、美丽岛电子报等链接，禁止再写“未发现报道”或“未发现证明”，而应直接根据这些链接内容判断。"
                         )
             except Exception as e:
                 print(f"Search step failed: {e}")
@@ -4489,9 +4554,10 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
                 "     - 依据：简要说明为什么这样判断\n"
                 "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
-                "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
+                "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社、路透社、彭博社、台湾证券交易所、美丽岛电子报等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
                 "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
                 "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
+                "   - 如果【实时搜索结果】中已经给出与该声明直接相关的候选链接，禁止写“未发现任何报道”或“未发现证明”；应先引用这些链接，再给出“属实 / 基本属实 / 存疑 / 缺乏证据 / 错误”的判断。\n"
                 "   - 如果某条暂时缺乏直接证据，也要明确写出当前候选来源，并说明“现有公开候选来源不足以直接支撑该说法”，不要只写“未发现”。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
@@ -4529,8 +4595,9 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "   - 必须逐条列出可核查新闻，不要使用表格。\n"
                 "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`来源/出处`。\n"
                 "   - `来源/出处` 必须尽量给出具体 URL，禁止把视频本身当作来源。\n"
-                "   - 如果提到具体机构、政府部门或媒体名，优先附上其官网或栏目页链接，不要只写机构名称。\n"
+                "   - 如果提到具体机构、政府部门或媒体名，优先附上其官网或栏目页链接，不要只写机构名称，尤其是路透社、彭博社、台湾证券交易所、美丽岛电子报等来源。\n"
                 "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”，并保留候选来源链接。\n\n"
+                "   - 如果【实时搜索结果】里已经有与声明直接相关的候选链接，禁止下结论为“未发现任何报道”或“未发现证明”。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
             )

@@ -65,19 +65,9 @@ def _pop_inflight(task_id: str) -> None:
 
 def _pick_cookie_inputs(payload: dict) -> tuple[dict, str]:
     prefer_local = str(os.environ.get("LOCAL_FETCH_PREFER_LOCAL_COOKIES", "1") or "1").strip().lower() not in {"0", "false", "no"}
-
-    local_browser_candidates = [
-        str(os.environ.get("LOCAL_FETCH_COOKIES_BROWSER", "") or "").strip().lower(),
-        str(os.environ.get("YTDLP_COOKIES_BROWSER", "") or "").strip().lower(),
-    ]
-    if prefer_local and os.name == "nt":
-        local_browser_candidates.extend(["edge", "chrome"])
-    local_browser_candidates = [item for item in local_browser_candidates if item]
-
-    preferred_browser = local_browser_candidates[0] if local_browser_candidates else ""
-    explicit_browser = str(os.environ.get("LOCAL_FETCH_COOKIES_BROWSER", "") or os.environ.get("YTDLP_COOKIES_BROWSER", "")).strip().lower()
-    if not explicit_browser and prefer_local and local_browser_candidates:
-        preferred_browser = "auto"
+    preferred_browser = str(
+        os.environ.get("LOCAL_FETCH_COOKIES_BROWSER", "") or os.environ.get("YTDLP_COOKIES_BROWSER", "")
+    ).strip().lower()
 
     local_sources = {
         "cookies_file": str(os.environ.get("LOCAL_FETCH_COOKIES_FILE", "") or os.environ.get("YTDLP_COOKIES_FILE", "")).strip(),

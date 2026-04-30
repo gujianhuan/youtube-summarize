@@ -1,9 +1,12 @@
 """Bridge API contract compatibility tests."""
 
+from pathlib import Path
+
 from bridge_api import (
     BRIDGE_PAYLOAD_VERSION_V1,
     BRIDGE_PAYLOAD_VERSION_V2,
     _normalize_bridge_payload,
+    _resolve_bridge_store_file,
 )
 
 
@@ -108,3 +111,31 @@ def test_normalize_bridge_payload_promotes_envelope_version() -> None:
     )
 
     assert payload["bridgeVersion"] == BRIDGE_PAYLOAD_VERSION_V2
+
+
+def test_resolve_bridge_store_file_prefers_legacy_file(monkeypatch, tmp_path: Path) -> None:
+    """已有项目内 bridge_store.json 时应继续沿用旧路径。"""
+
+    legacy_file = tmp_path / "bridge_store.json"
+    legacy_file.write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv("BRIDGE_STORE_FILE", raising=False)
+    monkeypatch.setattr("bridge_api.BASE_DIR", tmp_path)
+
+    assert _resolve_bridge_store_file() == legacy_file.resolve()
+
+
+def test_resolve_bridge_store_file_falls_back_when_base_dir_not_writable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """项目目录不可写时应自动回退到系统临时目录。"""
+
+    monkeypatch.delenv("BRIDGE_STORE_FILE", raising=False)
+    monkeypatch.setattr("bridge_api.BASE_DIR", tmp_path)
+    monkeypatch.setattr("bridge_api.os.access", lambda *_args, **_kwargs: False)
+
+    resolved = _resolve_bridge_store_file()
+
+    assert resolved.name == "bridge_store.json"
+    assert resolved.parent.name == "youtube_summarizer"
+    assert resolved != (tmp_path / "bridge_store.json").resolve()

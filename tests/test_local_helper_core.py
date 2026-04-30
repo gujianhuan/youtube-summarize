@@ -1,8 +1,11 @@
 """`local_helper_core` 的轻量单元测试。"""
 
+import os
+
 from local_cli_mvp.local_helper_core import (
     BRIDGE_PAYLOAD_VERSION,
     TRANSCRIPT_SCHEMA_VERSION,
+    _resolve_cookie_sources,
     build_local_transcript_envelope,
     build_main_url,
     format_local_helper_error,
@@ -60,3 +63,31 @@ def test_bridge_payload_version_is_v2_for_local_helper() -> None:
     """本地工具桥接上传应默认使用 V2。"""
 
     assert BRIDGE_PAYLOAD_VERSION == 2
+
+
+def test_resolve_cookie_sources_auto_filters_unavailable_browsers(monkeypatch) -> None:
+    """auto 模式应只返回本机真实存在的浏览器来源。"""
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\demo\AppData\Local")
+    monkeypatch.setenv("APPDATA", r"C:\Users\demo\AppData\Roaming")
+
+    existing_paths = {
+        r"C:\Users\demo\AppData\Roaming\Mozilla\Firefox\Profiles",
+        r"C:\Users\demo\AppData\Roaming\Mozilla\Firefox\Profiles\abc.default-release\cookies.sqlite",
+    }
+
+    monkeypatch.setattr(
+        "local_cli_mvp.local_helper_core.os.path.isdir",
+        lambda path: str(path) in existing_paths,
+    )
+    monkeypatch.setattr(
+        "local_cli_mvp.local_helper_core.os.listdir",
+        lambda path: ["abc.default-release"] if "Firefox\\Profiles" in str(path) else [],
+    )
+    monkeypatch.setattr(
+        "local_cli_mvp.local_helper_core.os.path.exists",
+        lambda path: str(path) in existing_paths,
+    )
+
+    assert _resolve_cookie_sources("", "auto") == [{"cookiesfrombrowser": "firefox"}]

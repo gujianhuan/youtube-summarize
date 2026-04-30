@@ -10,10 +10,19 @@ const helperTitleEl = document.getElementById("helperTitle");
 const helperDescEl = document.getElementById("helperDesc");
 const helperGuideBtn = document.getElementById("helperGuideBtn");
 const copyLinkBtn = document.getElementById("copyLinkBtn");
+const mainUrlInput = document.getElementById("mainUrlInput");
+const bridgeUrlInput = document.getElementById("bridgeUrlInput");
+const bridgeTokenInput = document.getElementById("bridgeTokenInput");
+const useLocalMainBtn = document.getElementById("useLocalMainBtn");
+const saveConfigBtn = document.getElementById("saveConfigBtn");
+const resetConfigBtn = document.getElementById("resetConfigBtn");
 
 const FLOW_STATUS_KEY = "summarizerFlowStatus";
+const EXTENSION_CONFIG_KEY = "summarizerExtensionConfig";
 const EXTENSION_TOOL_VERSION = "chrome-extension-mvp";
 const LOCAL_HELPER_GUIDE_PAGE = "local_helper_guide.html";
+const DEFAULT_MAIN_URL = "https://youtube-summarize-0oms.onrender.com/";
+const DEFAULT_BRIDGE_URL = "https://youtube-summarize-bridge.onrender.com";
 let lastExtractResponse = null;
 
 /**
@@ -33,6 +42,49 @@ function syncActionButtons() {
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
   statusEl.style.color = isError ? "#dc2626" : "#4b5563";
+}
+
+function normalizeMainUrl(value) {
+  const trimmed = String(value || "").trim();
+  return (trimmed || DEFAULT_MAIN_URL).replace(/\/+$/, "") + "/";
+}
+
+function normalizeBridgeUrl(value) {
+  const trimmed = String(value || "").trim();
+  return (trimmed || DEFAULT_BRIDGE_URL).replace(/\/+$/, "");
+}
+
+async function loadExtensionConfig() {
+  const result = await chrome.storage.local.get(EXTENSION_CONFIG_KEY);
+  const config = result?.[EXTENSION_CONFIG_KEY] || {};
+  mainUrlInput.value = normalizeMainUrl(config.summarizerUrl || DEFAULT_MAIN_URL);
+  bridgeUrlInput.value = normalizeBridgeUrl(config.bridgeApiUrl || DEFAULT_BRIDGE_URL);
+  bridgeTokenInput.value = String(config.bridgeApiToken || "");
+}
+
+async function saveExtensionConfig() {
+  const config = {
+    summarizerUrl: normalizeMainUrl(mainUrlInput.value),
+    bridgeApiUrl: normalizeBridgeUrl(bridgeUrlInput.value),
+    bridgeApiToken: String(bridgeTokenInput.value || "").trim()
+  };
+  await chrome.storage.local.set({ [EXTENSION_CONFIG_KEY]: config });
+  mainUrlInput.value = config.summarizerUrl;
+  bridgeUrlInput.value = config.bridgeApiUrl;
+  bridgeTokenInput.value = config.bridgeApiToken;
+  setStatus("联调配置已保存。");
+}
+
+async function resetExtensionConfig() {
+  await chrome.storage.local.set({
+    [EXTENSION_CONFIG_KEY]: {
+      summarizerUrl: DEFAULT_MAIN_URL,
+      bridgeApiUrl: DEFAULT_BRIDGE_URL,
+      bridgeApiToken: ""
+    }
+  });
+  await loadExtensionConfig();
+  setStatus("已恢复默认线上配置。");
 }
 
 function hideHelperPanel() {
@@ -591,6 +643,7 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 loadLastFlowStatus();
+loadExtensionConfig();
 syncActionButtons();
 
 extractBtn.addEventListener("click", extractTranscript);
@@ -618,6 +671,27 @@ copyLinkBtn.addEventListener("click", async () => {
   }
   await navigator.clipboard.writeText(currentUrl);
   setStatus("已复制视频链接，可粘贴到本地转写助手。");
+});
+
+useLocalMainBtn.addEventListener("click", () => {
+  mainUrlInput.value = "http://127.0.0.1:8501/";
+  setStatus("已切换为本地主站地址，记得点“保存配置”。");
+});
+
+saveConfigBtn.addEventListener("click", async () => {
+  try {
+    await saveExtensionConfig();
+  } catch (error) {
+    setStatus(`保存配置失败: ${error?.message || error || "unknown_error"}`, true);
+  }
+});
+
+resetConfigBtn.addEventListener("click", async () => {
+  try {
+    await resetExtensionConfig();
+  } catch (error) {
+    setStatus(`恢复默认配置失败: ${error?.message || error || "unknown_error"}`, true);
+  }
 });
 
 openBtn.addEventListener("click", async () => {

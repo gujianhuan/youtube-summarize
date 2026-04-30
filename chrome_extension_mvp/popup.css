@@ -27,6 +27,20 @@ h1 {
   margin-bottom: 12px;
 }
 
+.config-panel {
+  margin-bottom: 12px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #dbeafe;
+  background: #eff6ff;
+}
+
+.config-panel h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #1d4ed8;
+}
+
 .helper-panel {
   margin-bottom: 12px;
   padding: 10px;

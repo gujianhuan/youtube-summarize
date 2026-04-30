@@ -15,6 +15,26 @@
         <button id="copyBtn" disabled>复制文本</button>
         <button id="openBtn" disabled>一键总结</button>
       </div>
+      <section class="config-panel">
+        <h2>联调配置</h2>
+        <label class="field">
+          <span>主站地址</span>
+          <input id="mainUrlInput" placeholder="例如 http://127.0.0.1:8501/">
+        </label>
+        <label class="field">
+          <span>Bridge 地址</span>
+          <input id="bridgeUrlInput" placeholder="例如 https://youtube-summarize-bridge.onrender.com">
+        </label>
+        <label class="field">
+          <span>Bridge Token（可选）</span>
+          <input id="bridgeTokenInput" placeholder="未配置可留空">
+        </label>
+        <div class="helper-actions">
+          <button id="useLocalMainBtn" class="secondary-btn">切到本地主站</button>
+          <button id="saveConfigBtn" class="secondary-btn">保存配置</button>
+          <button id="resetConfigBtn" class="secondary-btn">恢复默认</button>
+        </div>
+      </section>
       <section id="helperPanel" class="helper-panel helper-panel-hidden">
         <h2 id="helperTitle">需要本地转写助手</h2>
         <p id="helperDesc" class="helper-desc"></p>

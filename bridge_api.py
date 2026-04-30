@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import threading
+import tempfile
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,9 +23,28 @@ from urllib.parse import parse_qs, quote, urlparse
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent
-BRIDGE_STORE_FILE = Path(
-    os.environ.get("BRIDGE_STORE_FILE", str(BASE_DIR / "bridge_store.json"))
-).resolve()
+
+
+def _resolve_bridge_store_file() -> Path:
+    """解析 bridge 本地 JSON 的实际存储路径。"""
+    configured_path = str(os.environ.get("BRIDGE_STORE_FILE", "") or "").strip()
+    if configured_path:
+        return Path(configured_path).expanduser().resolve()
+
+    legacy_store_file = (BASE_DIR / "bridge_store.json").resolve()
+    if legacy_store_file.exists():
+        return legacy_store_file
+
+    try:
+        if os.access(BASE_DIR, os.W_OK):
+            return legacy_store_file
+    except Exception:
+        pass
+
+    return (Path(tempfile.gettempdir()) / "youtube_summarizer" / "bridge_store.json").resolve()
+
+
+BRIDGE_STORE_FILE = _resolve_bridge_store_file()
 BRIDGE_API_HOST = os.environ.get("BRIDGE_API_HOST", "0.0.0.0")
 BRIDGE_API_PORT = int(os.environ.get("PORT", os.environ.get("BRIDGE_API_PORT", "8765")) or "8765")
 BRIDGE_TTL_SECONDS = int(os.environ.get("BRIDGE_TTL_SECONDS", "900") or "900")

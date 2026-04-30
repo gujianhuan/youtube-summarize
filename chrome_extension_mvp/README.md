@@ -36,13 +36,29 @@
 3. 选择“加载已解压的扩展程序”
 4. 选择当前目录 `chrome_extension_mvp`
 
+## 新电脑本地联调建议
+
+如果你当前想测试的是“插件 -> 本地主站”的链路，推荐这样配：
+
+1. 先启动本地主站：`http://127.0.0.1:8501/`
+2. 打开插件弹窗里的“联调配置”
+3. 将“主站地址”设为：`http://127.0.0.1:8501/`
+4. `Bridge 地址` 默认可先保持：`https://youtube-summarize-bridge.onrender.com`
+5. 点击“保存配置”
+
+说明：
+
+- 这样插件会继续把 transcript 上传到线上 bridge
+- 但总结页会直接打开你本机的主站，便于在新电脑验证本地联调
+- 如果你后面也把本地 bridge 跑起来了，再把 `Bridge 地址` 改成本地地址即可
+
 ## 更新方式
 
 - 当前如果你使用的是“加载已解压的扩展程序”，**每次代码更新后都需要在 `chrome://extensions/` 里点一次刷新**
 - 现在项目里已经提供开发辅助脚本：
 
 ```powershell
-Set-Location "D:\Program Files\Trae\YouTubeSummarizer\chrome_extension_mvp"
+Set-Location "D:\Workspace\YouTubeSummarizer\chrome_extension_mvp"
 .\refresh_dev.ps1
 ```
 

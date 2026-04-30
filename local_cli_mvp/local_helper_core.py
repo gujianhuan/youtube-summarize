@@ -36,7 +36,7 @@ BRIDGE_UPLOAD_TIMEOUT_SECONDS = 20
 BRIDGE_UPLOAD_RETRY_COUNT = 2
 DEFAULT_MAIN_URL = "https://youtube-summarize-0oms.onrender.com/"
 DEFAULT_BRIDGE_API_URL = "https://youtube-summarize-bridge.onrender.com"
-DEFAULT_BROWSER_COOKIE_ORDER = ("chrome", "edge", "firefox")
+DEFAULT_BROWSER_COOKIE_ORDER = ("firefox", "edge", "chrome", "brave", "chromium")
 TRANSCRIPT_SCHEMA_VERSION = "1.0"
 BRIDGE_PAYLOAD_VERSION = 2
 
@@ -182,13 +182,62 @@ def _resolve_cookie_sources(cookies_file: str, cookies_browser: str) -> list[dic
 
     browser_names: list[str]
     if browser_value == "auto":
-        browser_names = list(DEFAULT_BROWSER_COOKIE_ORDER)
+        browser_names = [
+            browser_name for browser_name in DEFAULT_BROWSER_COOKIE_ORDER if _is_browser_cookie_source_available(browser_name)
+        ]
     else:
         browser_names = [part.strip() for part in browser_value.split(",") if part.strip()]
 
     for browser_name in browser_names:
         sources.append({"cookiesfrombrowser": browser_name})
     return sources
+
+
+def _is_browser_cookie_source_available(browser_name: str) -> bool:
+    """在 auto 模式下只探测本机真实可用的浏览器 Cookie 来源。"""
+
+    name = str(browser_name or "").strip().lower()
+    if not name:
+        return False
+    if os.name != "nt":
+        return True
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    roaming = os.environ.get("APPDATA", "")
+
+    def _has_chromium_cookie(base_dir: str) -> bool:
+        if not base_dir or not os.path.isdir(base_dir):
+            return False
+        try:
+            entries = os.listdir(base_dir)
+        except OSError:
+            return False
+        profile_dirs = [entry for entry in entries if entry == "Default" or entry.startswith("Profile")]
+        if not profile_dirs:
+            profile_dirs = ["Default"]
+        for profile_dir in profile_dirs:
+            for candidate in ("Cookies", os.path.join("Network", "Cookies")):
+                if os.path.exists(os.path.join(base_dir, profile_dir, candidate)):
+                    return True
+        return False
+
+    if name == "chrome":
+        return _has_chromium_cookie(os.path.join(local, "Google", "Chrome", "User Data"))
+    if name == "edge":
+        return _has_chromium_cookie(os.path.join(local, "Microsoft", "Edge", "User Data"))
+    if name == "brave":
+        return _has_chromium_cookie(os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"))
+    if name == "chromium":
+        return _has_chromium_cookie(os.path.join(local, "Chromium", "User Data"))
+    if name == "firefox":
+        profiles_dir = os.path.join(roaming, "Mozilla", "Firefox", "Profiles")
+        if not os.path.isdir(profiles_dir):
+            return False
+        try:
+            return any(os.path.exists(os.path.join(profiles_dir, entry, "cookies.sqlite")) for entry in os.listdir(profiles_dir))
+        except OSError:
+            return False
+    return False
 
 
 def _build_ydl_opts(
