@@ -1390,18 +1390,6 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
 # --- 主界面 ---
 st.title("🎬 Video Summarizer")
 st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
-st.caption(f"运行版本诊断：`{build_runtime_version_diagnostics()}`")
-render_build_info = get_render_build_info()
-if render_build_info["is_render"] == "yes":
-    deploy_text = render_build_info["deploy_id"] or "未暴露 deploy id"
-    commit_text = render_build_info["commit_short"] or "unknown"
-    branch_text = render_build_info["branch"] or "unknown"
-    st.caption(
-        f"Render 部署信息：commit=`{commit_text}` | branch=`{branch_text}` | "
-        f"deploy_id=`{deploy_text}` | service=`{render_build_info['service_name'] or 'unknown'}`"
-    )
-else:
-    st.caption("当前运行环境：本地开发模式（非 Render）")
 
 # 一级导航：按用户任务而不是输入形态组织页面。
 tab_processing, tab_tasks, tab_automation, tab_library, tab_settings = st.tabs([
