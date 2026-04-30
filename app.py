@@ -55,6 +55,40 @@ extension_bridge_reader = components.declare_component(
 def _get_shared_lock():
     return threading.Lock()
 
+
+def get_render_build_info() -> dict[str, str]:
+    """返回当前运行环境的 Render / Git 构建信息。"""
+
+    def _clean_env(name: str) -> str:
+        return str(os.environ.get(name, "") or "").strip()
+
+    is_render = _clean_env("RENDER") == "true"
+    deploy_id = (
+        _clean_env("RENDER_DEPLOY_ID")
+        or _clean_env("RENDER_BUILD_ID")
+        or _clean_env("RENDER_INSTANCE_ID")
+    )
+    commit = _clean_env("RENDER_GIT_COMMIT")
+    branch = _clean_env("RENDER_GIT_BRANCH")
+    repo_slug = _clean_env("RENDER_GIT_REPO_SLUG")
+    service_id = _clean_env("RENDER_SERVICE_ID")
+    service_name = _clean_env("RENDER_SERVICE_NAME")
+    service_type = _clean_env("RENDER_SERVICE_TYPE")
+    external_url = _clean_env("RENDER_EXTERNAL_URL")
+
+    return {
+        "is_render": "yes" if is_render else "no",
+        "deploy_id": deploy_id,
+        "commit": commit,
+        "commit_short": commit[:7] if commit else "",
+        "branch": branch,
+        "repo_slug": repo_slug,
+        "service_id": service_id,
+        "service_name": service_name,
+        "service_type": service_type,
+        "external_url": external_url,
+    }
+
 def load_json_file(filepath, default_value):
     if os.path.exists(filepath):
         try:
@@ -1357,6 +1391,17 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
 st.title("🎬 Video Summarizer")
 st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
 st.caption(f"运行版本诊断：`{build_runtime_version_diagnostics()}`")
+render_build_info = get_render_build_info()
+if render_build_info["is_render"] == "yes":
+    deploy_text = render_build_info["deploy_id"] or "未暴露 deploy id"
+    commit_text = render_build_info["commit_short"] or "unknown"
+    branch_text = render_build_info["branch"] or "unknown"
+    st.caption(
+        f"Render 部署信息：commit=`{commit_text}` | branch=`{branch_text}` | "
+        f"deploy_id=`{deploy_text}` | service=`{render_build_info['service_name'] or 'unknown'}`"
+    )
+else:
+    st.caption("当前运行环境：本地开发模式（非 Render）")
 
 # 一级导航：按用户任务而不是输入形态组织页面。
 tab_processing, tab_tasks, tab_automation, tab_library, tab_settings = st.tabs([
@@ -1831,6 +1876,7 @@ def render_settings_metrics(task_status_value):
     """
     runtime_diag = str(build_runtime_version_diagnostics() or "").strip()
     runtime_lines = [item.strip() for item in runtime_diag.split(";") if item.strip()]
+    render_info = get_render_build_info()
     runtime_summary = "本地开发版" if "expected_commit=latest-local" in runtime_diag else "运行中"
     task_summary = "运行中" if task_status_value in ["queued", "running"] else "空闲"
     bridge_summary = "已连接" if st.session_state.manual_bridge_meta else "暂无"
@@ -1860,6 +1906,26 @@ def render_settings_metrics(task_status_value):
             st.code("\n".join(runtime_lines), language="text")
         else:
             st.caption("暂无可展示的运行版本诊断信息。")
+
+    with st.expander("查看 Render 部署信息", expanded=False):
+        if render_info["is_render"] == "yes":
+            st.json(
+                {
+                    "commit": render_info["commit"] or "unknown",
+                    "branch": render_info["branch"] or "unknown",
+                    "deploy_id": render_info["deploy_id"] or "未暴露 deploy id",
+                    "service_id": render_info["service_id"] or "unknown",
+                    "service_name": render_info["service_name"] or "unknown",
+                    "service_type": render_info["service_type"] or "unknown",
+                    "external_url": render_info["external_url"] or "",
+                    "repo_slug": render_info["repo_slug"] or "",
+                },
+                expanded=False,
+            )
+            if not render_info["deploy_id"]:
+                st.caption("当前 Render 环境变量未明确暴露 deploy id；页面会优先显示 commit、branch 与 service 信息。")
+        else:
+            st.caption("当前为本地运行环境，未检测到 Render 部署变量。")
 
 
 def render_bridge_diagnostics_panel():
