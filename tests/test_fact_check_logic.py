@@ -1,6 +1,7 @@
 """事实核查来源映射与措辞收敛测试。"""
 
 from core_logic import (
+    _build_fact_check_fallback_markdown,
     _enrich_fact_check_items_with_claim_sources,
     _find_authoritative_sources,
 )
@@ -43,3 +44,27 @@ def test_enrich_fact_check_softens_absolute_negative_wording_when_sources_exist(
     assert "未发现任何主流财经新闻媒体" not in enriched
     assert "https://www.reuters.com/" in enriched
     assert "https://www.bloomberg.com/" in enriched
+
+
+def test_build_fact_check_fallback_markdown_keeps_more_detail() -> None:
+    """兜底核查结果也应保留待补充核查点和多个来源，避免内容过于单薄。"""
+
+    fallback = _build_fact_check_fallback_markdown(
+        claim_sources=[
+            {
+                "claim": "台湾股市总市值达到4.47万亿美元，超越加拿大成为全球第六大股市。",
+                "queries": ["台湾股市 4.47万亿美元 加拿大 第六大股市"],
+                "search_markdown": (
+                    "- [台湾证券交易所](https://www.twse.com.tw/en/)\n"
+                    "- [彭博社](https://www.bloomberg.com/)\n"
+                    "- [路透社](https://www.reuters.com/)\n"
+                    "- [美丽岛电子报](https://www.my-formosa.com/)"
+                ),
+            }
+        ]
+    )
+
+    assert "### 条目1" in fallback
+    assert "待补充核查点" in fallback
+    assert "https://www.twse.com.tw/en/" in fallback
+    assert "https://www.bloomberg.com/" in fallback

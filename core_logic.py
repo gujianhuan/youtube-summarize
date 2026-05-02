@@ -3446,6 +3446,7 @@ def _build_fact_check_fallback_markdown(
         "- 新闻/声明：本次事实核查未能稳定生成完整逐条结论，以下保留系统整理的候选核查线索。",
         "- 核查结论：待进一步核查",
         "- 依据：模型本次未稳定返回结构化核查结果，系统已保留搜索入口和权威站点，方便继续人工复核。",
+        "- 待补充核查点：建议优先核对原始报道时间、数字口径、机构原文和二次转载是否存在偏差。",
     ]
 
     if claim_sources:
@@ -3455,7 +3456,7 @@ def _build_fact_check_fallback_markdown(
             query_list = item.get("queries") or []
             search_md = str(item.get("search_markdown") or "")
             links = _extract_markdown_links(search_md)
-            source_text = "；".join(f"[{label}]({url})" for label, url in links[:4]) if links else "当前未提取到可点击来源链接。"
+            source_text = "；".join(f"[{label}]({url})" for label, url in links[:5]) if links else "当前未提取到可点击来源链接。"
             search_text = " | ".join(str(query).strip() for query in query_list if str(query).strip()) or "未生成搜索词"
             rendered_sections.append(
                 "\n".join(
@@ -3464,6 +3465,7 @@ def _build_fact_check_fallback_markdown(
                         f"- 新闻/声明：{claim}",
                         "- 核查结论：待进一步核查",
                         f"- 依据：本条为系统兜底生成结果。当前已保留候选搜索词 `{search_text}` 与可人工复核来源，建议结合最新报道继续确认。",
+                        "- 待补充核查点：建议继续核对原始报道、官方披露、统计口径与发布时间是否一致。",
                         f"- 来源/出处： {source_text}",
                     ]
                 )
@@ -3473,7 +3475,7 @@ def _build_fact_check_fallback_markdown(
 
     search_links = _extract_markdown_links(search_results_md)
     if search_links:
-        source_text = "；".join(f"[{label}]({url})" for label, url in search_links[:6])
+        source_text = "；".join(f"[{label}]({url})" for label, url in search_links[:8])
         sections.append(f"- 来源/出处： {source_text}")
     else:
         sections.append("- 来源/出处：当前未提取到可点击来源链接。")
@@ -4175,7 +4177,7 @@ def extract_key_claims(
     base_url: str,
     model: str,
     proxy_url: str = None,
-    max_claims: int = 5,
+    max_claims: int = 8,
 ) -> list[dict]:
     client = _build_openai_client(api_key, base_url, proxy_url)
     cleaned_text = clean_document_text(text)
@@ -4185,6 +4187,8 @@ def extract_key_claims(
         "要求：\n"
         "- 只提取可核查的硬信息，不要提取纯观点、情绪表达或修辞。\n"
         "- 优先提取：数字、时间、政策、官方表述、事件是否发生、人物公开言论、强因果判断。\n"
+        "- 如果原文里存在多条不同主体、不同数字、不同时间点的声明，不要合并成一条笼统表述。\n"
+        "- 如果文本里可核查点较多，请尽量提满，不要只返回 1-2 条过于宽泛的声明。\n"
         "- 只返回 JSON，对象格式如下：\n"
         "{\n"
         '  "claims": [\n'
@@ -4202,7 +4206,7 @@ def extract_key_claims(
             {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
-        max_tokens=1200,
+        max_tokens=1500,
         temperature=0.1,
     )
     content = _extract_completion_content(response)
@@ -4310,7 +4314,7 @@ def fact_check_document_claims(
     base_url: str,
     model: str,
     proxy_url: str = None,
-    max_claims: int = 5,
+    max_claims: int = 8,
     progress_callback=None,
 ) -> str:
     if max_claims <= 0:
@@ -4353,8 +4357,14 @@ def fact_check_document_claims(
         "### 条目1\n"
         "- 关键声明：...\n"
         "- 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
-        "- 判断依据：...\n"
-        "- 来源/出处：给出 1-3 个外部来源链接，格式如 [新华社](https://...)\n"
+        "- 判断依据：\n"
+        "  - 支持/对应的公开信息：...\n"
+        "  - 冲突点或证据不足之处：...\n"
+        "  - 当前判断原因：...\n"
+        "- 待补充核查点：...\n"
+        "- 来源/出处：给出 2-4 个外部来源链接，格式如 [新华社](https://...)\n"
+        "- 如果原文包含多条不同声明，请分别成条输出，不要把多个数字或多个事件揉成一条。\n"
+        "- 如果一条声明涉及数字、时间、机构、排名，请尽量分别说明这些要素是否匹配。\n"
         "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
         "- 禁止把文档本身当来源。\n"
         "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
@@ -4369,7 +4379,7 @@ def fact_check_document_claims(
             {"role": "system", "content": "你是一个严谨的事实核查助手。请基于外部来源逐条核查关键声明。"},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=2200,
+        max_tokens=3200,
         temperature=0.15,
     )
     content = _extract_completion_content(response).strip()
@@ -4548,12 +4558,14 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "2. `fact_check_markdown` 的要求：\n"
                 "   - 必须是 Markdown。\n"
                 "   - 不要输出表格，改为逐条列出“新闻/声明核查项”。\n"
+                "   - 如果文本里存在多个可核查说法，优先输出 3-6 条；信息密度高时可以到 8 条，不要只给 1-2 条笼统结论。\n"
                 "   - 每一条都必须使用下面结构：\n"
                 "     ### 条目1\n"
                 "     - 新闻/声明：...\n"
                 "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
-                "     - 依据：简要说明为什么这样判断\n"
-                "     - 来源/出处：必须给出 1-3 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
+                "     - 依据：不要只写一句话，至少交代支持信息、冲突/不足之处、当前判断原因\n"
+                "     - 待补充核查点：若仍有不确定处，明确写出还需要核对什么\n"
+                "     - 来源/出处：必须给出 2-4 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
                 "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社、路透社、彭博社、台湾证券交易所、美丽岛电子报等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
                 "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
                 "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
@@ -4579,7 +4591,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "**字幕内容输入：**\n"
                 f"{content}"
             )
-        max_tokens = 3000
+        max_tokens = 3600
         if fact_check_enabled and content_len >= 14000:
              prompt = (
                 f"你是一个专业的新闻分析师。当前日期是：{current_date}。\n"
@@ -4593,17 +4605,19 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                 "   - `## 主要内容` 里输出 8-12 条核心要点，每条只表达一个意思。\n"
                 "2. `fact_check_markdown`：\n"
                 "   - 必须逐条列出可核查新闻，不要使用表格。\n"
-                "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`来源/出处`。\n"
-                "   - `来源/出处` 必须尽量给出具体 URL，禁止把视频本身当作来源。\n"
+                "   - 优先输出 4-8 条最关键的可核查声明，不要只给少量笼统条目。\n"
+                "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`待补充核查点`、`来源/出处`。\n"
+                "   - `依据` 里至少说明支持信息、冲突/不足之处、当前判断原因。\n"
+                "   - `来源/出处` 必须尽量给出 2-4 个具体 URL，禁止把视频本身当作来源。\n"
                 "   - 如果提到具体机构、政府部门或媒体名，优先附上其官网或栏目页链接，不要只写机构名称，尤其是路透社、彭博社、台湾证券交易所、美丽岛电子报等来源。\n"
                 "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”，并保留候选来源链接。\n\n"
                 "   - 如果【实时搜索结果】里已经有与声明直接相关的候选链接，禁止下结论为“未发现任何报道”或“未发现证明”。\n\n"
                 "**字幕内容输入：**\n"
                 f"{content}"
             )
-             max_tokens = 2500
+             max_tokens = 3800
         elif fact_check_enabled and content_len >= 9000:
-            max_tokens = 2200
+            max_tokens = 3200
         print(f"SummarizeText: content_len={content_len}, max_tokens={max_tokens}, model={(model or '').strip() or 'gpt-3.5-turbo'}")
 
         response = client.chat.completions.create(
@@ -4614,7 +4628,7 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
                     "content": (
                         "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"
                         if not fact_check_enabled
-                        else "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰。事实核查必须逐条列出新闻/声明，并尽可能提供外部来源链接；禁止把视频本身当作来源，也不要输出空泛的“无法独立核实”。"
+                        else "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰。事实核查必须逐条列出新闻/声明，尽量覆盖 3-8 条关键可核查说法，并提供更完整的判断依据、待补充核查点和外部来源链接；禁止把视频本身当作来源，也不要输出空泛的“无法独立核实”。"
                     ),
                 },
                 {"role": "user", "content": prompt}
