@@ -7,6 +7,7 @@ import traceback
 import json
 import os
 import re
+import html
 import uuid
 import calendar
 import requests
@@ -41,6 +42,7 @@ SUBSCRIPTIONS_FILE = os.path.join(BASE_DIR, "subscriptions.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 GUESTBOOK_FILE = os.path.join(BASE_DIR, "guestbook.json")
+FEEDBACK_FILE = os.path.join(BASE_DIR, "feedback_reports.json")
 BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
 BRIDGE_API_URL = str(os.environ.get("BRIDGE_API_URL", "https://youtube-summarize-bridge.onrender.com") or "").strip().rstrip("/")
@@ -122,6 +124,172 @@ def load_guestbook():
 
 def save_guestbook(guestbook):
     save_json_file(GUESTBOOK_FILE, guestbook)
+
+def load_feedback_reports():
+    return load_json_file(FEEDBACK_FILE, [])
+
+def save_feedback_reports(reports):
+    save_json_file(FEEDBACK_FILE, reports)
+
+def append_feedback_report(report: dict):
+    reports = load_feedback_reports()
+    reports.insert(0, report)
+    if len(reports) > 500:
+        reports = reports[:500]
+    save_feedback_reports(reports)
+
+def _short_display(value: str, limit: int = 24) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+def build_issue_diagnostics_snapshot(
+    context_label: str,
+    *,
+    source_url: str = "",
+    error_text: str = "",
+    extra: dict | None = None,
+) -> dict:
+    render_info = get_render_build_info()
+    bridge_meta = st.session_state.get("manual_bridge_meta") or {}
+    return {
+        "timestamp": _iso(_now()),
+        "context": str(context_label or "").strip(),
+        "source_url": str(source_url or "").strip(),
+        "error_text": str(error_text or "").strip(),
+        "render_commit": render_info.get("commit_short") or "local",
+        "render_branch": render_info.get("branch") or "local",
+        "render_deploy_id": render_info.get("deploy_id") or "",
+        "render_service": render_info.get("service_name") or "",
+        "runtime_diag": str(build_runtime_version_diagnostics() or "").strip(),
+        "bg_task_id": str(st.session_state.get("bg_task_id") or "").strip(),
+        "has_video_transcript": bool(st.session_state.get("transcript_text")),
+        "has_video_summary": bool(st.session_state.get("summary_text")),
+        "has_manual_summary": bool(st.session_state.get("manual_summary_text")),
+        "bridge_meta": bridge_meta if isinstance(bridge_meta, dict) else {},
+        "extra": extra or {},
+    }
+
+def format_issue_diagnostics_text(snapshot: dict) -> str:
+    if not isinstance(snapshot, dict):
+        return ""
+    lines = [
+        f"time={snapshot.get('timestamp') or ''}",
+        f"context={snapshot.get('context') or ''}",
+        f"commit={snapshot.get('render_commit') or 'local'}",
+        f"branch={snapshot.get('render_branch') or 'local'}",
+        f"deploy_id={snapshot.get('render_deploy_id') or 'n/a'}",
+        f"service={snapshot.get('render_service') or 'n/a'}",
+        f"source_url={snapshot.get('source_url') or ''}",
+        f"bg_task_id={snapshot.get('bg_task_id') or ''}",
+        f"runtime_diag={snapshot.get('runtime_diag') or ''}",
+    ]
+    error_text = str(snapshot.get("error_text") or "").strip()
+    if error_text:
+        lines.append(f"error={error_text}")
+    bridge_meta = snapshot.get("bridge_meta") or {}
+    if bridge_meta:
+        lines.append(f"bridge_meta={json.dumps(bridge_meta, ensure_ascii=False, sort_keys=True)}")
+    extra = snapshot.get("extra") or {}
+    if extra:
+        lines.append(f"extra={json.dumps(extra, ensure_ascii=False, sort_keys=True)}")
+    return "\n".join(lines).strip()
+
+def render_copy_to_clipboard_button(label: str, text: str, key: str) -> None:
+    button_id = f"copy_btn_{re.sub(r'[^a-zA-Z0-9_]+', '_', key)}"
+    status_id = f"{button_id}_status"
+    button_label = html.escape(str(label or "复制"))
+    text_payload = json.dumps(str(text or ""), ensure_ascii=False)
+    components.html(
+        f"""
+        <div style="display:flex;align-items:center;gap:8px;margin:0.1rem 0 0.4rem 0;">
+          <button id="{button_id}" style="padding:0.35rem 0.8rem;border-radius:0.5rem;border:1px solid #d0d7de;background:#f6f8fa;cursor:pointer;">
+            {button_label}
+          </button>
+          <span id="{status_id}" style="color:#57606a;font-size:0.9rem;"></span>
+        </div>
+        <script>
+        const btn = document.getElementById("{button_id}");
+        const status = document.getElementById("{status_id}");
+        btn.addEventListener("click", async () => {{
+          const clipboard = navigator.clipboard || (window.parent && window.parent.navigator && window.parent.navigator.clipboard);
+          try {{
+            await clipboard.writeText({text_payload});
+            status.textContent = "已复制";
+            setTimeout(() => status.textContent = "", 1500);
+          }} catch (err) {{
+            status.textContent = "复制失败，请手动复制下方文本";
+          }}
+        }});
+        </script>
+        """,
+        height=42,
+    )
+
+def render_issue_report_box(
+    context_label: str,
+    *,
+    source_url: str = "",
+    error_text: str = "",
+    extra: dict | None = None,
+    key_prefix: str,
+    expanded: bool = False,
+    box_title: str = "诊断与问题上报",
+) -> None:
+    snapshot = build_issue_diagnostics_snapshot(
+        context_label,
+        source_url=source_url,
+        error_text=error_text,
+        extra=extra,
+    )
+    diag_text = format_issue_diagnostics_text(snapshot)
+    with st.expander(box_title, expanded=expanded):
+        st.caption("先复制诊断信息，再提交问题反馈；后续排查会更快。")
+        render_copy_to_clipboard_button("复制诊断信息", diag_text, f"{key_prefix}_copy")
+        st.text_area(
+            "诊断信息预览",
+            diag_text,
+            height=180,
+            key=f"{key_prefix}_diag_preview",
+        )
+        with st.form(f"{key_prefix}_feedback_form", clear_on_submit=True):
+            reporter = st.text_input("昵称", value="User", max_chars=20)
+            issue_type = st.selectbox(
+                "问题类型",
+                ["提取失败", "总结失败", "事实核查问题", "版本/部署问题", "其他"],
+                key=f"{key_prefix}_issue_type",
+            )
+            report_source_url = st.text_input(
+                "来源链接（可选）",
+                value=str(source_url or ""),
+                key=f"{key_prefix}_source_url",
+            )
+            report_message = st.text_area(
+                "问题描述",
+                value=str(error_text or ""),
+                height=120,
+                placeholder="请尽量描述你做了什么、预期是什么、实际发生了什么。",
+                key=f"{key_prefix}_message",
+            )
+            submitted = st.form_submit_button("提交问题")
+            if submitted:
+                append_feedback_report(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "timestamp": _iso(_now()),
+                        "user": reporter.strip() or "Anonymous",
+                        "issue_type": issue_type,
+                        "context": context_label,
+                        "source_url": report_source_url.strip(),
+                        "message": report_message.strip(),
+                        "diagnostics": snapshot,
+                        "diagnostics_text": diag_text,
+                    }
+                )
+                st.success("问题已记录，可继续把上面的诊断信息直接发给我或测试群。")
 
 def read_extension_bridge_payload(payload_id: str, consume: bool = True) -> dict | None:
     """从主站同域 bridge storage 读取扩展预先写入的 transcript 载荷。"""
@@ -1865,7 +2033,12 @@ def render_settings_metrics(task_status_value):
     runtime_diag = str(build_runtime_version_diagnostics() or "").strip()
     runtime_lines = [item.strip() for item in runtime_diag.split(";") if item.strip()]
     render_info = get_render_build_info()
-    runtime_summary = "本地开发版" if "expected_commit=latest-local" in runtime_diag else "运行中"
+    if render_info["is_render"] == "yes":
+        runtime_summary = render_info["commit_short"] or "unknown"
+        runtime_caption = f"deploy={_short_display(render_info['deploy_id'] or 'n/a', 18)} | branch={render_info['branch'] or 'unknown'}"
+    else:
+        runtime_summary = "本地开发版" if "expected_commit=latest-local" in runtime_diag else "运行中"
+        runtime_caption = f"commit={render_info['commit_short'] or 'local'} | deploy=local"
     task_summary = "运行中" if task_status_value in ["queued", "running"] else "空闲"
     bridge_summary = "已连接" if st.session_state.manual_bridge_meta else "暂无"
 
@@ -1875,7 +2048,7 @@ def render_settings_metrics(task_status_value):
         with st.container(border=True):
             st.caption("运行版本")
             st.markdown(f"### {runtime_summary}")
-            st.caption(f"共 {len(runtime_lines) or 1} 项诊断信息")
+            st.caption(runtime_caption)
 
     with diag_col2:
         with st.container(border=True):
@@ -2003,6 +2176,19 @@ def render_settings_diagnostics_page(task_status_value, task_logs, task_runs, ta
 
     render_settings_metrics(task_status_value)
     render_bridge_diagnostics_panel()
+    render_issue_report_box(
+        "设置与诊断页",
+        source_url=st.session_state.get("manual_source_url") or "",
+        extra={
+            "task_status": task_status_value or "",
+            "task_log_count": len(task_logs or []),
+            "task_run_count": len(task_runs or []),
+            "task_run_item_count": len(task_run_items or []),
+        },
+        key_prefix="settings_diag",
+        expanded=False,
+        box_title="诊断信息与问题上报",
+    )
 
     st.divider()
     st.markdown("#### 💬 反馈与建议")
@@ -2036,6 +2222,14 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
 
     if err:
         st.error(f"总结失败: {err}")
+        render_issue_report_box(
+            "单视频总结失败",
+            source_url=url,
+            error_text=err,
+            extra={"mode": "single_video_summary", "manual": bool(manual)},
+            key_prefix="video_summary_fail",
+            expanded=False,
+        )
         return
 
     st.session_state.summary_text = summary
@@ -2095,6 +2289,14 @@ def do_video_fetch_single(url):
             progress_bar.empty()
             status_container.error("❌ 抓取失败")
             st.error(err)
+            render_issue_report_box(
+                "视频抓取失败",
+                source_url=url,
+                error_text=err,
+                extra={"mode": "video_fetch"},
+                key_prefix="video_fetch_fail",
+                expanded=False,
+            )
             return
 
         whisper_device_info, text = _extract_whisper_device_info(text)
@@ -2114,6 +2316,14 @@ def do_video_fetch_single(url):
         status_container.error("❌ 执行异常")
         st.error(f"{e}")
         st.code(traceback.format_exc())
+        render_issue_report_box(
+            "视频抓取异常",
+            source_url=url,
+            error_text=str(e),
+            extra={"mode": "video_fetch_exception", "traceback": traceback.format_exc()[-2000:]},
+            key_prefix="video_fetch_exception",
+            expanded=False,
+        )
 
 
 def do_video_check_single(url):
@@ -2130,6 +2340,14 @@ def do_video_check_single(url):
             st.text(report)
     except Exception as e:
         st.error(format_error(e))
+        render_issue_report_box(
+            "字幕检测失败",
+            source_url=url,
+            error_text=format_error(e),
+            extra={"mode": "video_check"},
+            key_prefix="video_check_fail",
+            expanded=False,
+        )
 
 
 def render_video_summary_section():
@@ -2286,6 +2504,14 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
 
     if err:
         st.error(f"总结失败: {err}")
+        render_issue_report_box(
+            "粘贴文本总结失败",
+            source_url=manual_source_url,
+            error_text=err,
+            extra={"mode": "manual_transcript_summary"},
+            key_prefix="manual_summary_fail",
+            expanded=False,
+        )
         return
 
     st.session_state.manual_summary_text = summary
@@ -2506,6 +2732,13 @@ def run_uploaded_document_summary(uploaded_doc):
             progress_bar.empty()
             status_container.error("❌ 文档总结失败")
             st.error(err)
+            render_issue_report_box(
+                "上传文档总结失败",
+                error_text=err,
+                extra={"mode": "document_upload_summary", "file_name": uploaded_doc.name},
+                key_prefix="doc_upload_fail",
+                expanded=False,
+            )
             return
 
         save_document_result("upload", result, doc_duration)
@@ -2516,6 +2749,13 @@ def run_uploaded_document_summary(uploaded_doc):
         status_container.error("❌ 文档处理异常")
         st.error(str(e))
         st.code(traceback.format_exc())
+        render_issue_report_box(
+            "上传文档处理异常",
+            error_text=str(e),
+            extra={"mode": "document_upload_exception", "traceback": traceback.format_exc()[-2000:]},
+            key_prefix="doc_upload_exception",
+            expanded=False,
+        )
 
 
 def run_document_url_summary(doc_url):
@@ -2545,6 +2785,14 @@ def run_document_url_summary(doc_url):
             progress_bar.empty()
             status_container.error("❌ 在线文档总结失败")
             st.error(err)
+            render_issue_report_box(
+                "在线文档总结失败",
+                source_url=doc_url,
+                error_text=err,
+                extra={"mode": "document_url_summary"},
+                key_prefix="doc_url_fail",
+                expanded=False,
+            )
             return
 
         save_document_result("url", result, doc_duration)
@@ -2555,6 +2803,14 @@ def run_document_url_summary(doc_url):
         status_container.error("❌ 在线内容处理异常")
         st.error(str(e))
         st.code(traceback.format_exc())
+        render_issue_report_box(
+            "在线内容处理异常",
+            source_url=doc_url,
+            error_text=str(e),
+            extra={"mode": "document_url_exception", "traceback": traceback.format_exc()[-2000:]},
+            key_prefix="doc_url_exception",
+            expanded=False,
+        )
 
 
 def render_document_processing_tab():
