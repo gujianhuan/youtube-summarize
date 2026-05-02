@@ -2,5 +2,4 @@
 headless = true
 
 [browser]
-# Auto-deploy probe: safe to remove after verification.
 gatherUsageStats = false
