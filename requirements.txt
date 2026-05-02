@@ -1,4 +1,4 @@
-streamlit
+streamlit==1.46.0
 requests
 youtube-transcript-api
 yt-dlp
