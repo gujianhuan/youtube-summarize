@@ -641,29 +641,63 @@ def _split_fact_check_sections(fact_check_md: str) -> list[str]:
 
 
 def _parse_fact_check_section(section_text: str) -> dict[str, object]:
-    """解析单条事实核查，拆出标题、正文和来源链接。"""
+    """解析单条事实核查，拆出标题、结论、依据、待补充项和来源。"""
     section = str(section_text or "").strip()
     lines = [line.rstrip() for line in section.splitlines()]
     title = ""
     conclusion = ""
+    rationale_lines: list[str] = []
+    pending_lines: list[str] = []
     body_lines: list[str] = []
     source_lines: list[str] = []
+    active_field = ""
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            if active_field in {"rationale", "pending"}:
+                target = rationale_lines if active_field == "rationale" else pending_lines
+                if target and target[-1] != "":
+                    target.append("")
             continue
         if not title:
             claim_match = re.search(r"(?:新闻/声明|关键声明|声明|新闻)[:：]\s*(.+)", stripped)
             if claim_match:
                 title = claim_match.group(1).strip()
+                active_field = ""
+                continue
             elif stripped.startswith("###"):
                 title = stripped.lstrip("#").strip()
+                active_field = ""
+                continue
         conclusion_match = re.search(r"核查结论[:：]\s*(.+)", stripped)
         if conclusion_match and not conclusion:
             conclusion = conclusion_match.group(1).strip()
+            active_field = ""
+            continue
+        rationale_match = re.search(r"(?:判断依据|依据)[:：]\s*(.*)", stripped)
+        if rationale_match:
+            rationale_text = rationale_match.group(1).strip()
+            if rationale_text:
+                rationale_lines.append(rationale_text)
+            active_field = "rationale"
+            continue
+        pending_match = re.search(r"待补充核查点[:：]\s*(.*)", stripped)
+        if pending_match:
+            pending_text = pending_match.group(1).strip()
+            if pending_text:
+                pending_lines.append(pending_text)
+            active_field = "pending"
+            continue
         if re.search(r"来源(?:链接|/出处|出处)?[:：]", stripped):
             source_lines.append(stripped)
+            active_field = ""
+            continue
+        if active_field == "rationale":
+            rationale_lines.append(stripped)
+            continue
+        if active_field == "pending":
+            pending_lines.append(stripped)
             continue
         body_lines.append(line)
 
@@ -672,14 +706,30 @@ def _parse_fact_check_section(section_text: str) -> dict[str, object]:
 
     source_links = _extract_markdown_links(section)
     body_markdown = "\n".join(body_lines).strip()
+    rationale_markdown = "\n".join(line for line in rationale_lines).strip()
+    pending_markdown = "\n".join(line for line in pending_lines).strip()
     source_summary = "\n".join(source_lines).strip()
     return {
         "title": title,
         "conclusion": conclusion,
+        "rationale_markdown": rationale_markdown,
+        "pending_markdown": pending_markdown,
         "body_markdown": body_markdown,
         "source_links": source_links,
         "source_summary": source_summary,
     }
+
+
+def _render_fact_check_label(label: str) -> None:
+    st.markdown(
+        (
+            "<div style='margin:0.55rem 0 0.2rem 0;"
+            "font-size:0.8rem;font-weight:600;color:#57606a;'>"
+            f"{html.escape(str(label or '').strip())}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def _render_source_links(source_links: list[tuple[str, str]]) -> None:
@@ -695,7 +745,7 @@ def _render_source_links(source_links: list[tuple[str, str]]) -> None:
     if not deduped:
         st.caption("当前未提取到可点击的核查来源。")
         return
-    st.markdown("**核查来源**")
+    _render_fact_check_label("来源/出处")
     source_lines = [f"- [{label}]({url})" for label, url in deduped[:12]]
     st.markdown("\n".join(source_lines))
 
@@ -718,7 +768,24 @@ def render_fact_check_content(fact_check_md: str, *, fact_title: str = "🕵️ 
         conclusion = str(parsed.get("conclusion") or "").strip()
         st.markdown(f"#### {title}")
         if conclusion:
-            st.caption(f"结论：{conclusion}")
+            st.markdown(
+                (
+                    "<div style='margin:0.25rem 0 0.75rem 0;padding:0.6rem 0.8rem;"
+                    "border:1px solid #d0d7de;border-radius:0.75rem;background:#f6f8fa;'>"
+                    "<div style='font-size:0.8rem;font-weight:600;color:#57606a;margin-bottom:0.2rem;'>核查结论</div>"
+                    f"<div style='color:#24292f;'>{html.escape(conclusion)}</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
+        if rationale_markdown:
+            _render_fact_check_label("判断依据")
+            st.markdown(rationale_markdown)
+        pending_markdown = str(parsed.get("pending_markdown") or "").strip()
+        if pending_markdown:
+            _render_fact_check_label("待补充核查点")
+            st.markdown(pending_markdown)
         body_markdown = str(parsed.get("body_markdown") or "").strip()
         if body_markdown:
             st.markdown(body_markdown)
