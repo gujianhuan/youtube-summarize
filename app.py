@@ -47,6 +47,8 @@ BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
 BRIDGE_API_URL = str(os.environ.get("BRIDGE_API_URL", "https://youtube-summarize-bridge.onrender.com") or "").strip().rstrip("/")
 BRIDGE_API_TOKEN = str(os.environ.get("BRIDGE_API_TOKEN", "") or "").strip()
+DEFAULT_SUMMARY_MODEL = "Pro/MiniMaxAI/MiniMax-M2.5"
+DEFAULT_FACT_CHECK_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 extension_bridge_reader = components.declare_component(
     "extension_bridge_reader",
@@ -112,6 +114,48 @@ def load_settings_safe():
 def save_settings_safe(settings):
     with _get_shared_lock():
         save_json_file(SETTINGS_FILE, settings)
+
+
+def _looks_like_siliconflow_base_url(base_url_value: str) -> bool:
+    lowered = str(base_url_value or "").strip().lower()
+    return "siliconflow" in lowered
+
+
+def resolve_pipeline_models(
+    settings_dict: dict | None = None,
+    *,
+    env: dict | None = None,
+    base_url_value: str = "",
+) -> tuple[str, str]:
+    settings_dict = settings_dict or {}
+    env = env or os.environ
+    legacy_model = str(settings_dict.get("model") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
+    default_summary_model = legacy_model
+    default_fact_check_model = legacy_model
+    if _looks_like_siliconflow_base_url(base_url_value):
+        default_summary_model = DEFAULT_SUMMARY_MODEL
+        default_fact_check_model = DEFAULT_FACT_CHECK_MODEL
+
+    summary_model = (
+        str(env.get("OPENAI_SUMMARY_MODEL", "") or "").strip()
+        or str(settings_dict.get("summary_model") or "").strip()
+        or str(env.get("OPENAI_MODEL", "") or "").strip()
+        or default_summary_model
+    )
+    fact_check_model = (
+        str(env.get("OPENAI_FACT_CHECK_MODEL", "") or "").strip()
+        or str(settings_dict.get("fact_check_model") or "").strip()
+        or default_fact_check_model
+    )
+    return summary_model, fact_check_model
+
+
+def format_pipeline_model_label(summary_model_name: str, fact_check_model_name: str) -> str:
+    summary_model_name = str(summary_model_name or "").strip() or "unknown"
+    fact_check_model_name = str(fact_check_model_name or "").strip() or summary_model_name
+    if summary_model_name == fact_check_model_name:
+        return summary_model_name
+    return f"总结:{summary_model_name} | 核查:{fact_check_model_name}"
 
 def load_history():
     return load_json_file(HISTORY_FILE, [])
@@ -1124,7 +1168,10 @@ def _run_task_once(task, settings):
     eff_proxy, _ = get_effective_proxy(proxy_value, True)
     timeout_seconds = float(settings.get("timeout_seconds") or 20.0)
     channel_url = task.get("channel_url")
-    model_name = settings.get("model") or "gpt-3.5-turbo"
+    summary_model_name, fact_check_model_name = resolve_pipeline_models(
+        settings,
+        base_url_value=str(settings.get("base_url") or ""),
+    )
     if not channel_url:
         _append_log(logs, "error", "任务缺少频道链接，已跳过", task.get("id"))
         settings["schedule_logs"] = logs
@@ -1148,7 +1195,8 @@ def _run_task_once(task, settings):
         "success_items": 0,
         "failed_items": 0,
         "duration_seconds": 0,
-        "model": model_name,
+        "model": summary_model_name,
+        "fact_check_model": fact_check_model_name,
         "error": "",
     }
     try:
@@ -1197,7 +1245,14 @@ def _run_task_once(task, settings):
                 run_items.append(item_record)
                 continue
             try:
-                summary = summarize_text(text, api_key, base_url, model_name, eff_proxy)
+                summary = summarize_text(
+                    text,
+                    api_key,
+                    base_url,
+                    summary_model_name,
+                    eff_proxy,
+                    fact_check_model=fact_check_model_name,
+                )
                 item_record["status"] = "success"
                 item_record["summary"] = summary
                 item_record["duration_seconds"] = int((_now() - item_start).total_seconds())
@@ -1470,6 +1525,10 @@ if "base_url" not in st.session_state:
     st.session_state.base_url = st.session_state.settings.get("base_url", "https://api.openai.com/v1")
 if "model" not in st.session_state:
     st.session_state.model = st.session_state.settings.get("model", "gpt-3.5-turbo")
+if "summary_model" not in st.session_state:
+    st.session_state.summary_model = str(st.session_state.settings.get("summary_model") or "").strip()
+if "fact_check_model" not in st.session_state:
+    st.session_state.fact_check_model = str(st.session_state.settings.get("fact_check_model") or "").strip()
 if "proxy" not in st.session_state:
     st.session_state.proxy = st.session_state.settings.get("proxy", "")
 if "transcript_text" not in st.session_state:
@@ -1532,6 +1591,8 @@ if "last_saved_settings" not in st.session_state:
         "api_key": st.session_state.settings.get("api_key", "") if remember_api_key_initial else "",
         "base_url": st.session_state.settings.get("base_url", "https://api.openai.com/v1"),
         "model": st.session_state.settings.get("model", "gpt-3.5-turbo"),
+        "summary_model": str(st.session_state.settings.get("summary_model") or "").strip(),
+        "fact_check_model": str(st.session_state.settings.get("fact_check_model") or "").strip(),
         "proxy": st.session_state.settings.get("proxy", ""),
         "remember_api_key": remember_api_key_initial,
     }
@@ -1554,12 +1615,20 @@ asr_fast_mode = True
 
 api_key = os.environ.get("OPENAI_API_KEY", st.session_state.settings.get("api_key", ""))
 base_url = os.environ.get("OPENAI_BASE_URL", st.session_state.settings.get("base_url", "https://api.openai.com/v1"))
-model_selected = os.environ.get("OPENAI_MODEL", st.session_state.settings.get("model", "gpt-3.5-turbo"))
+summary_model_selected, fact_check_model_selected = resolve_pipeline_models(
+    st.session_state.settings,
+    env=os.environ,
+    base_url_value=base_url,
+)
+model_selected = summary_model_selected
+pipeline_model_label = format_pipeline_model_label(summary_model_selected, fact_check_model_selected)
 
 st.session_state.proxy = proxy_input
 st.session_state.api_key = api_key
 st.session_state.base_url = base_url
 st.session_state.model = model_selected
+st.session_state.summary_model = summary_model_selected
+st.session_state.fact_check_model = fact_check_model_selected
 
 query_params = st.query_params
 ext_payload_id = str(query_params.get("ext_payload_id", "") or "").strip()
@@ -1701,7 +1770,14 @@ def internal_fetch_transcript(video_url, progress_callback=None):
     except Exception as e:
         return None, format_error(e)
 
-def internal_summarize(text, model_name, api_key_override=None, base_url_override=None, proxy_override=None):
+def internal_summarize(
+    text,
+    summary_model_name,
+    fact_check_model_name=None,
+    api_key_override=None,
+    base_url_override=None,
+    proxy_override=None,
+):
         """
         核心总结逻辑，返回 (summary_text, error_msg)
         支持外部传入凭证（用于后台线程）
@@ -1717,8 +1793,9 @@ def internal_summarize(text, model_name, api_key_override=None, base_url_overrid
                 text,
                 eff_api_key,
                 eff_base_url,
-                model_name,
+                summary_model_name,
                 eff_proxy,
+                fact_check_model=fact_check_model_name,
                 stream=False  # 后台任务默认不使用流式
             )
             return summary, None
@@ -1726,7 +1803,15 @@ def internal_summarize(text, model_name, api_key_override=None, base_url_overrid
             return None, str(e)
 
 
-def run_document_summary_pipeline(extracted, model_name, eff_api_key, eff_base_url, eff_proxy, progress_callback=None):
+def run_document_summary_pipeline(
+    extracted,
+    summary_model_name,
+    fact_check_model_name,
+    eff_api_key,
+    eff_base_url,
+    eff_proxy,
+    progress_callback=None,
+):
         """
         复用文档总结主流程，统一执行正文总结、文档判定与关键声明事实核查。
         """
@@ -1738,7 +1823,7 @@ def run_document_summary_pipeline(extracted, model_name, eff_api_key, eff_base_u
             extracted["clean_text"],
             eff_api_key,
             eff_base_url,
-            model_name,
+            summary_model_name,
             eff_proxy,
             progress_callback=relay_document_progress,
         )
@@ -1750,7 +1835,7 @@ def run_document_summary_pipeline(extracted, model_name, eff_api_key, eff_base_u
             summary_markdown=summary_result["summary_markdown"],
             api_key=eff_api_key,
             base_url=eff_base_url,
-            model=model_name,
+            model=fact_check_model_name,
             proxy_url=eff_proxy,
         )
 
@@ -1765,7 +1850,7 @@ def run_document_summary_pipeline(extracted, model_name, eff_api_key, eff_base_u
                 summary_markdown=summary_result["summary_markdown"],
                 api_key=eff_api_key,
                 base_url=eff_base_url,
-                model=model_name,
+                model=fact_check_model_name,
                 proxy_url=eff_proxy,
                 max_claims=int(fact_check_plan.get("recommended_claim_count") or 5),
                 progress_callback=relay_fact_progress,
@@ -1783,6 +1868,8 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
         eff_proxy = proxy_override or proxy_input
+        summary_model_name = str(model_name or summary_model_selected).strip() or summary_model_selected
+        fact_check_model_name = fact_check_model_selected
 
         ok, err = validate_document_upload(file_name, len(file_bytes))
         if not ok:
@@ -1798,7 +1885,8 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
             progress_callback(25, f"文档解析完成，正文约 {extracted['char_count']} 字符。")
         return run_document_summary_pipeline(
             extracted,
-            model_name,
+            summary_model_name,
+            fact_check_model_name,
             eff_api_key,
             eff_base_url,
             eff_proxy,
@@ -1810,6 +1898,8 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
         eff_proxy = proxy_override or proxy_input
+        summary_model_name = str(model_name or summary_model_selected).strip() or summary_model_selected
+        fact_check_model_name = fact_check_model_selected
 
         if not eff_api_key:
             return None, "请先填写 API Key。"
@@ -1821,7 +1911,8 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
             progress_callback(25, f"在线内容解析完成，正文约 {extracted['char_count']} 字符。")
         return run_document_summary_pipeline(
             extracted,
-            model_name,
+            summary_model_name,
+            fact_check_model_name,
             eff_api_key,
             eff_base_url,
             eff_proxy,
@@ -2240,6 +2331,7 @@ def render_settings_diagnostics_page(task_status_value, task_logs, task_runs, ta
     """
     st.markdown("### 🛠️ 设置与诊断")
     st.caption("集中放置运行诊断、桥接状态和反馈入口，降低问题排查成本。")
+    st.caption(f"当前双模型流水线：`{pipeline_model_label}`")
 
     render_settings_metrics(task_status_value)
     render_bridge_diagnostics_panel()
@@ -2276,8 +2368,12 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         return
 
     t_sum_start = time.time()
-    with st.spinner(f"正在请求 AI 总结 ({model_selected})..."):
-        summary, err = internal_summarize(st.session_state.transcript_text, model_selected)
+    with st.spinner(f"正在请求 AI 总结 ({pipeline_model_label})..."):
+        summary, err = internal_summarize(
+            st.session_state.transcript_text,
+            summary_model_selected,
+            fact_check_model_selected,
+        )
 
     sum_duration = time.time() - t_sum_start
     total_duration = fetch_duration + sum_duration
@@ -2431,6 +2527,7 @@ def render_video_summary_section():
         sum_t = duration_info.get("summary", 0)
         total_t = duration_info.get("total", 0)
         st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (抓取/转写: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
+    st.caption(f"🤖 模型流水线：{pipeline_model_label}")
 
     render_summary_content(
         st.session_state.summary_text,
@@ -2508,7 +2605,15 @@ def render_video_processing_tab():
         if not url:
             st.warning("请输入视频链接")
         else:
-            task_id = submit_task(url, model_selected, proxy_input, use_system_proxy, api_key, base_url)
+            task_id = submit_task(
+                url,
+                summary_model_selected,
+                fact_check_model_selected,
+                proxy_input,
+                use_system_proxy,
+                api_key,
+                base_url,
+            )
             st.session_state.bg_task_id = task_id
             st.rerun()
 
@@ -2557,8 +2662,12 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
 
     current_payload_id = st.session_state.manual_auto_payload_id if auto_paste_sum else ""
     t_manual_start = time.time()
-    with st.spinner(f"正在请求 AI 总结 ({model_selected})..."):
-        summary, err = internal_summarize(manual_transcript.strip(), model_selected)
+    with st.spinner(f"正在请求 AI 总结 ({pipeline_model_label})..."):
+        summary, err = internal_summarize(
+            manual_transcript.strip(),
+            summary_model_selected,
+            fact_check_model_selected,
+        )
     duration = time.time() - t_manual_start
 
     if current_payload_id:
@@ -2609,6 +2718,7 @@ def render_manual_summary_section():
     manual_dur = float((st.session_state.manual_summary_duration or {}).get("summary") or 0.0)
     if manual_dur:
         st.caption(f"⏱️ AI生成耗时: {manual_dur:.1f}s")
+    st.caption(f"🤖 模型流水线：{pipeline_model_label}")
 
     if st.session_state.manual_bridge_meta:
         bridge_context = build_manual_bridge_context(st.session_state.manual_bridge_meta)
@@ -3365,7 +3475,7 @@ def build_subscription_summary_footer(duration, whisper_device_info, transcript_
     """
     构建订阅视频总结页脚信息。
     """
-    footer_str = f"本总结由 {model_selected} 模型生成{whisper_device_info} | ⏳ 总耗时: {duration:.1f}s"
+    footer_str = f"本总结由 {pipeline_model_label} 流水线生成{whisper_device_info} | ⏳ 总耗时: {duration:.1f}s"
 
     try:
         raw_text = transcript_text or ""
@@ -3406,12 +3516,24 @@ def create_subscription_summary_stream(text):
     """
     from core_logic import summarize_text
 
+    if summary_model_selected != fact_check_model_selected:
+        return summarize_text(
+            text,
+            api_key,
+            base_url,
+            summary_model_selected,
+            proxy_input,
+            fact_check_model=fact_check_model_selected,
+            stream=False,
+        )
+
     return summarize_text(
         text,
         api_key,
         base_url,
-        model_selected,
+        summary_model_selected,
         proxy_input,
+        fact_check_model=fact_check_model_selected,
         stream=True,
     )
 
@@ -3484,7 +3606,10 @@ def render_subscription_video_summary_panel(video):
                 return
 
             progress_bar.progress(40, text="🚀 字幕获取成功，正在请求 AI 生成总结...")
-            status_container.info("🚀 正在请求 AI 生成总结 (流式输出)...")
+            if summary_model_selected != fact_check_model_selected:
+                status_container.info("🚀 正在请求 AI 生成总结（双模型流水线）...")
+            else:
+                status_container.info("🚀 正在请求 AI 生成总结 (流式输出)...")
 
             if not api_key:
                 progress_container.empty()
@@ -3500,6 +3625,13 @@ def render_subscription_video_summary_panel(video):
                 progress_container.empty()
 
                 if isinstance(stream, str):
+                    if stream.strip().startswith("{"):
+                        end_time = time.time()
+                        duration = end_time - start_time
+                        st.session_state[cache_key] = stream
+                        st.session_state[f"cache_meta_{video['id']}"] = build_subscription_summary_footer(duration, whisper_device_info, text)
+                        status_container.empty()
+                        st.rerun()
                     status_container.error(stream)
                     return
 

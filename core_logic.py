@@ -4449,33 +4449,28 @@ def _should_skip_fact_check_for_video_text(text: str) -> tuple[bool, str]:
     return False, ""
 
 
-def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url: str = None, stream: bool = False):
+def summarize_text(
+    text: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    proxy_url: str = None,
+    stream: bool = False,
+    fact_check_model: str | None = None,
+):
     if not text or not text.strip():
         return "没有可总结的内容（文本为空）。"
     if not api_key:
         return "请填写 API Key 以启用总结功能。"
-    
-    try:
-        from openai import OpenAI
-        import httpx
-    except ImportError:
-        return "未安装 openai 库（DeepSeek 等大模型均依赖此通用 SDK），无法进行总结。"
+
+    if stream and str(fact_check_model or "").strip() and str(fact_check_model or "").strip() != str(model or "").strip():
+        return "总结失败：当前双模型流水线不支持流式输出，请改用非流式模式。"
 
     try:
-        # 构造客户端
-        client_kwargs = {"api_key": api_key}
-        if base_url and base_url.strip():
-            client_kwargs["base_url"] = base_url.strip()
-        
-        # 配置 httpx client (代理 + 禁用 SSL 验证)
-        httpx_kwargs = {"verify": False}
-        if proxy_url and proxy_url.strip():
-            httpx_kwargs["proxy"] = proxy_url.strip()
-        
-        client_kwargs["http_client"] = httpx.Client(**httpx_kwargs)
-        
-        client = OpenAI(**client_kwargs)
-        
+        client = _build_openai_client(api_key, base_url, proxy_url)
+        summary_model = str(model or "").strip() or "gpt-3.5-turbo"
+        fact_model = str(fact_check_model or "").strip() or summary_model
+
         content = text.strip()
         content_len = len(content)
         max_input_len = 16000 if content_len > 18000 else 20000
@@ -4491,243 +4486,110 @@ def summarize_text(text: str, api_key: str, base_url: str, model: str, proxy_url
             fact_check_enabled = False
             print(f"SummarizeText: skip fact check, reason={skip_reason}")
 
-        # --- Step 1: Analyze & Generate Search Queries ---
-        search_context = ""
-        if fact_check_enabled and len(content) > 100:
-            try:
-                analysis_prompt = (
-                    f"当前日期: {current_date}。\n"
-                    "请分析以下文本，提取 5 个最需要进行事实核查的关键新闻事件、数字声明或政策说法。\n"
-                    "请直接输出 JSON 格式，不要包含 Markdown 标记：\n"
-                    "{ \"queries\": [\"搜索关键词1\", \"搜索关键词2\", \"搜索关键词3\", \"搜索关键词4\", \"搜索关键词5\"] }\n"
-                    "每条搜索关键词都必须包含核心实体、时间、地点、事件或数字，方便直接搜索到新闻来源。\n"
-                    "优先提取可核查的硬信息，不要提取纯观点表述。\n\n"
-                    f"文本内容摘要：{content[:4000]}"
-                )
-                
-                # Use a separate non-stream call for analysis
-                ana_resp = client.chat.completions.create(
-                    model=model.strip() or "gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": analysis_prompt}],
-                    response_format={"type": "json_object"},
-                    max_tokens=500,
-                    temperature=0.3
-                )
-                q_json_str = ana_resp.choices[0].message.content
-                q_json = json.loads(q_json_str)
-                queries = q_json.get("queries", [])
-                
-                if queries:
-                    print(f"Executing search queries: {queries}")
-                    search_res_str = perform_web_search(queries, proxy=proxy_url)
-                    if search_res_str:
-                        search_context = (
-                            f"\n\n**【实时搜索结果（用于事实核查）】**\n{search_res_str}\n\n"
-                            "请优先使用以上搜索结果中的外部来源进行核查。"
-                            "来源/出处必须尽量给出具体 URL 链接；如果提到具体机构或媒体名称，优先附上其官网或栏目页链接。"
-                            "严禁把“视频内容本身”“视频字幕”当作来源。"
-                            "如果候选来源里已经出现与声明直接相关的路透社、彭博社、台湾证券交易所、美丽岛电子报等链接，禁止再写“未发现报道”或“未发现证明”，而应直接根据这些链接内容判断。"
-                        )
-            except Exception as e:
-                print(f"Search step failed: {e}")
-
-        # --- Step 2: Final Summarization ---
-        if fact_check_enabled:
-            prompt = (
-                f"你是一个专业的新闻分析师和事实核查专家。当前真实日期是：{current_date}。\n"
-                "请务必基于此日期进行时效性判断，不要使用你训练时的截止日期（如2023或2024）。\n"
-                "请分析以下视频字幕，生成一份结构清晰、便于阅读的报告。\n"
-                f"{search_context}\n\n"
-                "【输出格式要求】\n"
-                "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n\n"
-                "1. `summary_markdown` 的要求：\n"
-                "   - 必须是 Markdown。\n"
-                "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
-                "   - 固定结构如下：\n"
-                "     ## 核心主题\n"
-                "     - 1 句话概括视频主旨。\n"
-                "     ## 主要内容\n"
-                "     - 逐条列出 6-12 条要点。\n"
-                "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
-                "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
-                "     ## 关键信息\n"
-                "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
-                "     ## 结论（可选）\n"
-                "     - 只有当视频确实提出了明确结论时才输出本节。\n"
-                "     - 如果视频没有清晰结论，就不要硬写结论。\n\n"
-                "2. `fact_check_markdown` 的要求：\n"
-                "   - 必须是 Markdown。\n"
-                "   - 不要输出表格，改为逐条列出“新闻/声明核查项”。\n"
-                "   - 如果文本里存在多个可核查说法，优先输出 3-6 条；信息密度高时可以到 8 条，不要只给 1-2 条笼统结论。\n"
-                "   - 每一条都必须使用下面结构：\n"
-                "     ### 条目1\n"
-                "     - 新闻/声明：...\n"
-                "     - 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
-                "     - 依据：不要只写一句话，至少交代支持信息、冲突/不足之处、当前判断原因\n"
-                "     - 待补充核查点：若仍有不确定处，明确写出还需要核对什么\n"
-                "     - 来源/出处：必须给出 2-4 个具体外部来源；优先使用提供的【实时搜索结果】中的 URL，格式如 `[新华社](https://...)`。\n"
-                "     - 如果提到乌克兰国防部、Defense News、美国国务院、塔斯社、路透社、彭博社、台湾证券交易所、美丽岛电子报等具体机构/媒体，优先附上这些机构/媒体的官网或栏目页，不要只写名称。\n"
-                "   - 禁止把“视频内容本身”“视频字幕”“视频博主说法”写成来源。\n"
-                "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”这类空泛表述。请先尽最大努力利用搜索结果和已有知识完成核查，再给出“存疑”或“缺乏证据”。\n"
-                "   - 如果【实时搜索结果】中已经给出与该声明直接相关的候选链接，禁止写“未发现任何报道”或“未发现证明”；应先引用这些链接，再给出“属实 / 基本属实 / 存疑 / 缺乏证据 / 错误”的判断。\n"
-                "   - 如果某条暂时缺乏直接证据，也要明确写出当前候选来源，并说明“现有公开候选来源不足以直接支撑该说法”，不要只写“未发现”。\n\n"
-                "**字幕内容输入：**\n"
-                f"{content}"
-            )
-        else:
-            prompt = (
-                f"你是一个专业的视频内容总结助手。当前真实日期是：{current_date}。\n"
-                "请总结以下视频字幕，但不要执行新闻事实核查。\n"
-                "当前文本更像测试说明、产品演示或技术链路描述，不适合输出新闻核查结论。\n\n"
-                "【输出格式要求】\n"
-                "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n"
-                "1. `summary_markdown` 的要求：\n"
-                "   - 必须是 Markdown。\n"
-                "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
-                "   - 固定结构如下：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。\n"
-                "2. `fact_check_markdown` 的要求：\n"
-                "   - 必须返回空字符串 `\"\"`。\n"
-                "   - 不要生成任何事实核查条目、来源链接或搜索建议。\n\n"
-                "**字幕内容输入：**\n"
-                f"{content}"
-            )
-        max_tokens = 3600
-        if fact_check_enabled and content_len >= 14000:
-             prompt = (
-                f"你是一个专业的新闻分析师。当前日期是：{current_date}。\n"
-                "请对以下长视频字幕进行总结和事实核查。\n"
-                f"{search_context}\n\n"
-                "【输出格式要求】\n"
-                "请严格输出 JSON，并只包含 `summary_markdown` 与 `fact_check_markdown` 两个字段。\n"
-                "1. `summary_markdown`：\n"
-                "   - 必须按分条形式输出。\n"
-                "   - 结构固定为：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。\n"
-                "   - `## 主要内容` 里输出 8-12 条核心要点，每条只表达一个意思。\n"
-                "2. `fact_check_markdown`：\n"
-                "   - 必须逐条列出可核查新闻，不要使用表格。\n"
-                "   - 优先输出 4-8 条最关键的可核查声明，不要只给少量笼统条目。\n"
-                "   - 每条都包含：`新闻/声明`、`核查结论`、`依据`、`待补充核查点`、`来源/出处`。\n"
-                "   - `依据` 里至少说明支持信息、冲突/不足之处、当前判断原因。\n"
-                "   - `来源/出处` 必须尽量给出 2-4 个具体 URL，禁止把视频本身当作来源。\n"
-                "   - 如果提到具体机构、政府部门或媒体名，优先附上其官网或栏目页链接，不要只写机构名称，尤其是路透社、彭博社、台湾证券交易所、美丽岛电子报等来源。\n"
-                "   - 不要写“无法独立核实”“手动搜索未发现”“未搜索到”，请优先依据外部搜索结果给出真假判断或“存疑/缺乏证据”，并保留候选来源链接。\n\n"
-                "   - 如果【实时搜索结果】里已经有与声明直接相关的候选链接，禁止下结论为“未发现任何报道”或“未发现证明”。\n\n"
-                "**字幕内容输入：**\n"
-                f"{content}"
-            )
-             max_tokens = 3800
-        elif fact_check_enabled and content_len >= 9000:
-            max_tokens = 3200
-        print(f"SummarizeText: content_len={content_len}, max_tokens={max_tokens}, model={(model or '').strip() or 'gpt-3.5-turbo'}")
+        prompt = (
+            f"你是一个专业的视频内容总结助手。当前真实日期是：{current_date}。\n"
+            "请总结以下视频字幕。\n"
+            "【输出格式要求】\n"
+            "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n"
+            "1. `summary_markdown` 的要求：\n"
+            "   - 必须是 Markdown。\n"
+            "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
+            "   - 固定结构如下：\n"
+            "     ## 核心主题\n"
+            "     - 1 句话概括视频主旨。\n"
+            "     ## 主要内容\n"
+            "     - 逐条列出 6-12 条要点。\n"
+            "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
+            "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
+            "     ## 关键信息\n"
+            "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
+            "     ## 结论（可选）\n"
+            "     - 只有当视频确实提出了明确结论时才输出本节。\n"
+            "     - 如果视频没有清晰结论，就不要硬写结论。\n"
+            "2. `fact_check_markdown` 的要求：\n"
+            "   - 必须返回空字符串 `\"\"`。\n"
+            "   - 不要生成任何事实核查条目。\n\n"
+            "**字幕内容输入：**\n"
+            f"{content}"
+        )
+        max_tokens = 2600 if content_len < 12000 else 3000
+        print(
+            "SummarizeText: "
+            f"content_len={content_len}, summary_model={summary_model}, fact_check_model={fact_model}, "
+            f"fact_check_enabled={fact_check_enabled}"
+        )
 
         response = client.chat.completions.create(
-            model=model.strip() or "gpt-3.5-turbo",
+            model=summary_model,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"
-                        if not fact_check_enabled
-                        else "你是一个专业的视频内容总结与事实核查助手。请始终返回合法 JSON。总结必须分条清晰。事实核查必须逐条列出新闻/声明，尽量覆盖 3-8 条关键可核查说法，并提供更完整的判断依据、待补充核查点和外部来源链接；禁止把视频本身当作来源，也不要输出空泛的“无法独立核实”。"
-                    ),
-                },
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"},
+                {"role": "user", "content": prompt},
             ],
             temperature=0.2,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             stream=stream,
         )
-        
         if stream:
             return response
-        
-        # 增加鲁棒性处理：某些情况下可能返回 JSON 字符串或字典
-        raw_resp = response
-        if isinstance(raw_resp, str):
-            if raw_resp.strip().lstrip().startswith("<"):
-                # 检测到 HTML 响应
-                return f"总结失败：返回了 HTML 内容而非 JSON。\n可能原因：\n1. Base URL 填写错误（填写了网页地址而非 API 地址）。\n2. 代理/网关拦截了请求并返回了错误页面。\n\n原始响应预览:\n{raw_resp[:500]}"
-            
-            try:
-                raw_resp = json.loads(raw_resp)
-            except Exception:
-                pass
-        
-        summary_data = {}
-        content_str = ""
-        
-        if isinstance(raw_resp, dict):
-            # 字典访问模式
-            choices = raw_resp.get("choices", [])
-            if choices and len(choices) > 0:
-                msg = choices[0].get("message", {})
-                content_str = msg.get("content", "")
-        else:
-            # 对象属性访问模式 (OpenAI v1 standard)
-            if hasattr(raw_resp, "choices") and len(raw_resp.choices) > 0:
-                content_str = raw_resp.choices[0].message.content
-        
+
+        content_str = _extract_completion_content(response)
         if not content_str:
-             return f"总结失败：无法解析响应内容。\n原始响应: {str(response)[:500]}"
+            return f"总结失败：无法解析响应内容。\n原始响应: {str(response)[:500]}"
 
         normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
-        if normalized_payload:
-            fact_md = normalized_payload.get("fact_check_markdown", "")
-            if fact_check_enabled:
-                if _is_placeholder_fact_check(fact_md):
-                    fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
-                fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
-                fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
-            else:
-                fact_md = ""
-            normalized_payload["fact_check_markdown"] = fact_md
-            return json.dumps(normalized_payload, ensure_ascii=False)
+        if not normalized_payload:
+            try:
+                repair_prompt = (
+                    "请将下面内容修复为合法 JSON，并且只能包含两个字段："
+                    "`summary_markdown` 和 `fact_check_markdown`。\n"
+                    "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
+                    "- `fact_check_markdown` 必须返回空字符串，不要补任何事实核查内容。\n"
+                    "- 只返回 JSON，不要解释。\n\n"
+                    f"原始内容：\n{content_str}"
+                )
+                repair_resp = client.chat.completions.create(
+                    model=summary_model,
+                    messages=[
+                        {"role": "system", "content": "你是一个 JSON 修复助手，只返回合法 JSON。"},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=min(2200, max_tokens),
+                    temperature=0.1,
+                )
+                repair_content = _extract_completion_content(repair_resp)
+                normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
+            except Exception as repair_exc:
+                print(f"Repair summary JSON failed: {repair_exc}")
 
-        try:
-            fact_check_repair_requirement = (
-                "- `fact_check_markdown` 必须保留或补齐事实核查内容。\n"
-                if fact_check_enabled
-                else "- `fact_check_markdown` 必须返回空字符串，不要补任何事实核查内容。\n"
-            )
-            repair_prompt = (
-                "请将下面内容修复为合法 JSON，并且只能包含两个字段："
-                + "`summary_markdown` 和 `fact_check_markdown`。\n"
-                + "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
-                + fact_check_repair_requirement
-                + "- 只返回 JSON，不要解释。\n\n"
-                + f"原始内容：\n{content_str}"
-            )
-            repair_resp = client.chat.completions.create(
-                model=model.strip() or "gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "你是一个 JSON 修复助手，只返回合法 JSON。"},
-                    {"role": "user", "content": repair_prompt},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=min(2200, max_tokens),
-                temperature=0.1,
-            )
-            repair_content = repair_resp.choices[0].message.content
-            normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
-            if normalized_payload:
-                fact_md = normalized_payload.get("fact_check_markdown", "")
-                if fact_check_enabled:
-                    if _is_placeholder_fact_check(fact_md):
-                        fact_md = _build_fact_check_fallback_markdown(search_results_md=search_context)
-                    fact_md = _enrich_fact_check_items_with_claim_sources(fact_md, [{"search_markdown": search_context}])
-                    fact_md = _enrich_fact_check_markdown_with_links(fact_md, search_context)
-                else:
-                    fact_md = ""
-                normalized_payload["fact_check_markdown"] = fact_md
-                return json.dumps(normalized_payload, ensure_ascii=False)
-        except Exception as repair_exc:
-            print(f"Repair summary JSON failed: {repair_exc}")
+        if not normalized_payload:
+            normalized_payload = {
+                "summary_markdown": content_str,
+                "fact_check_markdown": "",
+            }
 
-        return json.dumps({
-            "summary_markdown": content_str,
-            "fact_check_markdown": "" if not fact_check_enabled else _build_fact_check_fallback_markdown(search_results_md=search_context),
-        }, ensure_ascii=False)
+        summary_markdown = str(normalized_payload.get("summary_markdown") or "").strip() or content_str
+        fact_check_markdown = ""
+        if fact_check_enabled and len(content) > 100:
+            try:
+                max_claims = 8 if content_len >= 12000 else 6 if content_len >= 7000 else 5
+                fact_check_markdown = fact_check_document_claims(
+                    text=content,
+                    summary_markdown=summary_markdown,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=fact_model,
+                    proxy_url=proxy_url,
+                    max_claims=max_claims,
+                )
+            except Exception as fact_exc:
+                print(f"Video fact check pipeline failed: {fact_exc}")
+                fact_check_markdown = _build_fact_check_fallback_markdown()
+
+        normalized_payload["summary_markdown"] = summary_markdown
+        normalized_payload["fact_check_markdown"] = fact_check_markdown if fact_check_enabled else ""
+        return json.dumps(normalized_payload, ensure_ascii=False)
 
     except Exception as e:
         msg = str(e)
