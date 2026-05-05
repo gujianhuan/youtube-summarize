@@ -903,6 +903,9 @@
         helperMessage,
         detection
       });
+    })();
+    return true;
+  });
 
   window.addEventListener("message", (event) => {
     const data = event && event.data;
@@ -914,6 +917,7 @@
     }
     const requestId = String(data.requestId || "").trim();
     const payload = data.payload || {};
+    const targetWindow = event.source;
 
     chrome.runtime.sendMessage(
       {
@@ -925,6 +929,17 @@
         const replyPayload = runtimeError
           ? { ok: false, error: String(runtimeError.message || "runtime_message_failed") }
           : (response || { ok: false, error: "empty_background_response" });
+        if (targetWindow && typeof targetWindow.postMessage === "function") {
+          targetWindow.postMessage(
+            {
+              namespace: PAGE_REQUEST_NAMESPACE,
+              requestId,
+              payload: replyPayload
+            },
+            "*"
+          );
+          return;
+        }
         window.postMessage(
           {
             namespace: PAGE_REQUEST_NAMESPACE,
@@ -935,9 +950,6 @@
         );
       }
     );
-  });
-    })();
-    return true;
   });
 
   function findClickableByText(patterns) {
