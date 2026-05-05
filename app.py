@@ -2456,10 +2456,20 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         print(f"Failed to save history: {e_hist}")
 
 
+def get_current_video_url(url: str = "") -> str:
+    """统一解析当前视频链接，避免 rerun 后局部变量丢失。"""
+    candidate = str(url or "").strip()
+    if candidate:
+        st.session_state.input_url = candidate
+        return candidate
+    return str(st.session_state.get("input_url") or "").strip()
+
+
 def do_video_fetch_single(url):
     """
     抓取单视频字幕或执行音频转写，并在完成后触发总结。
     """
+    url = get_current_video_url(url)
     if not url:
         st.warning("请输入视频链接")
         return
@@ -2547,7 +2557,7 @@ def try_video_extension_first(url: str) -> tuple[bool, str]:
     - handled=True 表示已成功交给插件流程，主站等待 bridge 即可
     - handled=False 表示应继续回退到原有本地抓取
     """
-    url = str(url or "").strip()
+    url = get_current_video_url(url)
     if not url:
         return False, ""
 
@@ -2574,7 +2584,9 @@ def do_video_check_single(url):
     """
     检测当前视频可用字幕列表。
     """
+    url = get_current_video_url(url)
     if not url:
+        st.warning("请输入视频链接")
         return
     try:
         with st.spinner("检测中..."):
@@ -2673,7 +2685,7 @@ def render_video_processing_tab():
         key="input_url",
         placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...",
     )
-    resolved_url = str(url or st.session_state.get("input_url") or "").strip()
+    resolved_url = get_current_video_url(url)
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         fetch_btn = st.button("🚀 一键抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
@@ -2700,6 +2712,9 @@ def render_video_processing_tab():
             st.rerun()
 
     if fetch_btn:
+        if not resolved_url:
+            st.warning("请输入视频链接")
+            return
         handled_by_extension, extension_message = try_video_extension_first(resolved_url)
         if handled_by_extension:
             st.info(extension_message)
@@ -2708,8 +2723,14 @@ def render_video_processing_tab():
             st.caption(extension_message)
         do_video_fetch_single(resolved_url)
     if summary_btn:
+        if not resolved_url:
+            st.warning("请输入视频链接")
+            return
         do_video_summary_single(resolved_url)
     if check_btn:
+        if not resolved_url:
+            st.warning("请输入视频链接")
+            return
         do_video_check_single(resolved_url)
 
     render_video_summary_section()
