@@ -33,7 +33,10 @@
         "https://www.youtube.com/*",
         "https://youtube.com/*",
         "https://www.bilibili.com/*",
-        "https://b23.tv/*"
+        "https://b23.tv/*",
+        "http://127.0.0.1/*",
+        "http://localhost/*",
+        "https://youtube-summarize-0oms.onrender.com/*"
       ],
       "js": [
         "content.js"

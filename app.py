@@ -404,6 +404,22 @@ def wait_for_extension_bridge_payload(payload_id: str) -> tuple[dict | None, str
     return None, last_error
 
 
+def request_extension_summarize_flow(source_url: str) -> dict | None:
+    """通过隐藏组件向页面内插件发起抓取请求，成功时返回 payloadId。"""
+    source_url = str(source_url or "").strip()
+    if not source_url:
+        return None
+    return extension_bridge_reader(
+        action="requestExtensionSummarize",
+        sourceUrl=source_url,
+        requestId=f"video_extension_request_{abs(hash(source_url))}",
+        timeoutMs=15000,
+        height=0,
+        key=f"video_extension_request_{source_url}",
+        default=None,
+    )
+
+
 def normalize_extension_bridge_payload(payload: dict | None) -> dict:
     """兼容 bridge V1/V2，统一返回主站消费字段。"""
     if not isinstance(payload, dict):
@@ -1549,6 +1565,12 @@ if "manual_auto_payload_id" not in st.session_state:
     st.session_state.manual_auto_payload_id = ""
 if "manual_last_payload_id" not in st.session_state:
     st.session_state.manual_last_payload_id = ""
+if "video_extension_payload_id" not in st.session_state:
+    st.session_state.video_extension_payload_id = ""
+if "video_extension_last_payload_id" not in st.session_state:
+    st.session_state.video_extension_last_payload_id = ""
+if "video_extension_request_result" not in st.session_state:
+    st.session_state.video_extension_request_result = None
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -1688,6 +1710,35 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
         }
     if ext_autosubmit:
         st.session_state.manual_auto_payload_id = ext_payload_id
+
+video_extension_payload_id = st.session_state.get("video_extension_payload_id") or ""
+video_extension_last_payload_id = st.session_state.get("video_extension_last_payload_id") or ""
+if video_extension_payload_id and video_extension_payload_id != video_extension_last_payload_id:
+    video_bridge_payload, video_bridge_payload_error = wait_for_extension_bridge_payload(video_extension_payload_id)
+    if not video_bridge_payload and video_bridge_payload_error != "payload_not_found":
+        video_bridge_payload = read_extension_bridge_payload(video_extension_payload_id, consume=True)
+    normalized_video_bridge_payload = normalize_extension_bridge_payload(video_bridge_payload)
+    video_bridge_transcript = str(normalized_video_bridge_payload.get("transcript_text") or "").strip()
+    if video_bridge_transcript:
+        st.session_state.transcript_text = video_bridge_transcript
+        st.session_state.summary_text = ""
+        st.session_state.whisper_device_tag = ""
+        st.session_state.manual_bridge_meta = {
+            "payload_id": str(normalized_video_bridge_payload.get("payload_id") or video_extension_payload_id).strip(),
+            "bridge_version": int(normalized_video_bridge_payload.get("bridge_version") or 1),
+            "request_id": str(normalized_video_bridge_payload.get("request_id") or "").strip(),
+            "source_kind": str(normalized_video_bridge_payload.get("source_kind") or "extension").strip(),
+            "source_type": str(normalized_video_bridge_payload.get("source_type") or "subtitle").strip(),
+            "fallback_used": bool(normalized_video_bridge_payload.get("fallback_used")),
+            "text_source_reason": str(normalized_video_bridge_payload.get("text_source_reason") or "extension_extract_by_url").strip(),
+            "title": str(normalized_video_bridge_payload.get("title") or "").strip(),
+        }
+        st.session_state.video_extension_last_payload_id = video_extension_payload_id
+        do_video_summary_single(
+            str(normalized_video_bridge_payload.get("source_url") or st.session_state.get("input_url") or "").strip(),
+            manual=False,
+            fetch_duration=0.0,
+        )
 
 
 
@@ -2489,6 +2540,36 @@ def do_video_fetch_single(url):
         )
 
 
+def try_video_extension_first(url: str) -> tuple[bool, str]:
+    """
+    输入链接后优先尝试调用插件抓取 transcript，并通过 bridge 回传主站。
+    返回 (handled, message)：
+    - handled=True 表示已成功交给插件流程，主站等待 bridge 即可
+    - handled=False 表示应继续回退到原有本地抓取
+    """
+    url = str(url or "").strip()
+    if not url:
+        return False, ""
+
+    result = request_extension_summarize_flow(url)
+    st.session_state.video_extension_request_result = result
+    if not isinstance(result, dict):
+        return False, "未检测到可用插件响应，已回退主站抓取。"
+
+    if not bool(result.get("ok")):
+        error_text = str(result.get("error") or "").strip()
+        return False, f"插件抓取未接管（{error_text or 'unknown_error'}），已回退主站抓取。"
+
+    payload_id = str(result.get("payloadId") or result.get("payload_id") or "").strip()
+    if not payload_id:
+        return False, "插件未返回 payloadId，已回退主站抓取。"
+
+    st.session_state.video_extension_payload_id = payload_id
+    st.session_state.video_extension_last_payload_id = ""
+    st.session_state.input_url = url
+    return True, "已调用插件抓取，主站正在等待 bridge 回传后自动总结..."
+
+
 def do_video_check_single(url):
     """
     检测当前视频可用字幕列表。
@@ -2618,6 +2699,12 @@ def render_video_processing_tab():
             st.rerun()
 
     if fetch_btn:
+        handled_by_extension, extension_message = try_video_extension_first(url)
+        if handled_by_extension:
+            st.info(extension_message)
+            st.rerun()
+        if extension_message:
+            st.caption(extension_message)
         do_video_fetch_single(url)
     if summary_btn:
         do_video_summary_single(url)

@@ -1,4 +1,6 @@
 (function () {
+  const PAGE_REQUEST_NAMESPACE = "yt-summary-page-request";
+
   function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
@@ -901,6 +903,39 @@
         helperMessage,
         detection
       });
+
+  window.addEventListener("message", (event) => {
+    const data = event && event.data;
+    if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
+      return;
+    }
+    if (data.action !== "startSummarizeFlowFromPage") {
+      return;
+    }
+    const requestId = String(data.requestId || "").trim();
+    const payload = data.payload || {};
+
+    chrome.runtime.sendMessage(
+      {
+        action: "startSummarizeFlowFromPage",
+        payload
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        const replyPayload = runtimeError
+          ? { ok: false, error: String(runtimeError.message || "runtime_message_failed") }
+          : (response || { ok: false, error: "empty_background_response" });
+        window.postMessage(
+          {
+            namespace: PAGE_REQUEST_NAMESPACE,
+            requestId,
+            payload: replyPayload
+          },
+          "*"
+        );
+      }
+    );
+  });
     })();
     return true;
   });

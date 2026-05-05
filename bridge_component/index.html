@@ -7,6 +7,8 @@
 </head>
 <body>
   <script>
+    const PAGE_REQUEST_NAMESPACE = "yt-summary-page-request";
+
     function sendMessageToStreamlitClient(type, data) {
       window.parent.postMessage(
         {
@@ -68,6 +70,61 @@
       return null;
     }
 
+    function buildRequestId() {
+      if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+        return globalThis.crypto.randomUUID();
+      }
+      return `page_req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    }
+
+    function requestExtensionSummarize(args) {
+      const sourceUrl = String((args && args.sourceUrl) || "").trim();
+      if (!sourceUrl) {
+        setComponentValue({ ok: false, error: "source_url_required" });
+        return;
+      }
+      const requestId = String((args && args.requestId) || "").trim() || buildRequestId();
+      const timeoutMs = Number((args && args.timeoutMs) || 15000);
+      let settled = false;
+
+      function finish(value) {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.removeEventListener("message", handleMessage);
+        setComponentValue(value);
+      }
+
+      function handleMessage(event) {
+        const data = event && event.data;
+        if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
+          return;
+        }
+        if (String(data.requestId || "") !== requestId) {
+          return;
+        }
+        finish(data.payload || { ok: false, error: "empty_extension_response" });
+      }
+
+      window.addEventListener("message", handleMessage);
+      window.parent.postMessage(
+        {
+          namespace: PAGE_REQUEST_NAMESPACE,
+          action: "startSummarizeFlowFromPage",
+          requestId,
+          payload: {
+            sourceUrl
+          }
+        },
+        "*"
+      );
+
+      window.setTimeout(() => {
+        finish({ ok: false, error: "extension_request_timeout" });
+      }, timeoutMs);
+    }
+
     function watchBridgePayload(args) {
       const payloadId = String((args && args.payloadId) || "");
       const storageKeyPrefix = String((args && args.storageKeyPrefix) || "");
@@ -98,6 +155,10 @@
         return;
       }
       const args = event.data.args || {};
+      if (args.action === "requestExtensionSummarize") {
+        requestExtensionSummarize(args);
+        return;
+      }
       watchBridgePayload(args);
     });
 

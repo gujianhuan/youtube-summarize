@@ -6,6 +6,7 @@ const FLOW_STATUS_KEY = "summarizerFlowStatus";
 const BRIDGE_HEALTH_TIMEOUT_MS = 15000;
 const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
+const EXTENSION_TOOL_VERSION = "0.1.23";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -465,6 +466,96 @@ async function startSummarizeFlow(payload) {
   }
 }
 
+function buildPayloadId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `bridge_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function buildRequestId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function parseYouTubeVideoId(url) {
+  try {
+    const parsed = new URL(String(url || ""));
+    if (parsed.hostname.includes("youtu.be")) {
+      return parsed.pathname.replace(/^\/+/, "").trim();
+    }
+    return parsed.searchParams.get("v") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function buildTranscriptEnvelope(payloadId, response, transcript, sourceUrl, title) {
+  const videoId = parseYouTubeVideoId(sourceUrl);
+  const detection = response?.detection || {};
+  return {
+    schemaVersion: "1.0",
+    requestId: buildRequestId(),
+    source: {
+      kind: "extension",
+      sourceType: detection.sourceType && detection.sourceType !== "none" ? detection.sourceType : "subtitle",
+      toolVersion: EXTENSION_TOOL_VERSION
+    },
+    video: {
+      platform: String(response?.platform || "youtube"),
+      videoId,
+      url: sourceUrl,
+      title
+    },
+    transcript: {
+      language: "",
+      text: transcript,
+      segments: [],
+      charCount: transcript.length
+    },
+    diagnostics: {
+      textSourceReason: detection.reason || "unknown",
+      fallbackUsed: false,
+      extensionState: "text_ready",
+      notes: payloadId ? [`payload:${payloadId}`] : []
+    },
+    createdAt: new Date().toISOString()
+  };
+}
+
+async function startSummarizeFlowFromPage(payload) {
+  const sourceUrl = String(payload?.sourceUrl || "").trim();
+  if (!sourceUrl) {
+    throw new Error("source_url_required");
+  }
+  const extraction = await extractYouTubeTranscriptByUrl(sourceUrl);
+  if (!extraction?.ok || !String(extraction.transcript || "").trim()) {
+    throw new Error(String(extraction?.error || "extension_extract_failed"));
+  }
+  const transcript = String(extraction.transcript || "").trim();
+  const payloadId = buildPayloadId();
+  const envelope = buildTranscriptEnvelope(payloadId, extraction, transcript, sourceUrl, extraction.title || "");
+  const bridgePayload = {
+    payloadId,
+    sourceUrl,
+    title: extraction.title || "",
+    transcript,
+    envelope,
+    bridgeVersion: 2,
+    sourceKind: "extension",
+    sourceType: extraction?.detection?.sourceType || "subtitle",
+    textSourceReason: extraction?.detection?.reason || "extension_extract_by_url",
+    fallbackUsed: false
+  };
+  await uploadBridgePayload(bridgePayload);
+  return {
+    ok: true,
+    payloadId
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message?.action) {
     return undefined;
@@ -493,6 +584,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           ok: false,
           error: String(error?.message || error || "background_extract_failed")
         });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === "startSummarizeFlowFromPage") {
+    (async () => {
+      try {
+        const result = await startSummarizeFlowFromPage(message.payload || {});
+        sendResponse(result);
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error?.message || error || "page_flow_failed") });
       }
     })();
     return true;
