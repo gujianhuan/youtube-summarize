@@ -2460,7 +2460,6 @@ def get_current_video_url(url: str = "") -> str:
     """统一解析当前视频链接，避免 rerun 后局部变量丢失。"""
     candidate = str(url or "").strip()
     if candidate:
-        st.session_state.input_url = candidate
         return candidate
     return str(st.session_state.get("input_url") or "").strip()
 
@@ -2576,7 +2575,6 @@ def try_video_extension_first(url: str) -> tuple[bool, str]:
 
     st.session_state.video_extension_payload_id = payload_id
     st.session_state.video_extension_last_payload_id = ""
-    st.session_state.input_url = url
     return True, "已调用插件抓取，主站正在等待 bridge 回传后自动总结..."
 
 
