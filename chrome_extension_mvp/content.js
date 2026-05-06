@@ -928,6 +928,7 @@
     ];
     const replyEnvelope = (replyPayload) => ({
       namespace: PAGE_REQUEST_NAMESPACE,
+      action: "summarizeFlowReply",
       requestId,
       payload: replyPayload
     });

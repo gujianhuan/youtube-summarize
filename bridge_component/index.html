@@ -125,6 +125,10 @@
         if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
           return;
         }
+        // 显式要求回包动作名，避免误抓广播请求
+        if (data.action !== "summarizeFlowReply") {
+          return;
+        }
         if (String(data.requestId || "") !== requestId) {
           return;
         }
