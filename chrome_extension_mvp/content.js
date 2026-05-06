@@ -918,6 +918,14 @@
     const requestId = String(data.requestId || "").trim();
     const payload = data.payload || {};
     const targetWindow = event.source;
+    const attempts = [
+      {
+        stage: "content_script_received_bridge_request",
+        ok: true,
+        requestId,
+        sourceUrl: String(payload?.sourceUrl || "").trim()
+      }
+    ];
     const replyEnvelope = (replyPayload) => ({
       namespace: PAGE_REQUEST_NAMESPACE,
       requestId,
@@ -953,6 +961,10 @@
       }
     }
 
+    attempts.push({
+      stage: "content_script_send_runtime_message",
+      ok: true
+    });
     chrome.runtime.sendMessage(
       {
         action: "startSummarizeFlowFromPage",
@@ -960,9 +972,39 @@
       },
       (response) => {
         const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          attempts.push({
+            stage: "content_script_runtime_callback",
+            ok: false,
+            error: String(runtimeError.message || "runtime_message_failed")
+          });
+        } else {
+          attempts.push({
+            stage: "content_script_runtime_callback",
+            ok: true,
+            error: String(response?.error || "")
+          });
+        }
         const replyPayload = runtimeError
-          ? { ok: false, error: String(runtimeError.message || "runtime_message_failed") }
-          : (response || { ok: false, error: "empty_background_response" });
+          ? {
+              ok: false,
+              error: String(runtimeError.message || "runtime_message_failed"),
+              debug: { attempts: [...attempts] }
+            }
+          : {
+              ...(response || { ok: false, error: "empty_background_response" }),
+              debug: {
+                ...((response && response.debug && typeof response.debug === "object") ? response.debug : {}),
+                attempts: [
+                  ...attempts,
+                  ...((((response && response.debug) || {}).attempts) instanceof Array ? response.debug.attempts : [])
+                ]
+              }
+            };
+        attempts.push({
+          stage: "content_script_post_reply_to_bridge",
+          ok: true
+        });
         postReplyToKnownWindows(replyPayload);
       }
     );

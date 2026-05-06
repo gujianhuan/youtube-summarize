@@ -1082,14 +1082,50 @@ function buildTranscriptEnvelope(payloadId, response, transcript, sourceUrl, tit
 
 async function startSummarizeFlowFromPage(payload) {
   const sourceUrl = String(payload?.sourceUrl || "").trim();
+  const attempts = [
+    {
+      stage: "background_received_page_flow_request",
+      ok: true,
+      sourceUrl
+    }
+  ];
   if (!sourceUrl) {
-    throw new Error("source_url_required");
+    return {
+      ok: false,
+      error: "source_url_required",
+      debug: { attempts }
+    };
   }
+  attempts.push({
+    stage: "background_start_extraction",
+    ok: true
+  });
   const extraction = await extractYouTubeTranscriptForPageFlow(sourceUrl);
   if (!extraction?.ok || !String(extraction.transcript || "").trim()) {
-    throw new Error(String(extraction?.error || "extension_extract_failed"));
+    attempts.push({
+      stage: "background_extraction_failed",
+      ok: false,
+      error: String(extraction?.error || "extension_extract_failed")
+    });
+    return {
+      ...(typeof extraction === "object" && extraction ? extraction : {}),
+      ok: false,
+      error: String(extraction?.error || "extension_extract_failed"),
+      debug: {
+        ...((extraction?.debug && typeof extraction.debug === "object") ? extraction.debug : {}),
+        attempts: [
+          ...attempts,
+          ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
+        ]
+      }
+    };
   }
   const transcript = String(extraction.transcript || "").trim();
+  attempts.push({
+    stage: "background_extraction_succeeded",
+    ok: true,
+    reason: String(extraction?.detection?.reason || "")
+  });
   const payloadId = buildPayloadId();
   const envelope = buildTranscriptEnvelope(payloadId, extraction, transcript, sourceUrl, extraction.title || "");
   const bridgePayload = {
@@ -1104,10 +1140,45 @@ async function startSummarizeFlowFromPage(payload) {
     textSourceReason: extraction?.detection?.reason || "extension_extract_by_url",
     fallbackUsed: false
   };
-  await uploadBridgePayload(bridgePayload);
-  return {
+  attempts.push({
+    stage: "background_upload_bridge_payload",
     ok: true,
     payloadId
+  });
+  try {
+    await uploadBridgePayload(bridgePayload);
+  } catch (error) {
+    attempts.push({
+      stage: "background_upload_bridge_payload_failed",
+      ok: false,
+      error: String(error?.message || error || "bridge_upload_failed")
+    });
+    return {
+      ok: false,
+      error: String(error?.message || error || "bridge_upload_failed"),
+      helperMessage: "插件已抓到文本，但上传 bridge payload 失败。",
+      debug: {
+        attempts: [
+          ...attempts,
+          ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
+        ]
+      }
+    };
+  }
+  attempts.push({
+    stage: "background_upload_bridge_payload_succeeded",
+    ok: true,
+    payloadId
+  });
+  return {
+    ok: true,
+    payloadId,
+    debug: {
+      attempts: [
+        ...attempts,
+        ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
+      ]
+    }
   };
 }
 

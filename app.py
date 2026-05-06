@@ -419,7 +419,7 @@ def request_extension_summarize_flow(
         action="requestExtensionSummarize",
         sourceUrl=source_url,
         requestId=request_id,
-        timeoutMs=15000,
+        timeoutMs=60000,
         height=0,
         key=component_key,
         default=None,
@@ -1604,6 +1604,8 @@ if "video_extension_last_payload_id" not in st.session_state:
     st.session_state.video_extension_last_payload_id = ""
 if "video_extension_request_result" not in st.session_state:
     st.session_state.video_extension_request_result = None
+if "video_extension_request_debug_text" not in st.session_state:
+    st.session_state.video_extension_request_debug_text = ""
 if "video_extension_request_pending" not in st.session_state:
     st.session_state.video_extension_request_pending = False
 if "video_extension_request_url" not in st.session_state:
@@ -2597,6 +2599,7 @@ def reset_video_extension_request_state(clear_result: bool = True):
     st.session_state.video_extension_request_component_key = ""
     if clear_result:
         st.session_state.video_extension_request_result = None
+        st.session_state.video_extension_request_debug_text = ""
 
 
 def begin_video_extension_request(url: str) -> tuple[bool, str]:
@@ -2638,6 +2641,7 @@ def try_video_extension_first() -> tuple[str, str, str]:
     )
     normalized_result = normalize_extension_request_result(result)
     st.session_state.video_extension_request_result = normalized_result
+    st.session_state.video_extension_request_debug_text = ""
     if normalized_result is None:
         return "waiting", "已调用插件抓取，正在等待插件响应...", url
 
@@ -2647,9 +2651,12 @@ def try_video_extension_first() -> tuple[str, str, str]:
 
     if not bool(normalized_result.get("ok")):
         error_text = str(normalized_result.get("error") or "").strip()
+        if error_text == "extension_request_timeout":
+            error_text = "extension_request_timeout:bridge_waited_60s_no_plugin_reply"
         helper_text = str(normalized_result.get("helperMessage") or normalized_result.get("helper_message") or "").strip()
         debug_obj = normalized_result.get("debug") if isinstance(normalized_result.get("debug"), dict) else None
         debug_summary = ""
+        debug_lines: list[str] = []
         if isinstance(debug_obj, dict):
             attempts = debug_obj.get("attempts")
             if isinstance(attempts, list) and attempts:
@@ -2666,8 +2673,14 @@ def try_video_extension_first() -> tuple[str, str, str]:
                     if item_reason:
                         part += f"({item_reason})"
                     parts.append(part)
+                for item in attempts:
+                    if not isinstance(item, dict):
+                        continue
+                    debug_lines.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
                 if parts:
                     debug_summary = " | ".join(parts)
+        if debug_lines:
+            st.session_state.video_extension_request_debug_text = "\n".join(debug_lines)
         reset_video_extension_request_state(clear_result=False)
         message = f"插件抓取未接管（{error_text or 'unknown_error'}），且未再自动回退主站抓取。"
         if helper_text:
@@ -2783,6 +2796,10 @@ def render_video_processing_tab():
     elif extension_status == "fallback":
         if extension_message:
             st.error(extension_message)
+        debug_text = str(st.session_state.get("video_extension_request_debug_text") or "").strip()
+        if debug_text:
+            with st.expander("查看插件桥接链调试明细", expanded=False):
+                st.code(debug_text, language="json")
         st.caption("当前视频页已改为插件优先模式；主站不会再自动启动 yt-dlp/Whisper 音频转写兜底。")
         return
 

@@ -84,8 +84,17 @@
         return;
       }
       const requestId = String((args && args.requestId) || "").trim() || buildRequestId();
-      const timeoutMs = Number((args && args.timeoutMs) || 15000);
+      const timeoutMs = Number((args && args.timeoutMs) || 60000);
       let settled = false;
+      const trace = [
+        {
+          stage: "bridge_component_request_created",
+          ok: true,
+          requestId: requestId,
+          sourceUrl: sourceUrl,
+          timeoutMs: timeoutMs
+        }
+      ];
 
       function finish(value) {
         if (settled) {
@@ -93,7 +102,22 @@
         }
         settled = true;
         window.removeEventListener("message", handleMessage);
-        setComponentValue(value);
+        if (!value || typeof value !== "object") {
+          setComponentValue(value);
+          return;
+        }
+        const debug = (value.debug && typeof value.debug === "object") ? value.debug : {};
+        const existingAttempts = Array.isArray(debug.attempts) ? debug.attempts : [];
+        setComponentValue({
+          ...value,
+          debug: {
+            ...debug,
+            requestId: requestId,
+            sourceUrl: sourceUrl,
+            timeoutMs: timeoutMs,
+            attempts: [...trace, ...existingAttempts]
+          }
+        });
       }
 
       function handleMessage(event) {
@@ -104,10 +128,18 @@
         if (String(data.requestId || "") !== requestId) {
           return;
         }
+        trace.push({
+          stage: "bridge_component_received_reply",
+          ok: true
+        });
         finish(data.payload || { ok: false, error: "empty_extension_response" });
       }
 
       window.addEventListener("message", handleMessage);
+      trace.push({
+        stage: "bridge_component_postmessage_to_parent",
+        ok: true
+      });
       window.parent.postMessage(
         {
           namespace: PAGE_REQUEST_NAMESPACE,
@@ -121,7 +153,21 @@
       );
 
       window.setTimeout(() => {
-        finish({ ok: false, error: "extension_request_timeout" });
+        trace.push({
+          stage: "bridge_component_wait_reply_timeout",
+          ok: false,
+          error: "extension_request_timeout"
+        });
+        finish({
+          ok: false,
+          error: "extension_request_timeout",
+          helperMessage: `桥接页已等待插件响应 ${Math.round(timeoutMs / 1000)}s，但未收到回包。`,
+          debug: {
+            stage: "bridge_component_wait_reply",
+            timeoutMs,
+            requestId
+          }
+        });
       }, timeoutMs);
     }
 

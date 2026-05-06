@@ -15,6 +15,7 @@
     "https://youtube.com/*",
     "https://www.bilibili.com/*",
     "https://b23.tv/*",
+    "https://*.onrender.com/*",
     "http://127.0.0.1/*",
     "http://localhost/*",
     "https://youtube-summarize-0oms.onrender.com/*",
@@ -34,6 +35,7 @@
         "https://youtube.com/*",
         "https://www.bilibili.com/*",
         "https://b23.tv/*",
+        "https://*.onrender.com/*",
         "http://127.0.0.1/*",
         "http://localhost/*",
         "https://youtube-summarize-0oms.onrender.com/*"
