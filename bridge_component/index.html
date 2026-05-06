@@ -136,21 +136,38 @@
       }
 
       window.addEventListener("message", handleMessage);
-      trace.push({
-        stage: "bridge_component_postmessage_to_parent",
-        ok: true
-      });
-      window.parent.postMessage(
-        {
-          namespace: PAGE_REQUEST_NAMESPACE,
-          action: "startSummarizeFlowFromPage",
-          requestId,
-          payload: {
-            sourceUrl
-          }
-        },
-        "*"
-      );
+      const requestEnvelope = {
+        namespace: PAGE_REQUEST_NAMESPACE,
+        action: "startSummarizeFlowFromPage",
+        requestId,
+        payload: {
+          sourceUrl
+        }
+      };
+      const notifiedTargets = new Set();
+      const tryPost = (target, stageName) => {
+        if (!target || typeof target.postMessage !== "function" || notifiedTargets.has(target)) {
+          return;
+        }
+        notifiedTargets.add(target);
+        try {
+          trace.push({
+            stage: stageName,
+            ok: true
+          });
+          target.postMessage(requestEnvelope, "*");
+        } catch (error) {
+          trace.push({
+            stage: `${stageName}_failed`,
+            ok: false,
+            error: String((error && error.message) || error || "postmessage_failed")
+          });
+        }
+      };
+
+      tryPost(window, "bridge_component_postmessage_to_self");
+      tryPost(window.parent, "bridge_component_postmessage_to_parent");
+      tryPost(window.top, "bridge_component_postmessage_to_top");
 
       window.setTimeout(() => {
         trace.push({
