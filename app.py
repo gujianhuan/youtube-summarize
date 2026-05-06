@@ -3689,7 +3689,7 @@ def build_subscription_summary_footer(duration, whisper_device_info, transcript_
 
 def fetch_subscription_video_transcript(video_url, progress_bar):
     """
-    抓取订阅视频字幕并提取 Whisper 设备信息。
+    抓取订阅视频字幕。
     """
     def update_progress(progress_value, progress_text):
         progress_bar.progress(progress_value, text=progress_text)
@@ -3698,10 +3698,9 @@ def fetch_subscription_video_transcript(video_url, progress_bar):
     if err:
         return "", err, ""
 
-    whisper_device_name, text = _extract_whisper_device_info(text)
-    whisper_device_info = f" | ⚡ Whisper引擎: {whisper_device_name}" if whisper_device_name else ""
-    st.session_state.whisper_device_tag = whisper_device_name
-    return text, "", whisper_device_info
+    _whisper_device_name, text = _extract_whisper_device_info(text)
+    st.session_state.whisper_device_tag = ""
+    return text, "", ""
 
 
 def create_subscription_summary_stream(text):

@@ -127,7 +127,7 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
         setattr(api, "_cookies_content_b64", cookie_inputs["cookies_content_b64"])
         setattr(api, "_cookies_from_browser", cookie_inputs["cookies_from_browser"])
         setattr(api, "_status_callback", _status_cb)
-        setattr(api, "_asr_enabled", bool(payload.get("asr_enabled", True)))
+        setattr(api, "_asr_enabled", False)
         setattr(api, "_asr_model", str(payload.get("asr_model") or os.environ.get("LOCAL_FETCH_ASR_MODEL", "base")).strip() or "base")
         setattr(api, "_asr_language", str(payload.get("asr_language") or os.environ.get("LOCAL_FETCH_ASR_LANGUAGE", "")).strip())
         setattr(api, "_asr_fast_mode", bool(payload.get("asr_fast_mode", os.environ.get("LOCAL_FETCH_ASR_FAST_MODE", "1").strip() not in {"0", "false", "False"})))

@@ -4645,7 +4645,10 @@ def get_video_transcript(
             resolved_cookie_file=cookies_file,
             resolve_error=cookie_resolve_error,
         )
-        asr_enabled = bool(getattr(api, "_asr_enabled", False))
+        disable_audio_transcribe = str(
+            os.environ.get("DISABLE_AUDIO_TRANSCRIBE", "1") or "1"
+        ).strip().lower() not in {"0", "false", "no"}
+        asr_enabled = bool(getattr(api, "_asr_enabled", False)) and not disable_audio_transcribe
         asr_model = str(getattr(api, "_asr_model", "") or "")
         asr_language = str(getattr(api, "_asr_language", "") or "")
         asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
@@ -4713,11 +4716,14 @@ def get_video_transcript(
             except Exception as e:
                 raise RuntimeError(f"Bilibili 视频转写失败: {e}\nCookies 运行时诊断: {cookie_debug_summary}")
         
-        raise RuntimeError("Bilibili 视频未找到字幕，且未启用音频转写 (Whisper)。")
+        raise RuntimeError("Bilibili 视频未找到可用字幕，且当前已禁用音频转写兜底。")
 
     # 2. YouTube 逻辑保持不变
     langs = expand_languages(languages or ["en"])
-    asr_enabled = bool(getattr(api, "_asr_enabled", False))
+    disable_audio_transcribe = str(
+        os.environ.get("DISABLE_AUDIO_TRANSCRIBE", "1") or "1"
+    ).strip().lower() not in {"0", "false", "no"}
+    asr_enabled = bool(getattr(api, "_asr_enabled", False)) and not disable_audio_transcribe
     asr_model = str(getattr(api, "_asr_model", "") or "")
     asr_language = str(getattr(api, "_asr_language", "") or "")
     asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
