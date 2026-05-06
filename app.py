@@ -404,20 +404,53 @@ def wait_for_extension_bridge_payload(payload_id: str) -> tuple[dict | None, str
     return None, last_error
 
 
-def request_extension_summarize_flow(source_url: str) -> dict | None:
+def request_extension_summarize_flow(
+    source_url: str,
+    request_id: str = "",
+    component_key: str = "",
+) -> dict | None:
     """通过隐藏组件向页面内插件发起抓取请求，成功时返回 payloadId。"""
     source_url = str(source_url or "").strip()
     if not source_url:
         return None
+    request_id = str(request_id or "").strip() or f"video_extension_request_{uuid.uuid4().hex}"
+    component_key = str(component_key or "").strip() or f"video_extension_request_{request_id}"
     return extension_bridge_reader(
         action="requestExtensionSummarize",
         sourceUrl=source_url,
-        requestId=f"video_extension_request_{abs(hash(source_url))}",
+        requestId=request_id,
         timeoutMs=15000,
         height=0,
-        key=f"video_extension_request_{source_url}",
+        key=component_key,
         default=None,
     )
+
+
+def normalize_extension_request_result(result) -> dict | None:
+    """兼容组件返回的空字符串/JSON 字符串，避免把异步初始态误判为失败。"""
+    if result is None or isinstance(result, dict):
+        return result
+
+    if isinstance(result, str):
+        text = result.strip()
+        if not text or text.lower() in {"none", "null", "undefined"}:
+            return None
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {
+                "ok": False,
+                "error": f"unexpected_component_value:{text[:120]}",
+            }
+        return parsed if isinstance(parsed, dict) else {
+            "ok": False,
+            "error": "unexpected_component_value_non_object",
+        }
+
+    return {
+        "ok": False,
+        "error": f"unexpected_component_type:{type(result).__name__}",
+    }
 
 
 def normalize_extension_bridge_payload(payload: dict | None) -> dict:
@@ -1571,6 +1604,14 @@ if "video_extension_last_payload_id" not in st.session_state:
     st.session_state.video_extension_last_payload_id = ""
 if "video_extension_request_result" not in st.session_state:
     st.session_state.video_extension_request_result = None
+if "video_extension_request_pending" not in st.session_state:
+    st.session_state.video_extension_request_pending = False
+if "video_extension_request_url" not in st.session_state:
+    st.session_state.video_extension_request_url = ""
+if "video_extension_request_id" not in st.session_state:
+    st.session_state.video_extension_request_id = ""
+if "video_extension_request_component_key" not in st.session_state:
+    st.session_state.video_extension_request_component_key = ""
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -2549,33 +2590,76 @@ def do_video_fetch_single(url):
         )
 
 
-def try_video_extension_first(url: str) -> tuple[bool, str]:
-    """
-    输入链接后优先尝试调用插件抓取 transcript，并通过 bridge 回传主站。
-    返回 (handled, message)：
-    - handled=True 表示已成功交给插件流程，主站等待 bridge 即可
-    - handled=False 表示应继续回退到原有本地抓取
-    """
+def reset_video_extension_request_state(clear_result: bool = True):
+    """重置视频插件请求状态，避免旧请求结果污染后续流程。"""
+    st.session_state.video_extension_request_pending = False
+    st.session_state.video_extension_request_url = ""
+    st.session_state.video_extension_request_id = ""
+    st.session_state.video_extension_request_component_key = ""
+    if clear_result:
+        st.session_state.video_extension_request_result = None
+
+
+def begin_video_extension_request(url: str) -> tuple[bool, str]:
+    """初始化一次插件抓取请求，实际结果由后续 rerun 异步消费。"""
     url = get_current_video_url(url)
     if not url:
         return False, ""
 
-    result = request_extension_summarize_flow(url)
-    st.session_state.video_extension_request_result = result
-    if not isinstance(result, dict):
-        return False, "未检测到可用插件响应，已回退主站抓取。"
+    request_id = f"video_extension_request_{uuid.uuid4().hex}"
+    st.session_state.video_extension_request_pending = True
+    st.session_state.video_extension_request_url = url
+    st.session_state.video_extension_request_id = request_id
+    st.session_state.video_extension_request_component_key = f"video_extension_request_{request_id}"
+    st.session_state.video_extension_request_result = None
+    return True, "已向插件发起抓取请求，正在等待响应..."
 
-    if not bool(result.get("ok")):
-        error_text = str(result.get("error") or "").strip()
-        return False, f"插件抓取未接管（{error_text or 'unknown_error'}），已回退主站抓取。"
 
-    payload_id = str(result.get("payloadId") or result.get("payload_id") or "").strip()
+def try_video_extension_first() -> tuple[str, str, str]:
+    """
+    轮询当前视频插件请求状态。
+    返回 (status, message, url)：
+    - idle: 当前没有待处理请求
+    - waiting: 已发起请求，等待插件回包
+    - payload_ready: 插件已返回 payloadId，等待主站消费 bridge payload
+    - fallback: 插件流程失败，应回退主站抓取
+    """
+    if not bool(st.session_state.get("video_extension_request_pending")):
+        return "idle", "", ""
+
+    url = get_current_video_url(st.session_state.get("video_extension_request_url") or "")
+    if not url:
+        reset_video_extension_request_state()
+        return "idle", "", ""
+
+    result = request_extension_summarize_flow(
+        url,
+        request_id=str(st.session_state.get("video_extension_request_id") or "").strip(),
+        component_key=str(st.session_state.get("video_extension_request_component_key") or "").strip(),
+    )
+    normalized_result = normalize_extension_request_result(result)
+    st.session_state.video_extension_request_result = normalized_result
+    if normalized_result is None:
+        return "waiting", "已调用插件抓取，正在等待插件响应...", url
+
+    if not isinstance(normalized_result, dict):
+        reset_video_extension_request_state()
+        return "fallback", "未检测到可用插件响应，已回退主站抓取。", url
+
+    if not bool(normalized_result.get("ok")):
+        error_text = str(normalized_result.get("error") or "").strip()
+        reset_video_extension_request_state(clear_result=False)
+        return "fallback", f"插件抓取未接管（{error_text or 'unknown_error'}），已回退主站抓取。", url
+
+    payload_id = str(normalized_result.get("payloadId") or normalized_result.get("payload_id") or "").strip()
     if not payload_id:
-        return False, "插件未返回 payloadId，已回退主站抓取。"
+        reset_video_extension_request_state(clear_result=False)
+        return "fallback", "插件未返回 payloadId，已回退主站抓取。", url
 
     st.session_state.video_extension_payload_id = payload_id
     st.session_state.video_extension_last_payload_id = ""
-    return True, "已调用插件抓取，主站正在等待 bridge 回传后自动总结..."
+    reset_video_extension_request_state(clear_result=False)
+    return "payload_ready", "已调用插件抓取，主站正在读取 bridge 回传...", url
 
 
 def do_video_check_single(url):
@@ -2684,6 +2768,17 @@ def render_video_processing_tab():
         placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...",
     )
     resolved_url = get_current_video_url(url)
+    extension_status, extension_message, extension_url = try_video_extension_first()
+    if extension_status == "waiting" and extension_message:
+        st.info(extension_message)
+    elif extension_status == "payload_ready":
+        st.rerun()
+    elif extension_status == "fallback":
+        if extension_message:
+            st.caption(extension_message)
+        do_video_fetch_single(extension_url or resolved_url)
+        return
+
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         fetch_btn = st.button("🚀 一键抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
@@ -2713,12 +2808,10 @@ def render_video_processing_tab():
         if not resolved_url:
             st.warning("请输入视频链接")
             return
-        handled_by_extension, extension_message = try_video_extension_first(resolved_url)
+        handled_by_extension, extension_message = begin_video_extension_request(resolved_url)
         if handled_by_extension:
             st.info(extension_message)
             st.rerun()
-        if extension_message:
-            st.caption(extension_message)
         do_video_fetch_single(resolved_url)
     if summary_btn:
         if not resolved_url:

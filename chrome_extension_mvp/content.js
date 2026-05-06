@@ -918,6 +918,40 @@
     const requestId = String(data.requestId || "").trim();
     const payload = data.payload || {};
     const targetWindow = event.source;
+    const replyEnvelope = (replyPayload) => ({
+      namespace: PAGE_REQUEST_NAMESPACE,
+      requestId,
+      payload: replyPayload
+    });
+
+    function postReplyToKnownWindows(replyPayload) {
+      const envelope = replyEnvelope(replyPayload);
+      const notified = new Set();
+
+      const tryPost = (target) => {
+        if (!target || typeof target.postMessage !== "function" || notified.has(target)) {
+          return;
+        }
+        notified.add(target);
+        try {
+          target.postMessage(envelope, "*");
+        } catch (_error) {
+          // Ignore cross-window delivery issues and continue broadcasting.
+        }
+      };
+
+      tryPost(targetWindow);
+      tryPost(window);
+      tryPost(window.top);
+
+      try {
+        for (let i = 0; i < window.frames.length; i += 1) {
+          tryPost(window.frames[i]);
+        }
+      } catch (_error) {
+        // Ignore frame enumeration issues.
+      }
+    }
 
     chrome.runtime.sendMessage(
       {
@@ -929,25 +963,7 @@
         const replyPayload = runtimeError
           ? { ok: false, error: String(runtimeError.message || "runtime_message_failed") }
           : (response || { ok: false, error: "empty_background_response" });
-        if (targetWindow && typeof targetWindow.postMessage === "function") {
-          targetWindow.postMessage(
-            {
-              namespace: PAGE_REQUEST_NAMESPACE,
-              requestId,
-              payload: replyPayload
-            },
-            "*"
-          );
-          return;
-        }
-        window.postMessage(
-          {
-            namespace: PAGE_REQUEST_NAMESPACE,
-            requestId,
-            payload: replyPayload
-          },
-          "*"
-        );
+        postReplyToKnownWindows(replyPayload);
       }
     );
   });
