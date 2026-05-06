@@ -6,7 +6,9 @@ const FLOW_STATUS_KEY = "summarizerFlowStatus";
 const BRIDGE_HEALTH_TIMEOUT_MS = 15000;
 const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
-const EXTENSION_TOOL_VERSION = "0.1.24";
+const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
+const TEMP_TAB_READY_DELAY_MS = 1500;
+const EXTENSION_TOOL_VERSION = "0.1.27";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -486,10 +488,563 @@ function parseYouTubeVideoId(url) {
     if (parsed.hostname.includes("youtu.be")) {
       return parsed.pathname.replace(/^\/+/, "").trim();
     }
-    return parsed.searchParams.get("v") || "";
+    const watchId = parsed.searchParams.get("v") || "";
+    if (watchId) {
+      return watchId;
+    }
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    if (pathParts.length >= 2 && ["shorts", "live", "embed"].includes(pathParts[0])) {
+      return pathParts[1];
+    }
+    return "";
   } catch (_error) {
     return "";
   }
+}
+
+async function waitForTabComplete(tabId, timeoutMs = TEMP_TAB_LOAD_TIMEOUT_MS) {
+  if (!tabId) {
+    throw new Error("tab_id_required");
+  }
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.status === "complete") {
+      return;
+    }
+  } catch (_error) {
+    throw new Error("tab_not_found");
+  }
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutId = null;
+
+    const cleanup = () => {
+      chrome.tabs.onUpdated.removeListener(handleUpdated);
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+    };
+
+    const finish = (callback) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    const handleUpdated = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) {
+        return;
+      }
+      if (changeInfo.status === "complete") {
+        finish(resolve);
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(handleUpdated);
+    timeoutId = globalThis.setTimeout(() => {
+      finish(() => reject(new Error("temp_tab_load_timeout")));
+    }, timeoutMs);
+  });
+}
+
+async function ensureContentScriptOnTab(tabId) {
+  if (!tabId) {
+    return;
+  }
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content.js"]
+  });
+}
+
+async function extractTranscriptViaContentScriptTab(tabId) {
+  if (!tabId) {
+    return null;
+  }
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, { action: "extractTranscript" });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (!message.includes("Receiving end does not exist")) {
+      return null;
+    }
+  }
+
+  try {
+    await ensureContentScriptOnTab(tabId);
+    return await chrome.tabs.sendMessage(tabId, { action: "extractTranscript" });
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function findMatchingYouTubeTab(sourceUrl) {
+  const trimmedSourceUrl = String(sourceUrl || "").trim();
+  if (!trimmedSourceUrl || (!trimmedSourceUrl.includes("youtube.com") && !trimmedSourceUrl.includes("youtu.be"))) {
+    return null;
+  }
+
+  const targetVideoId = parseYouTubeVideoId(trimmedSourceUrl);
+  const tabs = await chrome.tabs.query({});
+  const candidates = tabs.filter((tab) => {
+    const tabUrl = String(tab?.url || "");
+    if (!tabUrl || (!tabUrl.includes("youtube.com") && !tabUrl.includes("youtu.be"))) {
+      return false;
+    }
+    if (targetVideoId) {
+      return parseYouTubeVideoId(tabUrl) === targetVideoId;
+    }
+    return tabUrl === trimmedSourceUrl;
+  });
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  candidates.sort((a, b) => {
+    const aScore = (a.active ? 2 : 0) + (a.status === "complete" ? 1 : 0);
+    const bScore = (b.active ? 2 : 0) + (b.status === "complete" ? 1 : 0);
+    return bScore - aScore;
+  });
+
+  return candidates[0] || null;
+}
+
+async function extractYouTubeTranscriptViaTemporaryTab(sourceUrl) {
+  const sourceUrlText = String(sourceUrl || "").trim();
+  if (!sourceUrlText) {
+    return null;
+  }
+
+  let tempTab = null;
+  try {
+    tempTab = await chrome.tabs.create({
+      url: sourceUrlText,
+      active: false
+    });
+    if (!tempTab?.id) {
+      return null;
+    }
+    await waitForTabComplete(tempTab.id);
+    await sleep(TEMP_TAB_READY_DELAY_MS);
+    return await extractTranscriptViaContentScriptTab(tempTab.id);
+  } catch (_error) {
+    return null;
+  } finally {
+    if (tempTab?.id) {
+      try {
+        await chrome.tabs.remove(tempTab.id);
+      } catch (_error) {
+        // Ignore cleanup failure for temp tab.
+      }
+    }
+  }
+}
+
+async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
+  const sourceUrlText = String(sourceUrl || "").trim();
+  if (!sourceUrlText) {
+    return null;
+  }
+
+  let tempTab = null;
+  try {
+    tempTab = await chrome.tabs.create({
+      url: sourceUrlText,
+      active: false
+    });
+    if (!tempTab?.id) {
+      return null;
+    }
+    await waitForTabComplete(tempTab.id);
+    await sleep(TEMP_TAB_READY_DELAY_MS);
+    return await extractYouTubeTranscriptViaMainWorldTab(tempTab.id);
+  } catch (_error) {
+    return null;
+  } finally {
+    if (tempTab?.id) {
+      try {
+        await chrome.tabs.remove(tempTab.id);
+      } catch (_error) {
+        // Ignore cleanup failure for temp tab.
+      }
+    }
+  }
+}
+
+function normalizePluginExtractionResult(result, fallbackReason = "subtitle_panel_available") {
+  if (!result?.ok || !String(result.transcript || "").trim()) {
+    return null;
+  }
+
+  const detection = result?.detection || {};
+  return {
+    ...result,
+    ok: true,
+    platform: String(result.platform || "youtube"),
+    title: String(result.title || "").trim(),
+    transcript: String(result.transcript || "").trim(),
+    detection: {
+      hasText: true,
+      sourceType: String(detection.sourceType || "transcript"),
+      confidence: Number(detection.confidence || 0.98),
+      reason: String(detection.reason || fallbackReason),
+      canFallbackToLocal: false
+    }
+  };
+}
+
+async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
+  if (!tabId) {
+    return null;
+  }
+
+  try {
+    const [injectionResult] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: async () => {
+        const normalizeWhitespace = (text) => String(text || "")
+          .replace(/\u200b/g, "")
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+
+        const decodeHtmlEntities = (text) => String(text || "")
+          .replace(/&#(\d+);/g, (_match, code) => String.fromCharCode(Number(code)))
+          .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCharCode(parseInt(code, 16)))
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, "\"")
+          .replace(/&#39;/g, "'")
+          .replace(/&nbsp;/g, " ");
+
+        const dedupeTranscriptLines = (lines) => {
+          const result = [];
+          const seen = new Set();
+          for (const rawLine of Array.isArray(lines) ? lines : []) {
+            const line = normalizeWhitespace(rawLine);
+            if (!line || seen.has(line)) {
+              continue;
+            }
+            seen.add(line);
+            result.push(line);
+          }
+          return result;
+        };
+
+        const parseYouTubeJsonTranscript = (payload) => {
+          const events = Array.isArray(payload?.events) ? payload.events : [];
+          const lines = [];
+          for (const event of events) {
+            const segs = Array.isArray(event?.segs) ? event.segs : [];
+            const line = segs.map((seg) => decodeHtmlEntities(seg?.utf8 || "")).join("");
+            const cleaned = normalizeWhitespace(line);
+            if (cleaned) {
+              lines.push(cleaned);
+            }
+          }
+          return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+        };
+
+        const parseYouTubeXmlTranscript = (xmlText) => {
+          const parser = new DOMParser();
+          const xml = parser.parseFromString(String(xmlText || ""), "text/xml");
+          const nodes = Array.from(xml.getElementsByTagName("text"));
+          const lines = nodes
+            .map((node) => decodeHtmlEntities(node.textContent || ""))
+            .map((line) => normalizeWhitespace(line))
+            .filter(Boolean);
+          return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+        };
+
+        const parseMaybeJson = (value) => {
+          if (!value) {
+            return null;
+          }
+          if (typeof value === "string") {
+            try {
+              return JSON.parse(value);
+            } catch (_error) {
+              return null;
+            }
+          }
+          return value;
+        };
+
+        const normalizeCaptionTracks = (value) => {
+          if (Array.isArray(value)) {
+            return value.filter((track) => track && typeof track === "object");
+          }
+          if (Array.isArray(value?.captionTracks)) {
+            return value.captionTracks.filter((track) => track && typeof track === "object");
+          }
+          if (value && typeof value === "object" && value.baseUrl) {
+            return [value];
+          }
+          return [];
+        };
+
+        const getCaptionTracks = () => {
+          const candidates = [];
+          candidates.push(globalThis.ytInitialPlayerResponse || null);
+          candidates.push(parseMaybeJson(globalThis?.ytplayer?.config?.args?.player_response));
+          candidates.push(parseMaybeJson(globalThis?.ytcfg?.data_?.PLAYER_VARS?.player_response));
+          if (typeof globalThis?.ytcfg?.get === "function") {
+            candidates.push(parseMaybeJson(globalThis.ytcfg.get("PLAYER_VARS")?.player_response));
+            candidates.push(parseMaybeJson(globalThis.ytcfg.get("PLAYER_RESPONSE")));
+          }
+          const moviePlayer = document.getElementById("movie_player");
+          if (moviePlayer && typeof moviePlayer.getPlayerResponse === "function") {
+            candidates.push(moviePlayer.getPlayerResponse());
+          }
+          for (const playerResponse of candidates) {
+            const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            if (Array.isArray(tracks) && tracks.length) {
+              return tracks;
+            }
+          }
+          if (moviePlayer && typeof moviePlayer.getOption === "function") {
+            const optionCandidates = [
+              moviePlayer.getOption("captions", "tracklist"),
+              moviePlayer.getOption("captions", "playerCaptionsTracklistRenderer"),
+              moviePlayer.getOption("captions", "track")
+            ];
+            for (const candidate of optionCandidates) {
+              const tracks = normalizeCaptionTracks(candidate);
+              if (tracks.length) {
+                return tracks;
+              }
+            }
+          }
+          return [];
+        };
+
+        const tracks = getCaptionTracks();
+        if (!tracks.length) {
+          return {
+            ok: false,
+            error: "main_world_no_caption_tracks",
+            debug: {
+              trackCount: 0
+            }
+          };
+        }
+
+        const sortedTracks = [...tracks].sort((a, b) => {
+          const aPenalty = a?.kind === "asr" ? 1 : 0;
+          const bPenalty = b?.kind === "asr" ? 1 : 0;
+          return aPenalty - bPenalty;
+        });
+
+        for (const track of sortedTracks) {
+          const baseUrl = String(track?.baseUrl || "").trim();
+          if (!baseUrl) {
+            continue;
+          }
+          const candidates = [];
+          try {
+            const jsonUrl = new URL(baseUrl);
+            jsonUrl.searchParams.set("fmt", "json3");
+            candidates.push(jsonUrl.toString());
+          } catch (_error) {
+            // Ignore malformed track URL and fallback to original.
+          }
+          candidates.push(baseUrl);
+
+          for (const candidate of candidates) {
+            try {
+              const resp = await fetch(candidate, {
+                method: "GET",
+                credentials: "include",
+                cache: "no-store"
+              });
+              if (!resp.ok) {
+                continue;
+              }
+              const rawText = await resp.text();
+              const trimmed = rawText.trim();
+              if (!trimmed) {
+                continue;
+              }
+              let transcript = "";
+              if (trimmed.startsWith("{")) {
+                transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
+              } else {
+                transcript = parseYouTubeXmlTranscript(trimmed);
+              }
+              if (transcript) {
+                return {
+                  ok: true,
+                  transcript,
+                  debug: {
+                    trackCount: tracks.length,
+                    languageCode: String(track?.languageCode || ""),
+                    kind: String(track?.kind || ""),
+                    fetchUrlType: candidate.includes("fmt=json3") ? "json3" : "base"
+                  }
+                };
+              }
+            } catch (_error) {
+              // Try next candidate/track.
+            }
+          }
+        }
+
+        return {
+          ok: false,
+          error: "main_world_caption_fetch_failed",
+          debug: {
+            trackCount: tracks.length
+          }
+        };
+      }
+    });
+    return injectionResult?.result || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
+  const sourceUrlText = String(sourceUrl || "").trim();
+  const matchedTab = await findMatchingYouTubeTab(sourceUrlText);
+  const attempts = [];
+
+  if (matchedTab?.id) {
+    attempts.push({
+      stage: "matched_tab_found",
+      ok: true,
+      tabId: matchedTab.id,
+      tabUrl: String(matchedTab.url || "")
+    });
+    try {
+      await waitForTabComplete(matchedTab.id, 8000);
+    } catch (_error) {
+      attempts.push({
+        stage: "matched_tab_wait_complete",
+        ok: false,
+        error: "matched_tab_load_timeout"
+      });
+    }
+
+    const rawContentResult = await extractTranscriptViaContentScriptTab(matchedTab.id);
+    const contentResult = normalizePluginExtractionResult(
+      rawContentResult,
+      "content_script_extract"
+    );
+    attempts.push({
+      stage: "matched_tab_content_script",
+      ok: Boolean(contentResult),
+      error: contentResult ? "" : String(rawContentResult?.error || "content_script_extract_failed"),
+      reason: String(rawContentResult?.detection?.reason || "")
+    });
+    if (contentResult) {
+      return contentResult;
+    }
+
+    const mainWorldResult = await extractYouTubeTranscriptViaMainWorldTab(matchedTab.id);
+    attempts.push({
+      stage: "matched_tab_main_world",
+      ok: Boolean(mainWorldResult?.ok && String(mainWorldResult.transcript || "").trim()),
+      error: String(mainWorldResult?.error || "main_world_extract_failed")
+    });
+    if (mainWorldResult?.ok && String(mainWorldResult.transcript || "").trim()) {
+      return {
+        ...mainWorldResult,
+        platform: "youtube",
+        title: String(matchedTab.title || "").trim(),
+        detection: {
+          hasText: true,
+          sourceType: "transcript",
+          confidence: 0.99,
+          reason: "main_world_caption_fetch",
+          canFallbackToLocal: false
+        }
+      };
+    }
+  } else {
+    attempts.push({
+      stage: "matched_tab_found",
+      ok: false,
+      error: "no_matching_tab"
+    });
+  }
+
+  const tempTabResult = await extractYouTubeTranscriptViaTemporaryTab(sourceUrlText);
+  const normalizedTempTabResult = normalizePluginExtractionResult(
+    tempTabResult,
+    "temp_tab_content_script_extract"
+  );
+  attempts.push({
+    stage: "temp_tab_content_script",
+    ok: Boolean(normalizedTempTabResult),
+    error: normalizedTempTabResult ? "" : String(tempTabResult?.error || "temp_tab_content_script_extract_failed"),
+    reason: String(tempTabResult?.detection?.reason || "")
+  });
+  if (normalizedTempTabResult) {
+    return normalizedTempTabResult;
+  }
+
+  const tempTabMainWorldResult = await extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrlText);
+  attempts.push({
+    stage: "temp_tab_main_world",
+    ok: Boolean(tempTabMainWorldResult?.ok && String(tempTabMainWorldResult.transcript || "").trim()),
+    error: String(tempTabMainWorldResult?.error || "temp_tab_main_world_extract_failed")
+  });
+  if (tempTabMainWorldResult?.ok && String(tempTabMainWorldResult.transcript || "").trim()) {
+    return {
+      ...tempTabMainWorldResult,
+      platform: "youtube",
+      detection: {
+        hasText: true,
+        sourceType: "transcript",
+        confidence: 0.99,
+        reason: "temp_tab_main_world_caption_fetch",
+        canFallbackToLocal: false
+      }
+    };
+  }
+
+  const backgroundResult = await extractYouTubeTranscriptByUrl(sourceUrlText);
+  attempts.push({
+    stage: "background_extract",
+    ok: Boolean(backgroundResult?.ok && String(backgroundResult.transcript || "").trim()),
+    error: String(backgroundResult?.error || "background_extract_failed")
+  });
+  if (backgroundResult?.ok && String(backgroundResult.transcript || "").trim()) {
+    return {
+      ...backgroundResult,
+      platform: "youtube",
+      detection: {
+        hasText: true,
+        sourceType: "transcript",
+        confidence: 0.99,
+        reason: "background_caption_fetch",
+        canFallbackToLocal: false
+      }
+    };
+  }
+
+  const finalResult = tempTabResult || tempTabMainWorldResult || backgroundResult || {};
+  return {
+    ...(typeof finalResult === "object" && finalResult ? finalResult : {}),
+    ok: false,
+    error: String(finalResult?.error || "extension_extract_failed"),
+    helperMessage: "插件已依次尝试匹配标签页、页面提取、临时页提取与后台直连，但仍未拿到文本。",
+    debug: {
+      sourceUrl: sourceUrlText,
+      matchedTabUrl: String(matchedTab?.url || ""),
+      attempts
+    }
+  };
 }
 
 function buildTranscriptEnvelope(payloadId, response, transcript, sourceUrl, title) {
@@ -530,7 +1085,7 @@ async function startSummarizeFlowFromPage(payload) {
   if (!sourceUrl) {
     throw new Error("source_url_required");
   }
-  const extraction = await extractYouTubeTranscriptByUrl(sourceUrl);
+  const extraction = await extractYouTubeTranscriptForPageFlow(sourceUrl);
   if (!extraction?.ok || !String(extraction.transcript || "").trim()) {
     throw new Error(String(extraction?.error || "extension_extract_failed"));
   }

@@ -31,6 +31,7 @@ def _background_worker(video_url, task_id, summary_model_selected, fact_check_mo
         setattr(api, "_cookies_content", os.environ.get("YTDLP_COOKIES_CONTENT", ""))
         setattr(api, "_cookies_content_b64", os.environ.get("YTDLP_COOKIES_CONTENT_B64", "").strip())
         setattr(api, "_cookies_from_browser", os.environ.get("YTDLP_COOKIES_BROWSER", "").strip().lower())
+        setattr(api, "_asr_enabled", False)
         
         # get_transcript_from_input 返回顺序为: (video_id, video_url, languages_csv)
         video_id, v_url, languages_csv = get_transcript_from_input(

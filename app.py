@@ -1674,7 +1674,7 @@ auto_cookies = bool(cookies_browser)
 timeout = 60
 retries = 3
 
-asr_enabled = True
+asr_enabled = False
 asr_model = os.environ.get("ASR_MODEL", "base")
 asr_fast_mode = True
 
@@ -1787,7 +1787,7 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
 
 # --- 主界面 ---
 st.title("🎬 Video Summarizer")
-st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | yt-dlp & Whisper")
+st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | 插件优先字幕提取")
 
 # 一级导航：按用户任务而不是输入形态组织页面。
 tab_processing, tab_tasks, tab_automation, tab_library, tab_settings = st.tabs([
@@ -1825,7 +1825,7 @@ def internal_fetch_transcript(video_url, progress_callback=None):
             use_system_proxy=use_system_proxy,
             retries=int(retries),
         )
-        # 注入私有属性
+        # 注入私有属性；当前页面已临时关闭音频下载/Whisper 转写兜底
         setattr(api, "_cookies_file", cookies_file)
         setattr(api, "_cookies_content", cookies_content)
         setattr(api, "_cookies_content_b64", cookies_content_b64)
@@ -1846,8 +1846,7 @@ def internal_fetch_transcript(video_url, progress_callback=None):
         langs_list = [s.strip() for s in languages_effective.split(",") if s.strip()]
         
         if progress_callback:
-            fast_tag = " + 极速" if asr_fast_mode else ""
-            progress_callback(30, f"获取字幕/音频 (Whisper: {asr_model}{fast_tag})...")
+            progress_callback(30, "获取字幕文本...")
         # 记录开始时间
         import time
         t0 = time.time()
@@ -2518,7 +2517,7 @@ def get_current_video_url(url: str = "") -> str:
 
 def do_video_fetch_single(url):
     """
-    抓取单视频字幕或执行音频转写，并在完成后触发总结。
+    抓取单视频字幕，并在完成后触发总结。
     """
     url = get_current_video_url(url)
     if not url:
@@ -2546,16 +2545,8 @@ def do_video_fetch_single(url):
         progress_bar = st.progress(0)
         t_start_all = time.time()
 
-        used_asr = False
-        asr_notice_shown = False
-
         def update_progress(progress_value, progress_text):
-            nonlocal used_asr, asr_notice_shown
             progress_bar.progress(progress_value, text=progress_text)
-            if (not asr_notice_shown) and ("Whisper" in str(progress_text) or "whisper" in str(progress_text)):
-                status_container.warning("⚠️ 字幕未获取成功，已自动切换到音频转写，耗时可能较长...")
-                asr_notice_shown = True
-                used_asr = True
 
         text, err = internal_fetch_transcript(url, update_progress)
         fetch_duration = time.time() - t_start_all
@@ -2574,14 +2565,11 @@ def do_video_fetch_single(url):
             )
             return
 
-        whisper_device_info, text = _extract_whisper_device_info(text)
-        st.session_state.whisper_device_tag = whisper_device_info
+        _whisper_device_info, text = _extract_whisper_device_info(text)
+        st.session_state.whisper_device_tag = ""
         st.session_state.transcript_text = text
 
-        if used_asr:
-            msg = f"🎉 音频转写完成！(Whisper: {whisper_device_info or 'CPU'}) | 耗时: {fetch_duration:.1f}s"
-        else:
-            msg = f"🎉 成功获取字幕！ | 耗时: {fetch_duration:.1f}s"
+        msg = f"🎉 成功获取字幕！ | 耗时: {fetch_duration:.1f}s"
         status_container.success(msg)
 
         time.sleep(0.5)
@@ -2633,7 +2621,7 @@ def try_video_extension_first() -> tuple[str, str, str]:
     - idle: 当前没有待处理请求
     - waiting: 已发起请求，等待插件回包
     - payload_ready: 插件已返回 payloadId，等待主站消费 bridge payload
-    - fallback: 插件流程失败，应回退主站抓取
+    - fallback: 插件流程失败，不再自动回退主站音频/转写链路
     """
     if not bool(st.session_state.get("video_extension_request_pending")):
         return "idle", "", ""
@@ -2655,17 +2643,43 @@ def try_video_extension_first() -> tuple[str, str, str]:
 
     if not isinstance(normalized_result, dict):
         reset_video_extension_request_state()
-        return "fallback", "未检测到可用插件响应，已回退主站抓取。", url
+        return "fallback", "未检测到可用插件响应，且未再自动回退主站抓取。", url
 
     if not bool(normalized_result.get("ok")):
         error_text = str(normalized_result.get("error") or "").strip()
+        helper_text = str(normalized_result.get("helperMessage") or normalized_result.get("helper_message") or "").strip()
+        debug_obj = normalized_result.get("debug") if isinstance(normalized_result.get("debug"), dict) else None
+        debug_summary = ""
+        if isinstance(debug_obj, dict):
+            attempts = debug_obj.get("attempts")
+            if isinstance(attempts, list) and attempts:
+                parts: list[str] = []
+                for item in attempts[:6]:
+                    if not isinstance(item, dict):
+                        continue
+                    stage = str(item.get("stage") or "").strip()
+                    ok_flag = bool(item.get("ok"))
+                    item_error = str(item.get("error") or "").strip()
+                    item_reason = str(item.get("reason") or "").strip()
+                    part = stage or "unknown_stage"
+                    part += ":ok" if ok_flag else f":{item_error or 'failed'}"
+                    if item_reason:
+                        part += f"({item_reason})"
+                    parts.append(part)
+                if parts:
+                    debug_summary = " | ".join(parts)
         reset_video_extension_request_state(clear_result=False)
-        return "fallback", f"插件抓取未接管（{error_text or 'unknown_error'}），已回退主站抓取。", url
+        message = f"插件抓取未接管（{error_text or 'unknown_error'}），且未再自动回退主站抓取。"
+        if helper_text:
+            message += f" {helper_text}"
+        if debug_summary:
+            message += f" 调试：{debug_summary}"
+        return "fallback", message, url
 
     payload_id = str(normalized_result.get("payloadId") or normalized_result.get("payload_id") or "").strip()
     if not payload_id:
         reset_video_extension_request_state(clear_result=False)
-        return "fallback", "插件未返回 payloadId，已回退主站抓取。", url
+        return "fallback", "插件未返回 payloadId，且未再自动回退主站抓取。", url
 
     st.session_state.video_extension_payload_id = payload_id
     st.session_state.video_extension_last_payload_id = ""
@@ -2712,7 +2726,7 @@ def render_video_summary_section():
         fetch_t = duration_info.get("fetch", 0)
         sum_t = duration_info.get("summary", 0)
         total_t = duration_info.get("total", 0)
-        st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (抓取/转写: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
+        st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (文本抓取: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
     st.caption(f"🤖 模型流水线：{pipeline_model_label}")
 
     render_summary_content(
@@ -2722,26 +2736,7 @@ def render_video_summary_section():
 
     st.divider()
 
-    footer_info = ""
-    if st.session_state.whisper_device_tag:
-        footer_info = f"⚡ Whisper: {st.session_state.whisper_device_tag}"
-
-    try:
-        raw_text = st.session_state.transcript_text or ""
-        if "<!-- TIMING:" in raw_text:
-            import re
-            m_timing = re.search(r"<!-- TIMING: download=([\d\.]+), transcribe=([\d\.]+) -->", raw_text)
-            if m_timing:
-                dl_time = float(m_timing.group(1))
-                tr_time = float(m_timing.group(2))
-                if footer_info:
-                    footer_info += " | "
-                footer_info += f"📥 下载: {dl_time:.1f}s | 🎙️ 转写: {tr_time:.1f}s"
-    except Exception:
-        pass
-
-    if footer_info:
-        st.caption(footer_info)
+    # 当前模式已关闭音频下载/Whisper 转写兜底，不再展示相关脚注。
 
 
 def render_video_transcript_section():
@@ -2787,8 +2782,8 @@ def render_video_processing_tab():
         st.rerun()
     elif extension_status == "fallback":
         if extension_message:
-            st.caption(extension_message)
-        do_video_fetch_single(extension_url or resolved_url)
+            st.error(extension_message)
+        st.caption("当前视频页已改为插件优先模式；主站不会再自动启动 yt-dlp/Whisper 音频转写兜底。")
         return
 
     col1, col2, col3 = st.columns([1, 1, 2])
@@ -2801,20 +2796,7 @@ def render_video_processing_tab():
         check_btn = st.button("🔍 检测可用字幕", use_container_width=True, key="btn_single_check")
 
     if bg_fetch_btn:
-        if not resolved_url:
-            st.warning("请输入视频链接")
-        else:
-            task_id = submit_task(
-                resolved_url,
-                summary_model_selected,
-                fact_check_model_selected,
-                proxy_input,
-                use_system_proxy,
-                api_key,
-                base_url,
-            )
-            st.session_state.bg_task_id = task_id
-            st.rerun()
+        st.warning("后台异步视频抓取暂时停用；当前仅保留插件直连文本提取链路。")
 
     if fetch_btn:
         if not resolved_url:
@@ -2824,7 +2806,7 @@ def render_video_processing_tab():
         if handled_by_extension:
             st.info(extension_message)
             st.rerun()
-        do_video_fetch_single(resolved_url)
+        st.warning("当前入口已切换为插件优先模式；如果未触发插件，请检查扩展是否已在当前页面注入。")
     if summary_btn:
         if not resolved_url:
             st.warning("请输入视频链接")
