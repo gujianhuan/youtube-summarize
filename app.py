@@ -1612,6 +1612,8 @@ if "video_extension_request_id" not in st.session_state:
     st.session_state.video_extension_request_id = ""
 if "video_extension_request_component_key" not in st.session_state:
     st.session_state.video_extension_request_component_key = ""
+if "current_video_url" not in st.session_state:
+    st.session_state.current_video_url = ""
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -1776,7 +1778,7 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
         }
         st.session_state.video_extension_last_payload_id = video_extension_payload_id
         do_video_summary_single(
-            str(normalized_video_bridge_payload.get("source_url") or st.session_state.get("input_url") or "").strip(),
+            str(normalized_video_bridge_payload.get("source_url") or st.session_state.get("current_video_url") or st.session_state.get("input_url") or "").strip(),
             manual=False,
             fetch_duration=0.0,
         )
@@ -2497,11 +2499,20 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         print(f"Failed to save history: {e_hist}")
 
 
-def get_current_video_url(url: str = "") -> str:
-    """统一解析当前视频链接，避免 rerun 后局部变量丢失。"""
+def remember_current_video_url(url: str = "") -> str:
+    """把当前视频链接持久化到独立 key，避免 rerun 时依赖 widget 状态。"""
     candidate = str(url or "").strip()
     if candidate:
+        st.session_state.current_video_url = candidate
         return candidate
+    return str(st.session_state.get("current_video_url") or "").strip()
+
+
+def get_current_video_url(url: str = "") -> str:
+    """统一解析当前视频链接，避免 rerun 后局部变量丢失。"""
+    remembered = remember_current_video_url(url)
+    if remembered:
+        return remembered
     return str(st.session_state.get("input_url") or "").strip()
 
 
@@ -2767,6 +2778,7 @@ def render_video_processing_tab():
         key="input_url",
         placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...",
     )
+    remember_current_video_url(url)
     resolved_url = get_current_video_url(url)
     extension_status, extension_message, extension_url = try_video_extension_first()
     if extension_status == "waiting" and extension_message:
