@@ -61,7 +61,7 @@ def _get_shared_lock():
 
 
 # --- Render Build Info Cache ---
-# Commit: 074efd7 (Log Aggregation & Timeout Fix v0.1.38)
+# Commit: 9d49649 (Log Aggregation & Timeout Fix v0.1.38)
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
