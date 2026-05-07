@@ -8,7 +8,7 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.40";
+const EXTENSION_TOOL_VERSION = "0.1.41";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -816,18 +816,32 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           // Fallback to searching all script tags if globals fail
           const scripts = Array.from(document.getElementsByTagName("script"));
           for (const s of scripts) {
-            const text = s.textContent || "";
-            if (text.includes("captionTracks")) {
-              const match = text.match(/ytInitialPlayerResponse\s*=\s*({.+?});/);
-              if (match) {
-                try {
-                  const resp = JSON.parse(match[1]);
-                  const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-                  if (Array.isArray(tracks) && tracks.length) return tracks;
-                } catch (e) {}
-              }
-            }
+      const text = s.textContent || "";
+      if (text.includes("captionTracks") || text.includes("ytInitialPlayerResponse") || text.includes("ytInitialData")) {
+        const patterns = [
+          /ytInitialPlayerResponse\s*=\s*({.+?});/,
+          /ytInitialData\s*=\s*({.+?});/,
+          /window\["ytInitialPlayerResponse"\]\s*=\s*({.+?});/,
+          /window\["ytInitialData"\]\s*=\s*({.+?});/
+        ];
+
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+          if (match) {
+            try {
+              const resp = JSON.parse(match[1]);
+              const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+                             resp?.engagementPanels?.find(p => p.engagementPanelSectionListRenderer?.targetId === "engagement-panel-transcript")
+                               ?.engagementPanelSectionListRenderer?.content?.transcriptRenderer?.body?.transcriptBodyRenderer?.cueGroups
+                               ?.map(g => g.transcriptCueGroupRenderer?.cues?.[0]?.transcriptCueRenderer)
+                               ?.filter(Boolean);
+
+              if (Array.isArray(tracks) && tracks.length) return tracks;
+            } catch (e) {}
           }
+        }
+      }
+    }
 
           return [];
         };
@@ -1073,7 +1087,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     };
   }
 
-  const finalResult = normalizedTempTabResult || contentResult || tempTabMainWorldResult || backgroundResult || {};
+  const finalResult = normalizedTempTabResult || contentResult || tempTabRawResult || backgroundResult || {};
   return {
     ...finalResult,
     ok: false,
@@ -1086,7 +1100,10 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     debug: {
       sourceUrl: sourceUrlText,
       matchedTabUrl: String(matchedTab?.url || ""),
-      attempts
+      attempts,
+      detection: {
+        extractionLogs: allExtractionLogs
+      }
     }
   };
 }
