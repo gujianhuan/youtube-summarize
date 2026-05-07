@@ -146,7 +146,9 @@
       "transcript-segment-view-model [role='button']",
       ".ytd-transcript-segment-list-renderer .segment-text",
       "ytd-transcript-segment-renderer",
-      "transcript-segment-view-model"
+      "transcript-segment-view-model",
+      ".segment-text",
+      ".cue"
     ];
     const lines = [];
     for (const selector of segmentSelectors) {
@@ -155,12 +157,13 @@
         continue;
       }
       for (const node of nodes) {
-        const text = normalizeWhitespace(node.textContent);
-        if (text) {
+        // 如果节点本身很大，尝试只抓取内部文本节点
+        const text = normalizeWhitespace(node.innerText || node.textContent);
+        if (text && !isLikelyTimestamp(text)) {
           lines.push(text);
         }
       }
-      if (lines.length) {
+      if (lines.length > 5) {
         break;
       }
     }
@@ -176,13 +179,9 @@
         return byTimestampBlocks;
       }
     }
-    if (!lines.length) {
-      const fallback = extractYouTubeTranscriptFromPanelText();
-      if (fallback) {
-        return fallback;
-      }
-    }
-    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+    
+    const result = normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+    return result.length > 20 ? result : "";
   }
 
   function isLikelyTimestamp(text) {
@@ -281,7 +280,7 @@
    * @returns {string}
    */
   function extractYouTubeTranscriptFromModernSegments() {
-    const nodes = querySelectorAllDeep("transcript-segment-view-model, ytd-transcript-segment-renderer");
+    const nodes = querySelectorAllDeep("transcript-segment-view-model, ytd-transcript-segment-renderer, .ytd-transcript-segment-renderer");
     if (!nodes.length) {
       return "";
     }
@@ -293,7 +292,7 @@
       }
 
       // 优先抓取特定的文本类或属性
-      const textContainer = node.querySelector(".segment-text, .cue, [role='button'], yt-formatted-string");
+      const textContainer = node.querySelector(".segment-text, .cue, [role='button'], yt-formatted-string, span");
       const rawText = textContainer ? textContainer.innerText : (node.innerText || node.textContent);
       
       const rawLines = normalizeWhitespace(rawText || "")
@@ -582,45 +581,20 @@
             }));
           };
           const parseMaybeJson = (value) => {
-            if (!value) {
-              return null;
-            }
-            if (typeof value === "string") {
-              try {
-                return JSON.parse(value);
-              } catch (_error) {
-                return null;
-              }
-            }
-            return value;
-          };
-
-          const normalizeCaptionTracks = (value) => {
-            if (Array.isArray(value)) {
-              return value.filter((track) => track && typeof track === "object");
-            }
-            if (Array.isArray(value?.captionTracks)) {
-              return value.captionTracks.filter((track) => track && typeof track === "object");
-            }
-            if (value && typeof value === "object" && value.baseUrl) {
-              return [value];
-            }
-            return [];
-          };
-
-          const getTracksFromResponse = (response) => {
-            const tracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-            return Array.isArray(tracks) ? tracks : [];
+            if (!value) return null;
+            if (typeof value === "object") return value;
+            try { return JSON.parse(value); } catch (e) { return null; }
           };
 
           try {
             const candidates = [];
-            candidates.push(window.ytInitialPlayerResponse || null);
+            candidates.push(window.ytInitialPlayerResponse);
             candidates.push(parseMaybeJson(window?.ytplayer?.config?.args?.player_response));
             candidates.push(parseMaybeJson(window?.ytcfg?.data_?.PLAYER_VARS?.player_response));
             if (typeof window?.ytcfg?.get === "function") {
               candidates.push(parseMaybeJson(window.ytcfg.get("PLAYER_VARS")?.player_response));
               candidates.push(parseMaybeJson(window.ytcfg.get("PLAYER_RESPONSE")));
+              candidates.push(parseMaybeJson(window.ytcfg.get("ytInitialPlayerResponse")));
             }
             const moviePlayer = document.getElementById("movie_player");
             if (moviePlayer && typeof moviePlayer.getPlayerResponse === "function") {
@@ -628,30 +602,13 @@
             }
 
             for (const candidate of candidates) {
-              const tracks = getTracksFromResponse(candidate);
-              if (tracks.length) {
+              const tracks = candidate?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+              if (Array.isArray(tracks) && tracks.length) {
                 emit(tracks);
                 return;
               }
             }
-
-            if (moviePlayer && typeof moviePlayer.getOption === "function") {
-              const optionCandidates = [
-                moviePlayer.getOption("captions", "tracklist"),
-                moviePlayer.getOption("captions", "playerCaptionsTracklistRenderer"),
-                moviePlayer.getOption("captions", "track")
-              ];
-              for (const candidate of optionCandidates) {
-                const tracks = normalizeCaptionTracks(candidate);
-                if (tracks.length) {
-                  emit(tracks);
-                  return;
-                }
-              }
-            }
-          } catch (_error) {
-            // Ignore bridge read errors and fall back to other strategies.
-          }
+          } catch (_error) {}
 
           emit([]);
         })();

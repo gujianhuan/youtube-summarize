@@ -61,7 +61,7 @@ def _get_shared_lock():
 
 
 # --- Render Build Info Cache ---
-# Commit: d63ed66 (Refined YouTube Extraction & Logging)
+# Commit: baa8098 (Diagnostic Logging & Extraction Enhanced)
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
@@ -2708,7 +2708,7 @@ def try_video_extension_first() -> tuple[str, str, str]:
         if debug_lines:
             st.session_state.video_extension_request_debug_text = "\n".join(debug_lines)
         reset_video_extension_request_state(clear_result=False)
-        message = f"插件抓取未接管（{error_text or 'unknown_error'}）。建议您切换到『本地转写』模式，通过本地 ASR 客户端获取文本。"
+        message = f"插件抓取未接管（{error_text or 'unknown_error'}）。请确认视频是否确实开启了字幕，或手动尝试刷新页面后再试。"
         if helper_text:
             message += f" {helper_text}"
         if debug_summary:

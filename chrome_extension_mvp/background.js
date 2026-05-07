@@ -8,7 +8,7 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.36";
+const EXTENSION_TOOL_VERSION = "0.1.37";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -679,23 +679,27 @@ async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
 }
 
 function normalizePluginExtractionResult(result, fallbackReason = "subtitle_panel_available") {
-  if (!result?.ok || !String(result.transcript || "").trim()) {
+  if (!result || typeof result !== "object") {
     return null;
   }
 
-  const detection = result?.detection || {};
+  const detection = result.detection || {};
+  const hasValidTranscript = result.ok && String(result.transcript || "").trim().length > 0;
+
   return {
     ...result,
-    ok: true,
+    ok: hasValidTranscript,
     platform: String(result.platform || "youtube"),
     title: String(result.title || "").trim(),
     transcript: String(result.transcript || "").trim(),
     detection: {
-      hasText: true,
-      sourceType: String(detection.sourceType || "transcript"),
-      confidence: Number(detection.confidence || 0.98),
+      ...detection,
+      hasText: hasValidTranscript,
+      sourceType: String(detection.sourceType || (hasValidTranscript ? "transcript" : "none")),
+      confidence: Number(detection.confidence || (hasValidTranscript ? 0.98 : 0)),
       reason: String(detection.reason || fallbackReason),
-      canFallbackToLocal: false
+      canFallbackToLocal: false,
+      extractionLogs: Array.isArray(detection.extractionLogs) ? detection.extractionLogs : []
     }
   };
 }
@@ -794,36 +798,48 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
 
         const getCaptionTracks = () => {
           const candidates = [];
-          candidates.push(globalThis.ytInitialPlayerResponse || null);
+          const parseMaybeJson = (val) => {
+            if (!val) return null;
+            if (typeof val === "object") return val;
+            try { return JSON.parse(val); } catch (e) { return null; }
+          };
+
+          candidates.push(globalThis.ytInitialPlayerResponse);
           candidates.push(parseMaybeJson(globalThis?.ytplayer?.config?.args?.player_response));
           candidates.push(parseMaybeJson(globalThis?.ytcfg?.data_?.PLAYER_VARS?.player_response));
+          
           if (typeof globalThis?.ytcfg?.get === "function") {
             candidates.push(parseMaybeJson(globalThis.ytcfg.get("PLAYER_VARS")?.player_response));
             candidates.push(parseMaybeJson(globalThis.ytcfg.get("PLAYER_RESPONSE")));
+            candidates.push(parseMaybeJson(globalThis.ytcfg.get("ytInitialPlayerResponse")));
           }
+
           const moviePlayer = document.getElementById("movie_player");
           if (moviePlayer && typeof moviePlayer.getPlayerResponse === "function") {
             candidates.push(moviePlayer.getPlayerResponse());
           }
-          for (const playerResponse of candidates) {
-            const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-            if (Array.isArray(tracks) && tracks.length) {
-              return tracks;
-            }
+
+          for (const resp of candidates) {
+            const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            if (Array.isArray(tracks) && tracks.length) return tracks;
           }
-          if (moviePlayer && typeof moviePlayer.getOption === "function") {
-            const optionCandidates = [
-              moviePlayer.getOption("captions", "tracklist"),
-              moviePlayer.getOption("captions", "playerCaptionsTracklistRenderer"),
-              moviePlayer.getOption("captions", "track")
-            ];
-            for (const candidate of optionCandidates) {
-              const tracks = normalizeCaptionTracks(candidate);
-              if (tracks.length) {
-                return tracks;
+
+          // Fallback to searching all script tags if globals fail
+          const scripts = Array.from(document.getElementsByTagName("script"));
+          for (const s of scripts) {
+            const text = s.textContent || "";
+            if (text.includes("captionTracks")) {
+              const match = text.match(/ytInitialPlayerResponse\s*=\s*({.+?});/);
+              if (match) {
+                try {
+                  const resp = JSON.parse(match[1]);
+                  const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+                  if (Array.isArray(tracks) && tracks.length) return tracks;
+                } catch (e) {}
               }
             }
           }
+
           return [];
         };
 
@@ -942,11 +958,11 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     );
     attempts.push({
       stage: "matched_tab_content_script",
-      ok: Boolean(contentResult),
-      error: contentResult ? "" : String(rawContentResult?.error || "content_script_extract_failed"),
+      ok: Boolean(contentResult?.ok),
+      error: contentResult?.ok ? "" : String(rawContentResult?.error || "content_script_extract_failed"),
       reason: String(rawContentResult?.detection?.reason || "")
     });
-    if (contentResult) {
+    if (contentResult?.ok) {
       return contentResult;
     }
 
@@ -966,7 +982,8 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
           sourceType: "transcript",
           confidence: 0.99,
           reason: "main_world_caption_fetch",
-          canFallbackToLocal: false
+          canFallbackToLocal: false,
+          extractionLogs: []
         }
       };
     }
@@ -985,11 +1002,11 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   );
   attempts.push({
     stage: "temp_tab_content_script",
-    ok: Boolean(normalizedTempTabResult),
-    error: normalizedTempTabResult ? "" : String(tempTabResult?.error || "temp_tab_content_script_extract_failed"),
+    ok: Boolean(normalizedTempTabResult?.ok),
+    error: normalizedTempTabResult?.ok ? "" : String(tempTabResult?.error || "temp_tab_content_script_extract_failed"),
     reason: String(tempTabResult?.detection?.reason || "")
   });
-  if (normalizedTempTabResult) {
+  if (normalizedTempTabResult?.ok) {
     return normalizedTempTabResult;
   }
 
@@ -1008,7 +1025,8 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
         sourceType: "transcript",
         confidence: 0.99,
         reason: "temp_tab_main_world_caption_fetch",
-        canFallbackToLocal: false
+        canFallbackToLocal: false,
+        extractionLogs: []
       }
     };
   }
@@ -1028,17 +1046,22 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
         sourceType: "transcript",
         confidence: 0.99,
         reason: "background_caption_fetch",
-        canFallbackToLocal: false
+        canFallbackToLocal: false,
+        extractionLogs: []
       }
     };
   }
 
-  const finalResult = tempTabResult || tempTabMainWorldResult || backgroundResult || {};
+  const finalResult = normalizedTempTabResult || contentResult || tempTabMainWorldResult || backgroundResult || {};
   return {
-    ...(typeof finalResult === "object" && finalResult ? finalResult : {}),
+    ...finalResult,
     ok: false,
     error: String(finalResult?.error || "extension_extract_failed"),
     helperMessage: "插件已依次尝试匹配标签页、页面提取、临时页提取与后台直连，但仍未拿到文本。",
+    detection: {
+      hasText: false,
+      extractionLogs: Array.isArray(finalResult?.detection?.extractionLogs) ? finalResult.detection.extractionLogs : []
+    },
     debug: {
       sourceUrl: sourceUrlText,
       matchedTabUrl: String(matchedTab?.url || ""),
