@@ -934,7 +934,7 @@
           url: location.href,
           transcript: "",
           helperMessage,
-          error: detailedError || "当前页面未提取到可见字幕。YouTube 已自动尝试展开 transcript 面板；如果仍失败，请手动展开 transcript/字幕面板后再试。",
+          error: detailedError || "当前页面未提取到可见字幕。YouTube 已自动尝试展开面板但仍未成功。如果该视频确定没有平台字幕，建议您切换到『本地转写』模式，通过本地 ASR 客户端获取文本。",
           detection
         });
         return;

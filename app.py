@@ -2704,7 +2704,7 @@ def try_video_extension_first() -> tuple[str, str, str]:
         if debug_lines:
             st.session_state.video_extension_request_debug_text = "\n".join(debug_lines)
         reset_video_extension_request_state(clear_result=False)
-        message = f"插件抓取未接管（{error_text or 'unknown_error'}），且未再自动回退主站抓取。"
+        message = f"插件抓取未接管（{error_text or 'unknown_error'}）。建议您切换到『本地转写』模式，通过本地 ASR 客户端获取文本。"
         if helper_text:
             message += f" {helper_text}"
         if debug_summary:
