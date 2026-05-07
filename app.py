@@ -61,7 +61,7 @@ def _get_shared_lock():
 
 
 # --- Render Build Info Cache ---
-# Commit: 9723a9f (Robust Logging & Universal Extraction v0.1.39+)
+# Commit: 9723a9f (Aggressive Extraction & Enhanced Logging v0.1.40)
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
@@ -2831,9 +2831,17 @@ def render_video_processing_tab():
         current_result = st.session_state.get("video_extension_request_result")
         extraction_logs = []
         if isinstance(current_result, dict):
+            # 尝试从不同位置提取日志
             detection = current_result.get("detection")
             if isinstance(detection, dict):
                 extraction_logs = detection.get("extractionLogs", [])
+            
+            if not extraction_logs:
+                debug_obj = current_result.get("debug")
+                if isinstance(debug_obj, dict):
+                    detection_inner = debug_obj.get("detection")
+                    if isinstance(detection_inner, dict):
+                        extraction_logs = detection_inner.get("extractionLogs", [])
         
         if isinstance(extraction_logs, list) and extraction_logs:
             with st.expander("查看插件文本提取过程日志", expanded=True):

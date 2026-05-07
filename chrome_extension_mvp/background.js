@@ -8,7 +8,7 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.39";
+const EXTENSION_TOOL_VERSION = "0.1.40";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -944,8 +944,8 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     });
 
     try {
-      // 增加到 8 秒，并使用更稳健的状态检查
-      await waitForTabComplete(matchedTab.id, 8000);
+      // 对已匹配的标签页，我们尝试等待其就绪，但即便超时也继续尝试提取
+      await waitForTabComplete(matchedTab.id, 5000);
       attempts.push({
         stage: "matched_tab_wait_complete",
         ok: true
@@ -954,7 +954,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
       attempts.push({
         stage: "matched_tab_wait_complete",
         ok: false,
-        error: String(error?.message || "matched_tab_load_timeout")
+        error: String(error?.message || "matched_tab_load_timeout_ignored")
       });
     }
 
