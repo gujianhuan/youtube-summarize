@@ -208,6 +208,7 @@
         namespace: PAGE_REQUEST_NAMESPACE,
         action: "startSummarizeFlowFromPage",
         requestId,
+        timestamp: Date.now(),
         payload: {
           sourceUrl
         }
@@ -252,21 +253,41 @@
       tryPost(window.parent, "bridge_component_postmessage_to_parent");
       tryPost(window.top, "bridge_component_postmessage_to_top");
 
-      if (broadcastChannel) {
-        try {
-          trace.push({
-            stage: "bridge_component_broadcast_request",
-            ok: true
-          });
-          broadcastChannel.postMessage(requestEnvelope);
-        } catch (error) {
-          trace.push({
-            stage: "bridge_component_broadcast_request_failed",
-            ok: false,
-            error: String((error && error.message) || error || "broadcast_failed")
-          });
+      const broadcastRequest = () => {
+        if (settled) return;
+        if (broadcastChannel) {
+          try {
+            trace.push({
+              stage: "bridge_component_broadcast_request",
+              ok: true,
+              retry: Boolean(notifiedTargets.size > 3)
+            });
+            broadcastChannel.postMessage(requestEnvelope);
+          } catch (error) {
+            trace.push({
+              stage: "bridge_component_broadcast_request_failed",
+              ok: false,
+              error: String((error && error.message) || error || "broadcast_failed")
+            });
+          }
         }
-      }
+        // Also re-trigger postMessage to self/parent/top in case of race conditions
+        tryPost(window, "bridge_component_postmessage_to_self_retry");
+        tryPost(window.parent, "bridge_component_postmessage_to_parent_retry");
+        tryPost(window.top, "bridge_component_postmessage_to_top_retry");
+      };
+
+      // Send initial broadcast
+      broadcastRequest();
+
+      // Periodically re-broadcast for the first 5 seconds to handle extension injection race
+      const reBroadcastTimer = window.setInterval(() => {
+        if (settled || (Date.now() - requestEnvelope.timestamp > 5000)) {
+          window.clearInterval(reBroadcastTimer);
+          return;
+        }
+        broadcastRequest();
+      }, 1000);
 
       storagePollTimer = window.setInterval(() => {
         const storageReply = readPayload(responseStorageKey, true);

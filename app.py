@@ -2827,7 +2827,14 @@ def render_video_processing_tab():
             with st.expander("查看插件桥接链调试明细", expanded=False):
                 st.code(debug_text, language="json")
         
-        extraction_logs = normalized_result.get("detection", {}).get("extractionLogs") if isinstance(normalized_result, dict) else []
+        # 获取当前的请求结果以提取日志
+        current_result = st.session_state.get("video_extension_request_result")
+        extraction_logs = []
+        if isinstance(current_result, dict):
+            detection = current_result.get("detection")
+            if isinstance(detection, dict):
+                extraction_logs = detection.get("extractionLogs", [])
+        
         if isinstance(extraction_logs, list) and extraction_logs:
             with st.expander("查看插件文本提取过程日志", expanded=True):
                 for log_line in extraction_logs:
