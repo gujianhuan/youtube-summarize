@@ -8,7 +8,7 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.37";
+const EXTENSION_TOOL_VERSION = "0.1.38";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -502,53 +502,42 @@ function parseYouTubeVideoId(url) {
   }
 }
 
-async function waitForTabComplete(tabId, timeoutMs = TEMP_TAB_LOAD_TIMEOUT_MS) {
+async function waitForTabComplete(tabId, timeoutMs = 5000) {
   if (!tabId) {
     throw new Error("tab_id_required");
   }
 
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab?.status === "complete") {
-      return;
-    }
-  } catch (_error) {
-    throw new Error("tab_not_found");
-  }
-
-  await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
     let timeoutId = null;
 
-    const cleanup = () => {
-      chrome.tabs.onUpdated.removeListener(handleUpdated);
-      if (timeoutId !== null) {
-        globalThis.clearTimeout(timeoutId);
-      }
-    };
-
-    const finish = (callback) => {
-      if (settled) {
-        return;
-      }
+    const finish = (ok, reason) => {
+      if (settled) return;
       settled = true;
-      cleanup();
-      callback();
+      chrome.tabs.onUpdated.removeListener(handleUpdated);
+      if (timeoutId !== null) globalThis.clearTimeout(timeoutId);
+      if (ok) resolve();
+      else reject(new Error(reason));
     };
 
     const handleUpdated = (updatedTabId, changeInfo) => {
-      if (updatedTabId !== tabId) {
-        return;
-      }
-      if (changeInfo.status === "complete") {
-        finish(resolve);
+      if (updatedTabId === tabId && (changeInfo.status === "complete" || changeInfo.status === "interactive")) {
+        finish(true);
       }
     };
 
     chrome.tabs.onUpdated.addListener(handleUpdated);
-    timeoutId = globalThis.setTimeout(() => {
-      finish(() => reject(new Error("temp_tab_load_timeout")));
-    }, timeoutMs);
+    timeoutId = globalThis.setTimeout(() => finish(false, "temp_tab_load_timeout"), timeoutMs);
+
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) {
+        finish(false, "tab_not_found");
+        return;
+      }
+      if (tab && (tab.status === "complete" || tab.status === "interactive")) {
+        finish(true);
+      }
+    });
   });
 }
 
@@ -931,6 +920,14 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
 
 async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   const sourceUrlText = String(sourceUrl || "").trim();
+  const allExtractionLogs = [];
+  const addLogs = (res) => {
+    const logs = res?.detection?.extractionLogs;
+    if (Array.isArray(logs)) {
+      allExtractionLogs.push(...logs);
+    }
+  };
+
   const matchedTab = await findMatchingYouTubeTab(sourceUrlText);
   const attempts = [];
 
@@ -941,17 +938,23 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
       tabId: matchedTab.id,
       tabUrl: String(matchedTab.url || "")
     });
+
     try {
-      await waitForTabComplete(matchedTab.id, 8000);
-    } catch (_error) {
+      await waitForTabComplete(matchedTab.id, 4000);
+      attempts.push({
+        stage: "matched_tab_wait_complete",
+        ok: true
+      });
+    } catch (error) {
       attempts.push({
         stage: "matched_tab_wait_complete",
         ok: false,
-        error: "matched_tab_load_timeout"
+        error: String(error?.message || "matched_tab_load_timeout")
       });
     }
 
     const rawContentResult = await extractTranscriptViaContentScriptTab(matchedTab.id);
+    addLogs(rawContentResult);
     const contentResult = normalizePluginExtractionResult(
       rawContentResult,
       "content_script_extract"
@@ -963,7 +966,13 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
       reason: String(rawContentResult?.detection?.reason || "")
     });
     if (contentResult?.ok) {
-      return contentResult;
+      return {
+        ...contentResult,
+        detection: {
+          ...contentResult.detection,
+          extractionLogs: allExtractionLogs
+        }
+      };
     }
 
     const mainWorldResult = await extractYouTubeTranscriptViaMainWorldTab(matchedTab.id);
@@ -983,7 +992,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
           confidence: 0.99,
           reason: "main_world_caption_fetch",
           canFallbackToLocal: false,
-          extractionLogs: []
+          extractionLogs: allExtractionLogs
         }
       };
     }
@@ -996,6 +1005,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   }
 
   const tempTabResult = await extractYouTubeTranscriptViaTemporaryTab(sourceUrlText);
+  addLogs(tempTabResult);
   const normalizedTempTabResult = normalizePluginExtractionResult(
     tempTabResult,
     "temp_tab_content_script_extract"
@@ -1007,7 +1017,13 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     reason: String(tempTabResult?.detection?.reason || "")
   });
   if (normalizedTempTabResult?.ok) {
-    return normalizedTempTabResult;
+    return {
+      ...normalizedTempTabResult,
+      detection: {
+        ...normalizedTempTabResult.detection,
+        extractionLogs: allExtractionLogs
+      }
+    };
   }
 
   const tempTabMainWorldResult = await extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrlText);
@@ -1026,7 +1042,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
         confidence: 0.99,
         reason: "temp_tab_main_world_caption_fetch",
         canFallbackToLocal: false,
-        extractionLogs: []
+        extractionLogs: allExtractionLogs
       }
     };
   }
@@ -1047,7 +1063,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
         confidence: 0.99,
         reason: "background_caption_fetch",
         canFallbackToLocal: false,
-        extractionLogs: []
+        extractionLogs: allExtractionLogs
       }
     };
   }
@@ -1060,7 +1076,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     helperMessage: "插件已依次尝试匹配标签页、页面提取、临时页提取与后台直连，但仍未拿到文本。",
     detection: {
       hasText: false,
-      extractionLogs: Array.isArray(finalResult?.detection?.extractionLogs) ? finalResult.detection.extractionLogs : []
+      extractionLogs: allExtractionLogs
     },
     debug: {
       sourceUrl: sourceUrlText,
