@@ -61,7 +61,7 @@ def _get_shared_lock():
 
 
 # --- Render Build Info Cache ---
-# Commit: 9723a9f (Aggressive Extraction & Enhanced Logging v0.1.40)
+# Commit: a4b0870 (Aggressive Extraction & Enhanced Logging v0.1.40)
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
