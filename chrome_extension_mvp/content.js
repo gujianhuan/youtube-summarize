@@ -144,7 +144,9 @@
       "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] yt-formatted-string",
       "transcript-segment-view-model .segment-text",
       "transcript-segment-view-model [role='button']",
-      ".ytd-transcript-segment-list-renderer .segment-text"
+      ".ytd-transcript-segment-list-renderer .segment-text",
+      "ytd-transcript-segment-renderer",
+      "transcript-segment-view-model"
     ];
     const lines = [];
     for (const selector of segmentSelectors) {

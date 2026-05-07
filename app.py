@@ -2679,8 +2679,10 @@ def try_video_extension_first() -> tuple[str, str, str]:
         debug_obj = normalized_result.get("debug") if isinstance(normalized_result.get("debug"), dict) else None
         debug_summary = ""
         debug_lines: list[str] = []
+        extraction_logs: list[str] = []
         if isinstance(debug_obj, dict):
             attempts = debug_obj.get("attempts")
+            extraction_logs = debug_obj.get("extractionLogs") if isinstance(debug_obj.get("extractionLogs"), list) else []
             if isinstance(attempts, list) and attempts:
                 parts: list[str] = []
                 for item in attempts[:6]:
@@ -2822,6 +2824,13 @@ def render_video_processing_tab():
         if debug_text:
             with st.expander("查看插件桥接链调试明细", expanded=False):
                 st.code(debug_text, language="json")
+        
+        extraction_logs = normalized_result.get("detection", {}).get("extractionLogs") if isinstance(normalized_result, dict) else []
+        if isinstance(extraction_logs, list) and extraction_logs:
+            with st.expander("查看插件文本提取过程日志", expanded=True):
+                for log_line in extraction_logs:
+                    st.write(f"- {log_line}")
+
         st.caption("提示：如果该视频没有平台字幕，插件模式将无法直接提取。建议您使用『本地转写』方法（通过本地客户端进行 ASR 转录）。")
         return
 
