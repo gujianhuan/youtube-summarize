@@ -61,7 +61,7 @@ def _get_shared_lock():
 
 
 # --- Render Build Info Cache ---
-# Commit: baa8098 (Diagnostic Logging & Extraction Enhanced)
+# Commit: f65f1cd (YouTube Data Extraction & Diagnostic Flow v0.1.37)
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
