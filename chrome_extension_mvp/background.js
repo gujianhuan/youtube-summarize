@@ -8,7 +8,7 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.38";
+const EXTENSION_TOOL_VERSION = "0.1.39";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -921,15 +921,19 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
 async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   const sourceUrlText = String(sourceUrl || "").trim();
   const allExtractionLogs = [];
-  const addLogs = (res) => {
+  const addLogs = (res, stageName) => {
     const logs = res?.detection?.extractionLogs;
     if (Array.isArray(logs)) {
       allExtractionLogs.push(...logs);
+    } else if (res?.error) {
+      allExtractionLogs.push(`[Background] ${stageName} failed: ${res.error}`);
     }
   };
 
   const matchedTab = await findMatchingYouTubeTab(sourceUrlText);
   const attempts = [];
+  let contentResult = null;
+  let tempTabResult = null;
 
   if (matchedTab?.id) {
     attempts.push({
@@ -940,7 +944,8 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     });
 
     try {
-      await waitForTabComplete(matchedTab.id, 4000);
+      // 增加到 8 秒，并使用更稳健的状态检查
+      await waitForTabComplete(matchedTab.id, 8000);
       attempts.push({
         stage: "matched_tab_wait_complete",
         ok: true
@@ -954,8 +959,8 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     }
 
     const rawContentResult = await extractTranscriptViaContentScriptTab(matchedTab.id);
-    addLogs(rawContentResult);
-    const contentResult = normalizePluginExtractionResult(
+    addLogs(rawContentResult, "matched_tab_content_script");
+    contentResult = normalizePluginExtractionResult(
       rawContentResult,
       "content_script_extract"
     );
@@ -1004,17 +1009,17 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     });
   }
 
-  const tempTabResult = await extractYouTubeTranscriptViaTemporaryTab(sourceUrlText);
-  addLogs(tempTabResult);
+  const tempTabRawResult = await extractYouTubeTranscriptViaTemporaryTab(sourceUrlText);
+  addLogs(tempTabRawResult, "temp_tab_content_script");
   const normalizedTempTabResult = normalizePluginExtractionResult(
-    tempTabResult,
+    tempTabRawResult,
     "temp_tab_content_script_extract"
   );
   attempts.push({
     stage: "temp_tab_content_script",
     ok: Boolean(normalizedTempTabResult?.ok),
-    error: normalizedTempTabResult?.ok ? "" : String(tempTabResult?.error || "temp_tab_content_script_extract_failed"),
-    reason: String(tempTabResult?.detection?.reason || "")
+    error: normalizedTempTabResult?.ok ? "" : String(tempTabRawResult?.error || "temp_tab_content_script_extract_failed"),
+    reason: String(tempTabRawResult?.detection?.reason || "")
   });
   if (normalizedTempTabResult?.ok) {
     return {

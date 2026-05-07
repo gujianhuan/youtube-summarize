@@ -181,7 +181,31 @@
     }
     
     const result = normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
-    return result.length > 20 ? result : "";
+    if (result.length > 20) {
+      return result;
+    }
+
+    // 最后的绝招：如果不包含特定的选择器，但有可见的 ytd-transcript-segment-renderer，直接提取 innerText
+    log("所有精确选择器失效，尝试通用段落提取");
+    const allSegments = querySelectorAllDeep("ytd-transcript-segment-renderer, transcript-segment-view-model, .ytd-transcript-segment-renderer");
+    if (allSegments.length > 0) {
+      const fallbackLines = [];
+      for (const seg of allSegments) {
+        if (isVisibleElement(seg)) {
+          const text = normalizeWhitespace(seg.innerText || seg.textContent);
+          if (text && !isLikelyTimestamp(text)) {
+            fallbackLines.push(text);
+          }
+        }
+      }
+      const fallbackResult = normalizeWhitespace(dedupeTranscriptLines(fallbackLines).join("\n"));
+      if (fallbackResult.length > 20) {
+        log(`通用段落提取成功，长度: ${fallbackResult.length}`);
+        return fallbackResult;
+      }
+    }
+
+    return "";
   }
 
   function isLikelyTimestamp(text) {
