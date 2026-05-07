@@ -138,7 +138,13 @@
       "ytd-transcript-segment-renderer .cue",
       "ytd-transcript-segment-renderer yt-formatted-string",
       "ytd-transcript-search-panel-renderer ytd-transcript-segment-renderer yt-formatted-string",
-      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] ytd-transcript-segment-renderer yt-formatted-string"
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] ytd-transcript-segment-renderer yt-formatted-string",
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] .segment-text",
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] .cue",
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] yt-formatted-string",
+      "transcript-segment-view-model .segment-text",
+      "transcript-segment-view-model [role='button']",
+      ".ytd-transcript-segment-list-renderer .segment-text"
     ];
     const lines = [];
     for (const selector of segmentSelectors) {
@@ -828,103 +834,71 @@
       let platform = "unknown";
       let helperMessage = "";
       let detailedError = "";
-      let detection = {
-        hasText: false,
-        sourceType: "none",
-        confidence: 0,
-        reason: "unknown",
-        canFallbackToLocal: false
+      const extractionLogs = [];
+
+      const log = (msg) => {
+        const time = new Date().toLocaleTimeString();
+        extractionLogs.push(`[${time}] ${msg}`);
       };
 
       if (host.includes("youtube.com")) {
         platform = "youtube";
+        log("开始 YouTube 提取流程");
+        
         const tracks = await getYouTubeCaptionTracks();
+        log(`获取到 captionTracks 数量: ${tracks.length}`);
+        
         transcript = await extractYouTubeTranscriptFromData();
         if (transcript) {
+          log("成功从内嵌数据 (captionTracks) 提取文本");
           helperMessage = "已优先从 YouTube 页面内嵌字幕数据中提取 transcript。";
-          detection = {
-            hasText: true,
-            sourceType: "transcript",
-            confidence: 0.98,
-            reason: "transcript_panel_available",
-            canFallbackToLocal: false
-          };
         }
+
         if (!transcript) {
+          log("尝试从页面 DOM 直接提取");
           transcript = extractYouTubeTranscript();
           if (transcript) {
-            detection = {
-              hasText: true,
-              sourceType: "subtitle",
-              confidence: 0.9,
-              reason: "subtitle_panel_available",
-              canFallbackToLocal: false
-            };
+            log("成功从页面 DOM 提取文本");
           }
         }
+
         if (!transcript) {
+          log("尝试自动展开 YouTube transcript 面板");
           const ensureResult = await ensureYouTubeTranscriptVisible();
+          log(`展开面板结果: ${ensureResult.ok ? "成功" : "失败"}, autoOpened: ${ensureResult.autoOpened}`);
+          
           transcript = extractYouTubeTranscript();
           if (ensureResult.autoOpened) {
             helperMessage = "已自动尝试展开 YouTube transcript 面板。";
           }
           if (transcript) {
-            detection = {
-              hasText: true,
-              sourceType: "subtitle",
-              confidence: 0.85,
-              reason: "subtitle_panel_available",
-              canFallbackToLocal: false
-            };
+            log("展开面板后成功提取文本");
           }
         }
+
         if (!transcript && tracks.length === 0 && !hasVisibleYouTubeTranscriptPanel() && !hasPotentialTranscriptButton()) {
+          log("未发现任何字幕来源 (无 tracks, 无面板, 无按钮)");
           detailedError = isYouTubeWatchPage()
             ? "当前视频页未发现可直接读取的 YouTube transcript / captionTracks。请先确认该视频是否真的开放了平台字幕，若页面肉眼可见 transcript 但扩展仍失败，说明是页面结构差异，需要继续补适配。"
             : "当前页面疑似不是标准 YouTube 视频详情页，暂时无法稳定读取 transcript。";
-          detection = {
-            hasText: false,
-            sourceType: "none",
-            confidence: 1,
-            reason: "no_text_source_found",
-            canFallbackToLocal: true
-          };
         } else if (!transcript) {
-          detection = {
-            hasText: false,
-            sourceType: "none",
-            confidence: 0.4,
-            reason: "extract_failed",
-            canFallbackToLocal: false
-          };
+          log("所有提取尝试均告失败");
         }
       } else if (host.includes("bilibili.com") || host.includes("b23.tv")) {
         platform = "bilibili";
+        log("开始 Bilibili 提取流程");
         transcript = extractBilibiliTranscript();
-        detection = transcript
-          ? {
-              hasText: true,
-              sourceType: "subtitle",
-              confidence: 0.8,
-              reason: "subtitle_panel_available",
-              canFallbackToLocal: false
-            }
-          : {
-              hasText: false,
-              sourceType: "none",
-              confidence: 0.5,
-              reason: "extract_failed",
-              canFallbackToLocal: false
-            };
-      } else {
-        detection = {
-          hasText: false,
-          sourceType: "none",
-          confidence: 1,
-          reason: "page_not_supported",
-          canFallbackToLocal: false
-        };
+        if (transcript) {
+          log("成功提取 Bilibili 字幕");
+        } else {
+          log("未能提取 Bilibili 字幕");
+        }
       }
+
+      const detection = {
+        hasText: !!transcript,
+        extractionLogs: extractionLogs
+      };
 
       if (!transcript) {
         sendResponse({
