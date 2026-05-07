@@ -1616,6 +1616,12 @@ if "video_extension_request_component_key" not in st.session_state:
     st.session_state.video_extension_request_component_key = ""
 if "current_video_url" not in st.session_state:
     st.session_state.current_video_url = ""
+if "video_extension_auto_summary_pending" not in st.session_state:
+    st.session_state.video_extension_auto_summary_pending = False
+if "video_extension_auto_summary_url" not in st.session_state:
+    st.session_state.video_extension_auto_summary_url = ""
+if "video_extension_auto_summary_fetch_duration" not in st.session_state:
+    st.session_state.video_extension_auto_summary_fetch_duration = 0.0
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -1779,11 +1785,14 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
             "title": str(normalized_video_bridge_payload.get("title") or "").strip(),
         }
         st.session_state.video_extension_last_payload_id = video_extension_payload_id
-        do_video_summary_single(
-            str(normalized_video_bridge_payload.get("source_url") or st.session_state.get("current_video_url") or st.session_state.get("input_url") or "").strip(),
-            manual=False,
-            fetch_duration=0.0,
-        )
+        st.session_state.video_extension_auto_summary_pending = True
+        st.session_state.video_extension_auto_summary_url = str(
+            normalized_video_bridge_payload.get("source_url")
+            or st.session_state.get("current_video_url")
+            or st.session_state.get("input_url")
+            or ""
+        ).strip()
+        st.session_state.video_extension_auto_summary_fetch_duration = 0.0
 
 
 
@@ -2498,6 +2507,19 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         add_history_entry("single", url, summary, st.session_state.transcript_text)
     except Exception as e_hist:
         print(f"Failed to save history: {e_hist}")
+
+
+if st.session_state.get("video_extension_auto_summary_pending"):
+    pending_summary_url = str(st.session_state.get("video_extension_auto_summary_url") or "").strip()
+    pending_fetch_duration = float(st.session_state.get("video_extension_auto_summary_fetch_duration") or 0.0)
+    st.session_state.video_extension_auto_summary_pending = False
+    st.session_state.video_extension_auto_summary_url = ""
+    st.session_state.video_extension_auto_summary_fetch_duration = 0.0
+    do_video_summary_single(
+        pending_summary_url,
+        manual=False,
+        fetch_duration=pending_fetch_duration,
+    )
 
 
 def remember_current_video_url(url: str = "") -> str:
