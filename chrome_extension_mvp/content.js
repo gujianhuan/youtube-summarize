@@ -281,7 +281,7 @@
    * @returns {string}
    */
   function extractYouTubeTranscriptFromModernSegments() {
-    const nodes = querySelectorAllDeep("transcript-segment-view-model");
+    const nodes = querySelectorAllDeep("transcript-segment-view-model, ytd-transcript-segment-renderer");
     if (!nodes.length) {
       return "";
     }
@@ -292,7 +292,11 @@
         continue;
       }
 
-      const rawLines = normalizeWhitespace(node.innerText || node.textContent || "")
+      // 优先抓取特定的文本类或属性
+      const textContainer = node.querySelector(".segment-text, .cue, [role='button'], yt-formatted-string");
+      const rawText = textContainer ? textContainer.innerText : (node.innerText || node.textContent);
+      
+      const rawLines = normalizeWhitespace(rawText || "")
         .split("\n")
         .map((line) => normalizeWhitespace(line))
         .filter(Boolean);
@@ -302,7 +306,12 @@
       }
 
       const contentLines = rawLines.filter((line, index) => {
-        if (index === 0 && isLikelyTimestamp(line)) {
+        // 过滤掉时间戳
+        if (isLikelyTimestamp(line)) {
+          return false;
+        }
+        // 过滤掉纯数字（有时是序号）
+        if (/^\d+$/.test(line)) {
           return false;
         }
         return Boolean(cleanTranscriptLine(line));
@@ -314,7 +323,8 @@
       }
     }
 
-    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+    const result = normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+    return result.length > 20 ? result : "";
   }
 
   function extractYouTubeTranscriptFromTimestampBlocks() {
@@ -852,7 +862,7 @@
         
         transcript = await extractYouTubeTranscriptFromData();
         if (transcript) {
-          log("成功从内嵌数据 (captionTracks) 提取文本");
+          log(`成功从内嵌数据提取文本，长度: ${transcript.length}`);
           helperMessage = "已优先从 YouTube 页面内嵌字幕数据中提取 transcript。";
         }
 
@@ -860,7 +870,7 @@
           log("尝试从页面 DOM 直接提取");
           transcript = extractYouTubeTranscript();
           if (transcript) {
-            log("成功从页面 DOM 提取文本");
+            log(`成功从页面 DOM 提取文本，长度: ${transcript.length}`);
           }
         }
 
@@ -874,8 +884,13 @@
             helperMessage = "已自动尝试展开 YouTube transcript 面板。";
           }
           if (transcript) {
-            log("展开面板后成功提取文本");
+            log(`展开面板后成功提取文本，长度: ${transcript.length}`);
           }
+        }
+
+        if (transcript && transcript.length < 50) {
+          log(`提取到的文本过短 (${transcript.length})，可能提取到了错误的容器，重置 transcript`);
+          transcript = "";
         }
 
         if (!transcript && tracks.length === 0 && !hasVisibleYouTubeTranscriptPanel() && !hasPotentialTranscriptButton()) {
