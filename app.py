@@ -2840,13 +2840,21 @@ def render_video_processing_tab():
                 for log_line in extraction_logs:
                     st.write(f"- {log_line}")
 
-        col_fb1, col_fb2 = st.columns([3, 1])
+        st.divider()
+        st.info("💡 如果插件模式多次尝试仍失败（可能由于视频无字幕或页面结构变动），您可以：")
+        
+        col_fb1, col_fb2 = st.columns([1, 1])
         with col_fb1:
-            st.caption("提示：如果该视频没有平台字幕，插件模式将无法直接提取。建议您使用『本地转写』模式（通过本地客户端进行 ASR 转录）。")
-        with col_fb2:
-            if st.button("🔄 重置状态", key="btn_reset_extension", use_container_width=True):
+            if st.button("🔄 重置插件状态并重试", key="btn_reset_extension", use_container_width=True):
                 reset_video_extension_request_state(clear_result=True)
                 st.rerun()
+        with col_fb2:
+            if st.button("🚜 强制服务器端抓取 (兜底模式)", key="btn_server_fallback", use_container_width=True, type="secondary"):
+                reset_video_extension_request_state(clear_result=True)
+                do_video_fetch_single(resolved_url)
+        
+        st.caption("提示：服务器端抓取会启动音频下载与转录流程，耗时较长（约需 30s+）。")
+        return
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
