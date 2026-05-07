@@ -2840,8 +2840,13 @@ def render_video_processing_tab():
                 for log_line in extraction_logs:
                     st.write(f"- {log_line}")
 
-        st.caption("提示：如果该视频没有平台字幕，插件模式将无法直接提取。建议您使用『本地转写』方法（通过本地客户端进行 ASR 转录）。")
-        return
+        col_fb1, col_fb2 = st.columns([3, 1])
+        with col_fb1:
+            st.caption("提示：如果该视频没有平台字幕，插件模式将无法直接提取。建议您使用『本地转写』模式（通过本地客户端进行 ASR 转录）。")
+        with col_fb2:
+            if st.button("🔄 重置状态", key="btn_reset_extension", use_container_width=True):
+                reset_video_extension_request_state(clear_result=True)
+                st.rerun()
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
