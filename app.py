@@ -2822,7 +2822,7 @@ def render_video_processing_tab():
         if debug_text:
             with st.expander("查看插件桥接链调试明细", expanded=False):
                 st.code(debug_text, language="json")
-        st.caption("当前视频页已改为插件优先模式；主站不会再自动启动 yt-dlp/Whisper 音频转写兜底。")
+        st.caption("提示：如果该视频没有平台字幕，插件模式将无法直接提取。建议您使用『本地转写』方法（通过本地客户端进行 ASR 转录）。")
         return
 
     col1, col2, col3 = st.columns([1, 1, 2])
