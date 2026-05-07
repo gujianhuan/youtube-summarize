@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Transcript Helper MVP",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "description": "Extract transcript text from YouTube or Bilibili pages and send it to the summarizer site through a server bridge flow.",
   "permissions": [
     "activeTab",
@@ -38,13 +38,15 @@
         "https://*.onrender.com/*",
         "http://127.0.0.1/*",
         "http://localhost/*",
-        "https://youtube-summarize-0oms.onrender.com/*"
+        "https://youtube-summarize-0oms.onrender.com/*",
+        "https://youtube-summarize-bridge.onrender.com/*"
       ],
       "js": [
         "content.js"
       ],
       "run_at": "document_idle",
-      "all_frames": true
+      "all_frames": true,
+      "match_about_blank": true
     }
   ]
 }

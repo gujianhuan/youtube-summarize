@@ -1,0 +1,20 @@
+
+Key                    Value                               
+---                    -----                               
+Transfer-Encoding      chunked                             
+Connection             keep-alive                          
+cf-cache-status        DYNAMIC                             
+rndr-id                202e9900-9813-4923                  
+vary                   Accept-Encoding                     
+x-render-origin-server uvicorn                             
+CF-RAY                 9f4569107ccfca53-NRT                
+alt-svc                h3=":443"; ma=86400                 
+Cache-Control          no-cache                            
+Content-Type           text/html; charset=utf-8            
+Date                   Thu, 30 Apr 2026 09:09:56 GMT       
+ETag                   W/"218ff70fc1fa3a938c1b3718f84b2f0c"
+Last-Modified          Wed, 29 Apr 2026 08:17:41 GMT       
+Server                 cloudflare                          
+
+
+

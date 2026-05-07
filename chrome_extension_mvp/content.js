@@ -2,6 +2,12 @@
   const PAGE_REQUEST_NAMESPACE = "yt-summary-page-request";
   const PAGE_REQUEST_STORAGE_PREFIX = "yt-summary-page-request:";
   const PAGE_RESPONSE_STORAGE_PREFIX = "yt-summary-page-response:";
+  const BROADCAST_CHANNEL_NAME = "yt-summary-broadcast-channel";
+
+  // Initialize BroadcastChannel if available
+  const broadcastChannel = (typeof window.BroadcastChannel === "function") 
+    ? new window.BroadcastChannel(BROADCAST_CHANNEL_NAME)
+    : null;
 
   function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -985,6 +991,14 @@
     } catch (_error) {
       // Ignore frame enumeration issues.
     }
+
+    if (broadcastChannel) {
+      try {
+        broadcastChannel.postMessage(envelope);
+      } catch (_error) {
+        // Ignore broadcast failures.
+      }
+    }
   }
 
   function handlePageFlowRequest(requestId, payload, targetWindow, receivedStage) {
@@ -1099,6 +1113,19 @@
     }
     handlePageFlowRequest(data.requestId, data.payload || {}, event.source, "content_script_received_bridge_request");
   });
+
+  if (broadcastChannel) {
+    broadcastChannel.addEventListener("message", (event) => {
+      const data = event && event.data;
+      if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
+        return;
+      }
+      if (data.action !== "startSummarizeFlowFromPage") {
+        return;
+      }
+      handlePageFlowRequest(data.requestId, data.payload || {}, null, "content_script_received_broadcast_request");
+    });
+  }
 
   window.setInterval(pollPageFlowStorageRequests, 350);
 

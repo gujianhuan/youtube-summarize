@@ -1,0 +1,10 @@
+﻿git : fatal: unable to access 'https://github.com/gujianhuan/youtube-summarize.
+git/': Failed to connect to github.com port 443 after 21083 ms: Could not conne
+ct to server
+所在位置 行:1 字符: 5
++ & { git ls-remote origin refs/heads/main 2>&1 | Out-File -Encoding ut ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (fatal: unable t...nnect to server 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

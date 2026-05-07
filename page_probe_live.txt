@@ -1,0 +1,40 @@
+﻿d:\Workspace\YouTubeSummarizer\.python313\python.exe : Traceback (most recent c
+all last):
+所在位置 行:1 字符: 5
++ & { d:\Workspace\YouTubeSummarizer\.python313\python.exe run_page_pro ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last) 
+   ::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "D:\Workspace\YouTubeSummarizer\run_page_probe.py", line 260, in <module
+>
+    asyncio.run(main())
+    ~~~~~~~~~~~^^^^^^^^
+  File "asyncio\runners.py", line 195, in run
+  File "asyncio\runners.py", line 118, in run
+  File "asyncio\base_events.py", line 725, in run_until_complete
+  File "D:\Workspace\YouTubeSummarizer\run_page_probe.py", line 174, in main
+    click_text_tab = await _runtime_eval(ws, msg_id, click_text_tab_js, await_p
+romise=False)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^
+  File "D:\Workspace\YouTubeSummarizer\run_page_probe.py", line 47, in _runtime
+_eval
+    result = await _cdp_send(
+             ^^^^^^^^^^^^^^^^
+    ...<8 lines>...
+    )
+    ^
+  File "D:\Workspace\YouTubeSummarizer\run_page_probe.py", line 38, in _cdp_sen
+d
+    await ws.send(json.dumps(payload))
+  File "D:\Workspace\YouTubeSummarizer\.python313\Lib\site-packages\websockets\
+asyncio\connection.py", line 478, in send
+    async with self.send_context():
+               ~~~~~~~~~~~~~~~~~^^
+  File "contextlib.py", line 214, in __aenter__
+  File "D:\Workspace\YouTubeSummarizer\.python313\Lib\site-packages\websockets\
+asyncio\connection.py", line 965, in send_context
+    raise self.protocol.close_exc from original_exc
+websockets.exceptions.ConnectionClosedError: no close frame received or sent

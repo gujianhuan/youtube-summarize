@@ -10,6 +10,12 @@
     const PAGE_REQUEST_NAMESPACE = "yt-summary-page-request";
     const PAGE_REQUEST_STORAGE_PREFIX = "yt-summary-page-request:";
     const PAGE_RESPONSE_STORAGE_PREFIX = "yt-summary-page-response:";
+    const BROADCAST_CHANNEL_NAME = "yt-summary-broadcast-channel";
+
+    // Initialize BroadcastChannel if available
+    const broadcastChannel = (typeof window.BroadcastChannel === "function") 
+      ? new window.BroadcastChannel(BROADCAST_CHANNEL_NAME)
+      : null;
 
     function sendMessageToStreamlitClient(type, data) {
       window.parent.postMessage(
@@ -135,6 +141,9 @@
           window.clearTimeout(timeoutTimer);
         }
         window.removeEventListener("message", handleMessage);
+        if (broadcastChannel) {
+          broadcastChannel.removeEventListener("message", handleBroadcastMessage);
+        }
         clearPayload(requestStorageKey);
         if (!value || typeof value !== "object") {
           setComponentValue(value);
@@ -173,7 +182,28 @@
         finish(data.payload || { ok: false, error: "empty_extension_response" });
       }
 
+      function handleBroadcastMessage(event) {
+        const data = event && event.data;
+        if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
+          return;
+        }
+        if (data.action !== "summarizeFlowReply") {
+          return;
+        }
+        if (String(data.requestId || "") !== requestId) {
+          return;
+        }
+        trace.push({
+          stage: "bridge_component_received_broadcast_reply",
+          ok: true
+        });
+        finish(data.payload || { ok: false, error: "empty_extension_response" });
+      }
+
       window.addEventListener("message", handleMessage);
+      if (broadcastChannel) {
+        broadcastChannel.addEventListener("message", handleBroadcastMessage);
+      }
       const requestEnvelope = {
         namespace: PAGE_REQUEST_NAMESPACE,
         action: "startSummarizeFlowFromPage",
@@ -221,6 +251,22 @@
       tryPost(window, "bridge_component_postmessage_to_self");
       tryPost(window.parent, "bridge_component_postmessage_to_parent");
       tryPost(window.top, "bridge_component_postmessage_to_top");
+
+      if (broadcastChannel) {
+        try {
+          trace.push({
+            stage: "bridge_component_broadcast_request",
+            ok: true
+          });
+          broadcastChannel.postMessage(requestEnvelope);
+        } catch (error) {
+          trace.push({
+            stage: "bridge_component_broadcast_request_failed",
+            ok: false,
+            error: String((error && error.message) || error || "broadcast_failed")
+          });
+        }
+      }
 
       storagePollTimer = window.setInterval(() => {
         const storageReply = readPayload(responseStorageKey, true);
