@@ -61,7 +61,7 @@ def _get_shared_lock():
 
 
 # --- Render Build Info Cache ---
-# Commit: ec24d83 (Plugin-Only Workflow Finalized)
+# Commit: d63ed66 (Refined YouTube Extraction & Logging)
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
