@@ -1,5 +1,7 @@
 (function () {
   const PAGE_REQUEST_NAMESPACE = "yt-summary-page-request";
+  const PAGE_REQUEST_STORAGE_PREFIX = "yt-summary-page-request:";
+  const PAGE_RESPONSE_STORAGE_PREFIX = "yt-summary-page-response:";
 
   function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -50,6 +52,44 @@
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  function parseJsonSafely(rawValue) {
+    if (!rawValue) {
+      return null;
+    }
+    try {
+      return JSON.parse(rawValue);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function writePageFlowStorageResponse(requestId, replyPayload) {
+    const responseKey = `${PAGE_RESPONSE_STORAGE_PREFIX}${requestId}`;
+    const envelope = JSON.stringify({
+      namespace: PAGE_REQUEST_NAMESPACE,
+      action: "summarizeFlowReply",
+      requestId,
+      payload: replyPayload
+    });
+    for (const store of [window.localStorage, window.sessionStorage]) {
+      try {
+        store.setItem(responseKey, envelope);
+      } catch (_error) {
+        // Ignore storage write issues and keep other delivery paths alive.
+      }
+    }
+  }
+
+  function consumePageFlowStorageRequest(storageKey) {
+    for (const store of [window.localStorage, window.sessionStorage]) {
+      try {
+        store.removeItem(storageKey);
+      } catch (_error) {
+        // Ignore cleanup errors.
+      }
+    }
   }
 
   function dedupeTranscriptLines(lines) {
@@ -907,60 +947,61 @@
     return true;
   });
 
-  window.addEventListener("message", (event) => {
-    const data = event && event.data;
-    if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
-      return;
-    }
-    if (data.action !== "startSummarizeFlowFromPage") {
-      return;
-    }
-    const requestId = String(data.requestId || "").trim();
-    const payload = data.payload || {};
-    const targetWindow = event.source;
-    const attempts = [
-      {
-        stage: "content_script_received_bridge_request",
-        ok: true,
-        requestId,
-        sourceUrl: String(payload?.sourceUrl || "").trim()
-      }
-    ];
-    const replyEnvelope = (replyPayload) => ({
+  const handledPageFlowRequests = new Set();
+
+  function replyEnvelope(requestId, replyPayload) {
+    return {
       namespace: PAGE_REQUEST_NAMESPACE,
       action: "summarizeFlowReply",
       requestId,
       payload: replyPayload
-    });
+    };
+  }
 
-    function postReplyToKnownWindows(replyPayload) {
-      const envelope = replyEnvelope(replyPayload);
-      const notified = new Set();
+  function postReplyToKnownWindows(requestId, replyPayload, targetWindow) {
+    const envelope = replyEnvelope(requestId, replyPayload);
+    const notified = new Set();
 
-      const tryPost = (target) => {
-        if (!target || typeof target.postMessage !== "function" || notified.has(target)) {
-          return;
-        }
-        notified.add(target);
-        try {
-          target.postMessage(envelope, "*");
-        } catch (_error) {
-          // Ignore cross-window delivery issues and continue broadcasting.
-        }
-      };
-
-      tryPost(targetWindow);
-      tryPost(window);
-      tryPost(window.top);
-
-      try {
-        for (let i = 0; i < window.frames.length; i += 1) {
-          tryPost(window.frames[i]);
-        }
-      } catch (_error) {
-        // Ignore frame enumeration issues.
+    const tryPost = (target) => {
+      if (!target || typeof target.postMessage !== "function" || notified.has(target)) {
+        return;
       }
+      notified.add(target);
+      try {
+        target.postMessage(envelope, "*");
+      } catch (_error) {
+        // Ignore cross-window delivery issues and continue broadcasting.
+      }
+    };
+
+    tryPost(targetWindow);
+    tryPost(window);
+    tryPost(window.top);
+
+    try {
+      for (let i = 0; i < window.frames.length; i += 1) {
+        tryPost(window.frames[i]);
+      }
+    } catch (_error) {
+      // Ignore frame enumeration issues.
     }
+  }
+
+  function handlePageFlowRequest(requestId, payload, targetWindow, receivedStage) {
+    const normalizedRequestId = String(requestId || "").trim();
+    if (!normalizedRequestId || handledPageFlowRequests.has(normalizedRequestId)) {
+      return;
+    }
+    handledPageFlowRequests.add(normalizedRequestId);
+
+    const attempts = [
+      {
+        stage: receivedStage,
+        ok: true,
+        requestId: normalizedRequestId,
+        sourceUrl: String(payload?.sourceUrl || "").trim()
+      }
+    ];
 
     attempts.push({
       stage: "content_script_send_runtime_message",
@@ -973,43 +1014,93 @@
       },
       (response) => {
         const runtimeError = chrome.runtime.lastError;
+        let replyPayload;
+
         if (runtimeError) {
           attempts.push({
             stage: "content_script_runtime_callback",
             ok: false,
             error: String(runtimeError.message || "runtime_message_failed")
           });
+          replyPayload = {
+            ok: false,
+            error: String(runtimeError.message || "runtime_message_failed"),
+            debug: { attempts: [...attempts] }
+          };
         } else {
           attempts.push({
             stage: "content_script_runtime_callback",
             ok: true,
             error: String(response?.error || "")
           });
-        }
-        const replyPayload = runtimeError
-          ? {
-              ok: false,
-              error: String(runtimeError.message || "runtime_message_failed"),
-              debug: { attempts: [...attempts] }
+          replyPayload = {
+            ...(response || { ok: false, error: "empty_background_response" }),
+            debug: {
+              ...((response && response.debug && typeof response.debug === "object") ? response.debug : {}),
+              attempts: [
+                ...attempts,
+                ...((((response && response.debug) || {}).attempts) instanceof Array ? response.debug.attempts : [])
+              ]
             }
-          : {
-              ...(response || { ok: false, error: "empty_background_response" }),
-              debug: {
-                ...((response && response.debug && typeof response.debug === "object") ? response.debug : {}),
-                attempts: [
-                  ...attempts,
-                  ...((((response && response.debug) || {}).attempts) instanceof Array ? response.debug.attempts : [])
-                ]
-              }
-            };
+          };
+        }
+
         attempts.push({
           stage: "content_script_post_reply_to_bridge",
           ok: true
         });
-        postReplyToKnownWindows(replyPayload);
+        postReplyToKnownWindows(normalizedRequestId, replyPayload, targetWindow);
+
+        attempts.push({
+          stage: "content_script_write_storage_reply",
+          ok: true
+        });
+        if (replyPayload.debug && typeof replyPayload.debug === "object") {
+          replyPayload.debug.attempts = [
+            ...attempts,
+            ...((Array.isArray(replyPayload.debug.attempts) ? replyPayload.debug.attempts : []).filter(Boolean))
+          ];
+        }
+        writePageFlowStorageResponse(normalizedRequestId, replyPayload);
       }
     );
+  }
+
+  function pollPageFlowStorageRequests() {
+    for (const store of [window.localStorage, window.sessionStorage]) {
+      let keys = [];
+      try {
+        keys = Array.from({ length: store.length }, (_, index) => store.key(index)).filter(Boolean);
+      } catch (_error) {
+        continue;
+      }
+
+      for (const key of keys) {
+        if (!String(key).startsWith(PAGE_REQUEST_STORAGE_PREFIX)) {
+          continue;
+        }
+        const payload = parseJsonSafely(store.getItem(key));
+        if (!payload || payload.namespace !== PAGE_REQUEST_NAMESPACE || payload.action !== "startSummarizeFlowFromPage") {
+          continue;
+        }
+        consumePageFlowStorageRequest(key);
+        handlePageFlowRequest(payload.requestId, payload.payload || {}, null, "content_script_received_storage_request");
+      }
+    }
+  }
+
+  window.addEventListener("message", (event) => {
+    const data = event && event.data;
+    if (!data || data.namespace !== PAGE_REQUEST_NAMESPACE) {
+      return;
+    }
+    if (data.action !== "startSummarizeFlowFromPage") {
+      return;
+    }
+    handlePageFlowRequest(data.requestId, data.payload || {}, event.source, "content_script_received_bridge_request");
   });
+
+  window.setInterval(pollPageFlowStorageRequests, 350);
 
   function findClickableByText(patterns) {
     const nodes = querySelectorAllDeep('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer');

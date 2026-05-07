@@ -8,6 +8,8 @@
 <body>
   <script>
     const PAGE_REQUEST_NAMESPACE = "yt-summary-page-request";
+    const PAGE_REQUEST_STORAGE_PREFIX = "yt-summary-page-request:";
+    const PAGE_RESPONSE_STORAGE_PREFIX = "yt-summary-page-response:";
 
     function sendMessageToStreamlitClient(type, data) {
       window.parent.postMessage(
@@ -77,6 +79,27 @@
       return `page_req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
     }
 
+    function writePayload(storageKey, value) {
+      const serialized = JSON.stringify(value);
+      for (const store of [window.localStorage, window.sessionStorage]) {
+        try {
+          store.setItem(storageKey, serialized);
+        } catch (_error) {
+          // Ignore storage write failures and keep other channels available.
+        }
+      }
+    }
+
+    function clearPayload(storageKey) {
+      for (const store of [window.localStorage, window.sessionStorage]) {
+        try {
+          store.removeItem(storageKey);
+        } catch (_error) {
+          // Ignore storage cleanup failures.
+        }
+      }
+    }
+
     function requestExtensionSummarize(args) {
       const sourceUrl = String((args && args.sourceUrl) || "").trim();
       if (!sourceUrl) {
@@ -85,7 +108,11 @@
       }
       const requestId = String((args && args.requestId) || "").trim() || buildRequestId();
       const timeoutMs = Number((args && args.timeoutMs) || 60000);
+      const requestStorageKey = `${PAGE_REQUEST_STORAGE_PREFIX}${requestId}`;
+      const responseStorageKey = `${PAGE_RESPONSE_STORAGE_PREFIX}${requestId}`;
       let settled = false;
+      let storagePollTimer = null;
+      let timeoutTimer = null;
       const trace = [
         {
           stage: "bridge_component_request_created",
@@ -101,7 +128,14 @@
           return;
         }
         settled = true;
+        if (storagePollTimer) {
+          window.clearInterval(storagePollTimer);
+        }
+        if (timeoutTimer) {
+          window.clearTimeout(timeoutTimer);
+        }
         window.removeEventListener("message", handleMessage);
+        clearPayload(requestStorageKey);
         if (!value || typeof value !== "object") {
           setComponentValue(value);
           return;
@@ -148,6 +182,21 @@
           sourceUrl
         }
       };
+
+      clearPayload(responseStorageKey);
+      try {
+        writePayload(requestStorageKey, requestEnvelope);
+        trace.push({
+          stage: "bridge_component_write_storage_request",
+          ok: true
+        });
+      } catch (error) {
+        trace.push({
+          stage: "bridge_component_write_storage_request_failed",
+          ok: false,
+          error: String((error && error.message) || error || "storage_write_failed")
+        });
+      }
       const notifiedTargets = new Set();
       const tryPost = (target, stageName) => {
         if (!target || typeof target.postMessage !== "function" || notifiedTargets.has(target)) {
@@ -173,7 +222,25 @@
       tryPost(window.parent, "bridge_component_postmessage_to_parent");
       tryPost(window.top, "bridge_component_postmessage_to_top");
 
-      window.setTimeout(() => {
+      storagePollTimer = window.setInterval(() => {
+        const storageReply = readPayload(responseStorageKey, true);
+        if (!storageReply || typeof storageReply !== "object") {
+          return;
+        }
+        if (storageReply.namespace !== PAGE_REQUEST_NAMESPACE || storageReply.action !== "summarizeFlowReply") {
+          return;
+        }
+        if (String(storageReply.requestId || "") !== requestId) {
+          return;
+        }
+        trace.push({
+          stage: "bridge_component_received_storage_reply",
+          ok: true
+        });
+        finish(storageReply.payload || { ok: false, error: "empty_extension_response" });
+      }, 250);
+
+      timeoutTimer = window.setTimeout(() => {
         trace.push({
           stage: "bridge_component_wait_reply_timeout",
           ok: false,
