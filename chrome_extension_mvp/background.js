@@ -8,9 +8,9 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.44";
+const EXTENSION_TOOL_VERSION = "0.1.45";
 
-// Release v0.1.44: Fix bridge retry logic and enhance subtitle parsing.
+// Release v0.1.45: Fix XML parser order and enhance fetch/parse diagnostic trace.
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -218,19 +218,14 @@ function parseYouTubeJsonTranscript(payload) {
 function parseYouTubeXmlTranscript(xmlText) {
   const lines = [];
   const source = String(xmlText || "");
-  const patterns = [
-    /<text\b[^>]*>([\s\S]*?)<\/text>/g,
-    /<p\b[^>]*>([\s\S]*?)<\/p>/g,
-    /<s\b[^>]*>([\s\S]*?)<\/s>/g
-  ];
+  // Use combined regex to maintain original order
+  const pattern = /<(text|p|s)\b[^>]*>([\s\S]*?)<\/\1>/g;
 
-  for (const pattern of patterns) {
-    for (const match of source.matchAll(pattern)) {
-      const raw = String(match[1] || "").replace(/<[^>]+>/g, " ");
-      const cleaned = normalizeWhitespace(decodeHtmlEntities(raw));
-      if (cleaned) {
-        lines.push(cleaned);
-      }
+  for (const match of source.matchAll(pattern)) {
+    const raw = String(match[2] || "").replace(/<[^>]+>/g, " ");
+    const cleaned = normalizeWhitespace(decodeHtmlEntities(raw));
+    if (cleaned) {
+      lines.push(cleaned);
     }
   }
 
@@ -329,17 +324,21 @@ async function fetchYouTubeCaptionTrack(track) {
       if (!trimmed) {
         continue;
       }
-      if (trimmed.startsWith("{")) {
-        const transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
-        if (transcript) {
-          return transcript;
+      try {
+        if (trimmed.startsWith("{")) {
+          const transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
+          if (transcript) {
+            return transcript;
+          }
         }
-      }
-      for (const parser of [parseYouTubeXmlTranscript, parseYouTubeVttTranscript]) {
-        const transcript = parser(trimmed);
-        if (transcript) {
-          return transcript;
+        for (const parser of [parseYouTubeXmlTranscript, parseYouTubeVttTranscript]) {
+          const transcript = parser(trimmed);
+          if (transcript) {
+            return transcript;
+          }
         }
+      } catch (e) {
+        // Continue to next candidate.
       }
     } catch (_error) {
       // Try next candidate.
@@ -369,6 +368,7 @@ async function extractYouTubeTranscriptByUrl(sourceUrl) {
     return aPenalty - bPenalty;
   });
 
+  const extractionTrace = [];
   for (const track of sortedTracks) {
     const transcript = await fetchYouTubeCaptionTrack(track);
     if (transcript) {
@@ -382,6 +382,8 @@ async function extractYouTubeTranscriptByUrl(sourceUrl) {
           kind: String(track?.kind || "")
         }
       };
+    } else {
+      extractionTrace.push(`Failed to fetch track: ${track?.languageCode} (${track?.kind})`);
     }
   }
 
@@ -390,7 +392,8 @@ async function extractYouTubeTranscriptByUrl(sourceUrl) {
     error: "background_caption_fetch_failed",
     debug: {
       htmlContainsCaptionTracks: true,
-      trackCount: tracks.length
+      trackCount: tracks.length,
+      trace: extractionTrace
     }
   };
 }
@@ -800,17 +803,17 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         };
 
         const parseYouTubeXmlTranscript = (xmlText) => {
-          const parser = new DOMParser();
-          const xml = parser.parseFromString(String(xmlText || ""), "text/xml");
-          const nodes = [
-            ...Array.from(xml.getElementsByTagName("text")),
-            ...Array.from(xml.getElementsByTagName("p")),
-            ...Array.from(xml.getElementsByTagName("s"))
-          ];
-          const lines = nodes
-            .map((node) => decodeHtmlEntities((node.textContent || "").replace(/\s+/g, " ")))
-            .map((line) => normalizeWhitespace(line))
-            .filter(Boolean);
+          const lines = [];
+          const source = String(xmlText || "");
+          const pattern = /<(text|p|s)\b[^>]*>([\s\S]*?)<\/\1>/g;
+
+          for (const match of source.matchAll(pattern)) {
+            const raw = String(match[2] || "").replace(/<[^>]+>/g, " ");
+            const cleaned = normalizeWhitespace(decodeHtmlEntities(raw));
+            if (cleaned) {
+              lines.push(cleaned);
+            }
+          }
           return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
         };
 
@@ -941,6 +944,7 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         };
 
         const tracks = getCaptionTracks();
+        const extractionTrace = [];
         if (!tracks.length) {
           return {
             ok: false,
@@ -960,6 +964,7 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         for (const track of sortedTracks) {
           const baseUrl = String(track?.baseUrl || "").trim();
           if (!baseUrl) {
+            extractionTrace.push(`Empty baseUrl for track: ${track?.languageCode}`);
             continue;
           }
           const candidates = [];
@@ -980,19 +985,28 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
                 cache: "no-store"
               });
               if (!resp.ok) {
+                extractionTrace.push(`Fetch failed for ${candidate.slice(0, 50)}...: ${resp.status}`);
                 continue;
               }
               const rawText = await resp.text();
               const trimmed = rawText.trim();
               if (!trimmed) {
+                extractionTrace.push(`Empty body for ${candidate.slice(0, 50)}...`);
                 continue;
               }
               let transcript = "";
-              if (trimmed.startsWith("{")) {
-                transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
-              } else {
-                transcript = parseYouTubeXmlTranscript(trimmed) || parseYouTubeVttTranscript(trimmed);
+              let parseError = "";
+              try {
+                if (trimmed.startsWith("{")) {
+                  transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
+                } else {
+                  transcript = parseYouTubeXmlTranscript(trimmed) || parseYouTubeVttTranscript(trimmed);
+                }
+              } catch (e) {
+                parseError = String(e.message || e);
+                extractionTrace.push(`Parse error for ${candidate.slice(0, 50)}...: ${parseError}`);
               }
+
               if (transcript) {
                 return {
                   ok: true,
@@ -1004,9 +1018,11 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
                     fetchUrlType: candidate.includes("fmt=json3") ? "json3" : "base"
                   }
                 };
+              } else {
+                extractionTrace.push(`No text extracted from ${candidate.slice(0, 50)}... (ParseError: ${parseError})`);
               }
-            } catch (_error) {
-              // Try next candidate/track.
+            } catch (err) {
+              extractionTrace.push(`Network error for ${candidate.slice(0, 50)}...: ${err.message}`);
             }
           }
         }
@@ -1015,7 +1031,8 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           ok: false,
           error: "main_world_caption_fetch_failed",
           debug: {
-            trackCount: tracks.length
+            trackCount: tracks.length,
+            trace: extractionTrace
           }
         };
       }
