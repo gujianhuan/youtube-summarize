@@ -1179,7 +1179,8 @@
     });
   }
 
-  window.setInterval(pollPageFlowStorageRequests, 350);
+  pollPageFlowStorageRequests();
+  window.setInterval(pollPageFlowStorageRequests, 250);
 
   function findClickableByText(patterns) {
     const nodes = querySelectorAllDeep('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer');

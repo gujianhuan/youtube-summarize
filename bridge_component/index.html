@@ -229,11 +229,16 @@
         });
       }
       const notifiedTargets = new Set();
-      const tryPost = (target, stageName) => {
-        if (!target || typeof target.postMessage !== "function" || notifiedTargets.has(target)) {
+      const tryPost = (target, stageName, allowRepeat = false) => {
+        if (!target || typeof target.postMessage !== "function") {
           return;
         }
-        notifiedTargets.add(target);
+        if (!allowRepeat && notifiedTargets.has(target)) {
+          return;
+        }
+        if (!allowRepeat) {
+          notifiedTargets.add(target);
+        }
         try {
           trace.push({
             stage: stageName,
@@ -253,14 +258,17 @@
       tryPost(window.parent, "bridge_component_postmessage_to_parent");
       tryPost(window.top, "bridge_component_postmessage_to_top");
 
+      let broadcastAttempt = 0;
       const broadcastRequest = () => {
         if (settled) return;
+        broadcastAttempt += 1;
         if (broadcastChannel) {
           try {
             trace.push({
               stage: "bridge_component_broadcast_request",
               ok: true,
-              retry: Boolean(notifiedTargets.size > 3)
+              retry: broadcastAttempt > 1,
+              attempt: broadcastAttempt
             });
             broadcastChannel.postMessage(requestEnvelope);
           } catch (error) {
@@ -272,17 +280,17 @@
           }
         }
         // Also re-trigger postMessage to self/parent/top in case of race conditions
-        tryPost(window, "bridge_component_postmessage_to_self_retry");
-        tryPost(window.parent, "bridge_component_postmessage_to_parent_retry");
-        tryPost(window.top, "bridge_component_postmessage_to_top_retry");
+        tryPost(window, "bridge_component_postmessage_to_self_retry", true);
+        tryPost(window.parent, "bridge_component_postmessage_to_parent_retry", true);
+        tryPost(window.top, "bridge_component_postmessage_to_top_retry", true);
       };
 
       // Send initial broadcast
       broadcastRequest();
 
-      // Periodically re-broadcast for the first 5 seconds to handle extension injection race
+      // Periodically re-broadcast for the first 10 seconds to handle extension injection race
       const reBroadcastTimer = window.setInterval(() => {
-        if (settled || (Date.now() - requestEnvelope.timestamp > 5000)) {
+        if (settled || (Date.now() - requestEnvelope.timestamp > 10000)) {
           window.clearInterval(reBroadcastTimer);
           return;
         }
