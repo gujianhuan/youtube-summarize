@@ -10,6 +10,8 @@ const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
 const EXTENSION_TOOL_VERSION = "0.1.44";
 
+// Release v0.1.44: Fix bridge retry logic and enhance subtitle parsing.
+
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
   return (trimmed || fallbackValue).replace(/\/+$/, "") + "/";
