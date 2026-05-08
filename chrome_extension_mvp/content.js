@@ -567,6 +567,152 @@
     return [];
   }
 
+  function extractTextFromRuns(value) {
+    if (!value) {
+      return "";
+    }
+    if (typeof value === "string") {
+      return normalizeWhitespace(decodeHtmlEntities(value));
+    }
+    if (Array.isArray(value)) {
+      return normalizeWhitespace(value.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+    }
+    if (typeof value === "object") {
+      if (typeof value.text === "string") {
+        return normalizeWhitespace(decodeHtmlEntities(value.text));
+      }
+      if (typeof value.utf8 === "string") {
+        return normalizeWhitespace(decodeHtmlEntities(value.utf8));
+      }
+      if (typeof value.simpleText === "string") {
+        return normalizeWhitespace(decodeHtmlEntities(value.simpleText));
+      }
+      if (Array.isArray(value.runs)) {
+        return normalizeWhitespace(value.runs.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+      }
+      for (const key of ["cue", "snippet", "content", "headline", "title"]) {
+        const nestedText = extractTextFromRuns(value[key]);
+        if (nestedText) {
+          return nestedText;
+        }
+      }
+    }
+    return "";
+  }
+
+  function extractTranscriptFromCueGroups(cueGroups) {
+    const lines = [];
+    for (const group of Array.isArray(cueGroups) ? cueGroups : []) {
+      const cues = Array.isArray(group?.transcriptCueGroupRenderer?.cues)
+        ? group.transcriptCueGroupRenderer.cues
+        : [];
+      for (const cue of cues) {
+        const renderer = cue?.transcriptCueRenderer || cue || {};
+        const line = extractTextFromRuns(
+          renderer.cue ||
+          renderer.snippet ||
+          renderer.content ||
+          renderer.cueSimpleText ||
+          renderer.text ||
+          renderer
+        );
+        if (!line || isLikelyTimestamp(line)) {
+          continue;
+        }
+        lines.push(line);
+      }
+    }
+    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+  }
+
+  function collectCueGroups(root, results = [], seen = new Set()) {
+    if (!root || typeof root !== "object" || seen.has(root) || results.length >= 5) {
+      return results;
+    }
+    seen.add(root);
+    if (Array.isArray(root)) {
+      for (const item of root) {
+        collectCueGroups(item, results, seen);
+        if (results.length >= 5) {
+          break;
+        }
+      }
+      return results;
+    }
+    if (Array.isArray(root.cueGroups) && root.cueGroups.length) {
+      results.push(root.cueGroups);
+    }
+    for (const value of Object.values(root)) {
+      collectCueGroups(value, results, seen);
+      if (results.length >= 5) {
+        break;
+      }
+    }
+    return results;
+  }
+
+  function extractTranscriptFromStructuredData(root) {
+    const candidates = collectCueGroups(root);
+    for (const cueGroups of candidates) {
+      const transcript = extractTranscriptFromCueGroups(cueGroups);
+      if (transcript) {
+        return transcript;
+      }
+    }
+    return "";
+  }
+
+  function extractStructuredTranscriptFromSource(source) {
+    if (!source) {
+      return "";
+    }
+
+    const markers = [
+      "ytInitialData =",
+      "var ytInitialData =",
+      "window[\"ytInitialData\"] =",
+      "ytInitialData=",
+      "\"ytInitialData\":"
+    ];
+
+    for (const marker of markers) {
+      const initialData = parseJsonObjectAfterMarker(source, marker);
+      const transcript = extractTranscriptFromStructuredData(initialData);
+      if (transcript) {
+        return transcript;
+      }
+    }
+
+    const cueGroupsKey = "\"cueGroups\":";
+    let searchIndex = 0;
+    while (searchIndex < source.length) {
+      const markerIndex = source.indexOf(cueGroupsKey, searchIndex);
+      if (markerIndex === -1) {
+        break;
+      }
+      const arrayStart = source.indexOf("[", markerIndex);
+      if (arrayStart === -1) {
+        break;
+      }
+      const rawArray = extractBalancedJsonArray(source, arrayStart);
+      if (!rawArray) {
+        searchIndex = markerIndex + cueGroupsKey.length;
+        continue;
+      }
+      try {
+        const transcript = extractTranscriptFromCueGroups(JSON.parse(rawArray));
+        if (transcript) {
+          return transcript;
+        }
+      } catch (_error) {
+        // Continue searching next occurrence.
+      }
+      searchIndex = arrayStart + rawArray.length;
+    }
+
+    return "";
+  }
+
   async function fetchCurrentPageHtml() {
     try {
       const resp = await fetch(location.href, {
@@ -664,6 +810,171 @@
       parent.appendChild(script);
       script.remove();
       window.setTimeout(() => finalize([]), 1200);
+    });
+  }
+
+  async function getYouTubeInlineTranscriptFromPageContext() {
+    const eventName = `yt_inline_transcript_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+    return new Promise((resolve) => {
+      let settled = false;
+
+      const finalize = (transcript) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.removeEventListener(eventName, handleEvent);
+        resolve(typeof transcript === "string" ? transcript : "");
+      };
+
+      const handleEvent = (event) => {
+        const detail = event?.detail || {};
+        finalize(detail.transcript);
+      };
+
+      window.addEventListener(eventName, handleEvent, { once: true });
+
+      const script = document.createElement("script");
+      script.textContent = `
+        (() => {
+          const eventName = ${JSON.stringify(eventName)};
+          const emit = (transcript) => {
+            window.dispatchEvent(new CustomEvent(eventName, {
+              detail: { transcript: typeof transcript === "string" ? transcript : "" }
+            }));
+          };
+          const normalizeWhitespace = (text) => String(text || "")
+            .replace(/\\u200b/g, "")
+            .replace(/[ \\t]+\\n/g, "\\n")
+            .replace(/\\n{3,}/g, "\\n\\n")
+            .trim();
+          const decodeHtmlEntities = (text) => String(text || "")
+            .replace(/&#(\\d+);/g, (_match, code) => String.fromCharCode(Number(code)))
+            .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCharCode(parseInt(code, 16)))
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, "\\"")
+            .replace(/&#39;/g, "'")
+            .replace(/&nbsp;/g, " ");
+          const dedupeTranscriptLines = (lines) => {
+            const result = [];
+            const seen = new Set();
+            for (const rawLine of Array.isArray(lines) ? lines : []) {
+              const line = normalizeWhitespace(rawLine);
+              if (!line || seen.has(line)) continue;
+              seen.add(line);
+              result.push(line);
+            }
+            return result;
+          };
+          const extractTextFromRuns = (value) => {
+            if (!value) return "";
+            if (typeof value === "string") return normalizeWhitespace(decodeHtmlEntities(value));
+            if (Array.isArray(value)) {
+              return normalizeWhitespace(value.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+            }
+            if (typeof value === "object") {
+              if (typeof value.text === "string") return normalizeWhitespace(decodeHtmlEntities(value.text));
+              if (typeof value.utf8 === "string") return normalizeWhitespace(decodeHtmlEntities(value.utf8));
+              if (typeof value.simpleText === "string") return normalizeWhitespace(decodeHtmlEntities(value.simpleText));
+              if (Array.isArray(value.runs)) {
+                return normalizeWhitespace(value.runs.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+              }
+              for (const key of ["cue", "snippet", "content", "headline", "title"]) {
+                const nestedText = extractTextFromRuns(value[key]);
+                if (nestedText) return nestedText;
+              }
+            }
+            return "";
+          };
+          const isLikelyTimestamp = (text) => /^(?:\\d{1,2}:)?\\d{1,2}:\\d{2}$/.test(String(text || "").trim());
+          const extractTranscriptFromCueGroups = (cueGroups) => {
+            const lines = [];
+            for (const group of Array.isArray(cueGroups) ? cueGroups : []) {
+              const cues = Array.isArray(group?.transcriptCueGroupRenderer?.cues)
+                ? group.transcriptCueGroupRenderer.cues
+                : [];
+              for (const cue of cues) {
+                const renderer = cue?.transcriptCueRenderer || cue || {};
+                const line = extractTextFromRuns(
+                  renderer.cue ||
+                  renderer.snippet ||
+                  renderer.content ||
+                  renderer.cueSimpleText ||
+                  renderer.text ||
+                  renderer
+                );
+                if (!line || isLikelyTimestamp(line)) continue;
+                lines.push(line);
+              }
+            }
+            return normalizeWhitespace(dedupeTranscriptLines(lines).join("\\n"));
+          };
+          const collectCueGroups = (root, results = [], seen = new Set()) => {
+            if (!root || typeof root !== "object" || seen.has(root) || results.length >= 5) return results;
+            seen.add(root);
+            if (Array.isArray(root)) {
+              for (const item of root) {
+                collectCueGroups(item, results, seen);
+                if (results.length >= 5) break;
+              }
+              return results;
+            }
+            if (Array.isArray(root.cueGroups) && root.cueGroups.length) {
+              results.push(root.cueGroups);
+            }
+            for (const value of Object.values(root)) {
+              collectCueGroups(value, results, seen);
+              if (results.length >= 5) break;
+            }
+            return results;
+          };
+          const extractTranscriptFromStructuredData = (root) => {
+            const candidates = collectCueGroups(root);
+            for (const cueGroups of candidates) {
+              const transcript = extractTranscriptFromCueGroups(cueGroups);
+              if (transcript) return transcript;
+            }
+            return "";
+          };
+          const parseMaybeJson = (value) => {
+            if (!value) return null;
+            if (typeof value === "object") return value;
+            try { return JSON.parse(value); } catch (_error) { return null; }
+          };
+
+          try {
+            const candidates = [];
+            candidates.push(window.ytInitialData);
+            candidates.push(parseMaybeJson(window?.ytcfg?.data_?.INITIAL_DATA));
+            if (typeof window?.ytcfg?.get === "function") {
+              candidates.push(parseMaybeJson(window.ytcfg.get("INITIAL_DATA")));
+              candidates.push(parseMaybeJson(window.ytcfg.get("ytInitialData")));
+            }
+            for (const candidate of candidates) {
+              const transcript = extractTranscriptFromStructuredData(candidate);
+              if (transcript) {
+                emit(transcript);
+                return;
+              }
+            }
+          } catch (_error) {}
+
+          emit("");
+        })();
+      `;
+
+      const parent = document.documentElement || document.head || document.body;
+      if (!parent) {
+        finalize("");
+        return;
+      }
+
+      parent.appendChild(script);
+      script.remove();
+      window.setTimeout(() => finalize(""), 1200);
     });
   }
 
@@ -857,6 +1168,15 @@
             return transcript;
           }
         }
+      }
+      const pageContextTranscript = await getYouTubeInlineTranscriptFromPageContext();
+      if (pageContextTranscript) {
+        return pageContextTranscript;
+      }
+      const htmlSource = await fetchCurrentPageHtml();
+      const htmlTranscript = extractStructuredTranscriptFromSource(htmlSource);
+      if (htmlTranscript) {
+        return htmlTranscript;
       }
       cachedYouTubeCaptionTracks = null;
       cachedYouTubeCaptionTracksUrl = "";

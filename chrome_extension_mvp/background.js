@@ -8,9 +8,9 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.45";
+const EXTENSION_TOOL_VERSION = "0.1.46";
 
-// Release v0.1.45: Fix XML parser order and enhance fetch/parse diagnostic trace.
+// Release v0.1.46: Add ytInitialData cueGroups fallback when timedtext returns empty.
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -270,6 +270,157 @@ function parseYouTubeVttTranscript(vttText) {
   return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
 }
 
+function extractTextFromRuns(value) {
+  if (!value) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return normalizeWhitespace(decodeHtmlEntities(value));
+  }
+  if (Array.isArray(value)) {
+    return normalizeWhitespace(value.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+  }
+  if (typeof value === "object") {
+    if (typeof value.text === "string") {
+      return normalizeWhitespace(decodeHtmlEntities(value.text));
+    }
+    if (typeof value.utf8 === "string") {
+      return normalizeWhitespace(decodeHtmlEntities(value.utf8));
+    }
+    if (typeof value.simpleText === "string") {
+      return normalizeWhitespace(decodeHtmlEntities(value.simpleText));
+    }
+    if (Array.isArray(value.runs)) {
+      return normalizeWhitespace(value.runs.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+    }
+    for (const key of ["cue", "snippet", "content", "headline", "title"]) {
+      const nestedText = extractTextFromRuns(value[key]);
+      if (nestedText) {
+        return nestedText;
+      }
+    }
+  }
+  return "";
+}
+
+function isLikelyTranscriptTimestamp(text) {
+  return /^(?:\d{1,2}:)?\d{1,2}:\d{2}$/.test(String(text || "").trim());
+}
+
+function extractTranscriptFromCueGroups(cueGroups) {
+  const lines = [];
+  for (const group of Array.isArray(cueGroups) ? cueGroups : []) {
+    const cues = Array.isArray(group?.transcriptCueGroupRenderer?.cues)
+      ? group.transcriptCueGroupRenderer.cues
+      : [];
+    for (const cue of cues) {
+      const renderer = cue?.transcriptCueRenderer || cue || {};
+      const line = extractTextFromRuns(
+        renderer.cue ||
+        renderer.snippet ||
+        renderer.content ||
+        renderer.cueSimpleText ||
+        renderer.text ||
+        renderer
+      );
+      if (!line || isLikelyTranscriptTimestamp(line)) {
+        continue;
+      }
+      lines.push(line);
+    }
+  }
+  return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+}
+
+function collectCueGroups(root, results = [], seen = new Set()) {
+  if (!root || typeof root !== "object" || seen.has(root) || results.length >= 5) {
+    return results;
+  }
+  seen.add(root);
+  if (Array.isArray(root)) {
+    for (const item of root) {
+      collectCueGroups(item, results, seen);
+      if (results.length >= 5) {
+        break;
+      }
+    }
+    return results;
+  }
+  if (Array.isArray(root.cueGroups) && root.cueGroups.length) {
+    results.push(root.cueGroups);
+  }
+  for (const value of Object.values(root)) {
+    collectCueGroups(value, results, seen);
+    if (results.length >= 5) {
+      break;
+    }
+  }
+  return results;
+}
+
+function extractTranscriptFromStructuredData(root) {
+  const candidates = collectCueGroups(root);
+  for (const cueGroups of candidates) {
+    const transcript = extractTranscriptFromCueGroups(cueGroups);
+    if (transcript) {
+      return transcript;
+    }
+  }
+  return "";
+}
+
+function extractTranscriptFromSource(source) {
+  if (!source) {
+    return "";
+  }
+
+  const markers = [
+    "ytInitialData =",
+    "var ytInitialData =",
+    "window[\"ytInitialData\"] =",
+    "ytInitialData=",
+    "\"ytInitialData\":"
+  ];
+
+  for (const marker of markers) {
+    const initialData = parseJsonObjectAfterMarker(source, marker);
+    const transcript = extractTranscriptFromStructuredData(initialData);
+    if (transcript) {
+      return transcript;
+    }
+  }
+
+  const cueGroupsKey = "\"cueGroups\":";
+  let searchIndex = 0;
+  while (searchIndex < source.length) {
+    const markerIndex = source.indexOf(cueGroupsKey, searchIndex);
+    if (markerIndex === -1) {
+      break;
+    }
+    const arrayStart = source.indexOf("[", markerIndex);
+    if (arrayStart === -1) {
+      break;
+    }
+    const rawArray = extractBalancedBlock(source, arrayStart, "[", "]");
+    if (!rawArray) {
+      searchIndex = markerIndex + cueGroupsKey.length;
+      continue;
+    }
+    try {
+      const cueGroups = JSON.parse(rawArray);
+      const transcript = extractTranscriptFromCueGroups(cueGroups);
+      if (transcript) {
+        return transcript;
+      }
+    } catch (_error) {
+      // Continue searching later occurrences.
+    }
+    searchIndex = arrayStart + rawArray.length;
+  }
+
+  return "";
+}
+
 async function fetchYouTubeWatchHtml(url) {
   const response = await fetchWithTimeout(
     url,
@@ -386,6 +537,21 @@ async function extractYouTubeTranscriptByUrl(sourceUrl) {
       extractionTrace.push(`Failed to fetch track: ${track?.languageCode} (${track?.kind})`);
     }
   }
+
+  const directTranscript = extractTranscriptFromSource(html);
+  if (directTranscript) {
+    return {
+      ok: true,
+      transcript: directTranscript,
+      debug: {
+        htmlContainsCaptionTracks: true,
+        trackCount: tracks.length,
+        source: "watch_html_cuegroups_fallback",
+        trace: extractionTrace
+      }
+    };
+  }
+  extractionTrace.push("No transcript extracted from watch HTML cueGroups fallback");
 
   return {
     ok: false,
@@ -855,6 +1021,103 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
         };
 
+        const extractTextFromRuns = (value) => {
+          if (!value) {
+            return "";
+          }
+          if (typeof value === "string") {
+            return normalizeWhitespace(decodeHtmlEntities(value));
+          }
+          if (Array.isArray(value)) {
+            return normalizeWhitespace(value.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+          }
+          if (typeof value === "object") {
+            if (typeof value.text === "string") {
+              return normalizeWhitespace(decodeHtmlEntities(value.text));
+            }
+            if (typeof value.utf8 === "string") {
+              return normalizeWhitespace(decodeHtmlEntities(value.utf8));
+            }
+            if (typeof value.simpleText === "string") {
+              return normalizeWhitespace(decodeHtmlEntities(value.simpleText));
+            }
+            if (Array.isArray(value.runs)) {
+              return normalizeWhitespace(value.runs.map((item) => extractTextFromRuns(item)).filter(Boolean).join(""));
+            }
+            for (const key of ["cue", "snippet", "content", "headline", "title"]) {
+              const nestedText = extractTextFromRuns(value[key]);
+              if (nestedText) {
+                return nestedText;
+              }
+            }
+          }
+          return "";
+        };
+
+        const isLikelyTranscriptTimestamp = (text) => /^(?:\d{1,2}:)?\d{1,2}:\d{2}$/.test(String(text || "").trim());
+
+        const extractTranscriptFromCueGroups = (cueGroups) => {
+          const lines = [];
+          for (const group of Array.isArray(cueGroups) ? cueGroups : []) {
+            const cues = Array.isArray(group?.transcriptCueGroupRenderer?.cues)
+              ? group.transcriptCueGroupRenderer.cues
+              : [];
+            for (const cue of cues) {
+              const renderer = cue?.transcriptCueRenderer || cue || {};
+              const line = extractTextFromRuns(
+                renderer.cue ||
+                renderer.snippet ||
+                renderer.content ||
+                renderer.cueSimpleText ||
+                renderer.text ||
+                renderer
+              );
+              if (!line || isLikelyTranscriptTimestamp(line)) {
+                continue;
+              }
+              lines.push(line);
+            }
+          }
+          return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+        };
+
+        const collectCueGroups = (root, results = [], seen = new Set()) => {
+          if (!root || typeof root !== "object" || seen.has(root) || results.length >= 5) {
+            return results;
+          }
+          seen.add(root);
+          if (Array.isArray(root)) {
+            for (const item of root) {
+              collectCueGroups(item, results, seen);
+              if (results.length >= 5) {
+                break;
+              }
+            }
+            return results;
+          }
+          if (Array.isArray(root.cueGroups) && root.cueGroups.length) {
+            results.push(root.cueGroups);
+          }
+          for (const value of Object.values(root)) {
+            collectCueGroups(value, results, seen);
+            if (results.length >= 5) {
+              break;
+            }
+          }
+          return results;
+        };
+
+        const extractTranscriptFromStructuredData = (root) => {
+          const candidates = collectCueGroups(root);
+          for (const cueGroups of candidates) {
+            const transcript = extractTranscriptFromCueGroups(cueGroups);
+            if (transcript) {
+              return transcript;
+            }
+          }
+          return "";
+        };
+
         const parseMaybeJson = (value) => {
           if (!value) {
             return null;
@@ -943,6 +1206,57 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           return [];
         };
 
+        const getInlineTranscript = () => {
+          const initialDataCandidates = [];
+          const parseMaybeJson = (val) => {
+            if (!val) return null;
+            if (typeof val === "object") return val;
+            try { return JSON.parse(val); } catch (_error) { return null; }
+          };
+
+          initialDataCandidates.push(globalThis.ytInitialData);
+          initialDataCandidates.push(parseMaybeJson(globalThis?.ytcfg?.data_?.INITIAL_DATA));
+          if (typeof globalThis?.ytcfg?.get === "function") {
+            initialDataCandidates.push(parseMaybeJson(globalThis.ytcfg.get("INITIAL_DATA")));
+            initialDataCandidates.push(parseMaybeJson(globalThis.ytcfg.get("ytInitialData")));
+          }
+
+          for (const candidate of initialDataCandidates) {
+            const transcript = extractTranscriptFromStructuredData(candidate);
+            if (transcript) {
+              return transcript;
+            }
+          }
+
+          const scripts = Array.from(document.getElementsByTagName("script"));
+          for (const scriptNode of scripts) {
+            const text = scriptNode.textContent || "";
+            if (!text.includes("cueGroups") && !text.includes("ytInitialData")) {
+              continue;
+            }
+            const patterns = [
+              /ytInitialData\s*=\s*({[\s\S]*?});/,
+              /window\["ytInitialData"\]\s*=\s*({[\s\S]*?});/
+            ];
+            for (const pattern of patterns) {
+              const match = text.match(pattern);
+              if (!match) {
+                continue;
+              }
+              try {
+                const transcript = extractTranscriptFromStructuredData(JSON.parse(match[1]));
+                if (transcript) {
+                  return transcript;
+                }
+              } catch (_error) {
+                // Ignore malformed inline data and keep scanning.
+              }
+            }
+          }
+
+          return "";
+        };
+
         const tracks = getCaptionTracks();
         const extractionTrace = [];
         if (!tracks.length) {
@@ -1026,6 +1340,21 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
             }
           }
         }
+
+        const inlineTranscript = getInlineTranscript();
+        if (inlineTranscript) {
+          extractionTrace.push("Recovered transcript from ytInitialData cueGroups fallback");
+          return {
+            ok: true,
+            transcript: inlineTranscript,
+            debug: {
+              trackCount: tracks.length,
+              source: "main_world_cuegroups_fallback",
+              trace: extractionTrace
+            }
+          };
+        }
+        extractionTrace.push("No transcript extracted from ytInitialData cueGroups fallback");
 
         return {
           ok: false,
