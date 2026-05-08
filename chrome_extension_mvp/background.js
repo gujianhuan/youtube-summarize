@@ -8,9 +8,11 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 2500;
-const EXTENSION_TOOL_VERSION = "0.1.47";
+const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 3;
+const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 1200;
+const EXTENSION_TOOL_VERSION = "0.1.48";
 
-// Release v0.1.47: Stabilize ytInitialData parsing and extend temp tab readiness delay.
+// Release v0.1.48: Retry flaky YouTube extraction paths and log per-attempt track details.
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -82,6 +84,18 @@ function decodeHtmlEntities(text) {
     .replace(/&quot;/g, "\"")
     .replace(/&#39;/g, "'")
     .replace(/&nbsp;/g, " ");
+}
+
+function describeCaptionTrack(track) {
+  if (!track || typeof track !== "object") {
+    return "unknown_track";
+  }
+  const parts = [
+    `lang=${String(track.languageCode || "") || "unknown"}`,
+    `kind=${String(track.kind || "") || "none"}`,
+    `name=${extractTextFromRuns(track.name || "") || ""}`
+  ].filter(Boolean);
+  return parts.join(", ");
 }
 
 function dedupeTranscriptLines(lines) {
@@ -500,68 +514,90 @@ async function fetchYouTubeCaptionTrack(track) {
 }
 
 async function extractYouTubeTranscriptByUrl(sourceUrl) {
-  const html = await fetchYouTubeWatchHtml(sourceUrl);
-  const tracks = extractCaptionTracksFromSource(html);
-  if (!tracks.length) {
-    return {
-      ok: false,
-      error: "background_no_caption_tracks",
-      debug: {
-        htmlContainsCaptionTracks: html.includes("captionTracks"),
-        trackCount: 0
+  let lastResult = null;
+
+  for (let attempt = 1; attempt <= YOUTUBE_EXTRACTION_RETRY_ATTEMPTS; attempt += 1) {
+    const html = await fetchYouTubeWatchHtml(sourceUrl);
+    const tracks = extractCaptionTracksFromSource(html);
+    const extractionTrace = [`background_attempt=${attempt}`];
+
+    if (!tracks.length) {
+      lastResult = {
+        ok: false,
+        error: "background_no_caption_tracks",
+        debug: {
+          htmlContainsCaptionTracks: html.includes("captionTracks"),
+          trackCount: 0,
+          trace: extractionTrace
+        }
+      };
+      if (attempt < YOUTUBE_EXTRACTION_RETRY_ATTEMPTS) {
+        await sleep(YOUTUBE_EXTRACTION_RETRY_DELAY_MS);
+        continue;
       }
-    };
-  }
+      return lastResult;
+    }
 
-  const sortedTracks = [...tracks].sort((a, b) => {
-    const aPenalty = a?.kind === "asr" ? 1 : 0;
-    const bPenalty = b?.kind === "asr" ? 1 : 0;
-    return aPenalty - bPenalty;
-  });
+    const sortedTracks = [...tracks].sort((a, b) => {
+      const aPenalty = a?.kind === "asr" ? 1 : 0;
+      const bPenalty = b?.kind === "asr" ? 1 : 0;
+      return aPenalty - bPenalty;
+    });
 
-  const extractionTrace = [];
-  for (const track of sortedTracks) {
-    const transcript = await fetchYouTubeCaptionTrack(track);
-    if (transcript) {
+    extractionTrace.push(`tracks=${sortedTracks.map((track) => describeCaptionTrack(track)).join(" | ")}`);
+
+    for (const track of sortedTracks) {
+      const transcript = await fetchYouTubeCaptionTrack(track);
+      if (transcript) {
+        return {
+          ok: true,
+          transcript,
+          debug: {
+            htmlContainsCaptionTracks: true,
+            trackCount: tracks.length,
+            languageCode: String(track?.languageCode || ""),
+            kind: String(track?.kind || ""),
+            attempt,
+            trace: extractionTrace
+          }
+        };
+      }
+      extractionTrace.push(`Failed to fetch track: ${describeCaptionTrack(track)}`);
+    }
+
+    const directTranscript = extractTranscriptFromSource(html);
+    if (directTranscript) {
       return {
         ok: true,
-        transcript,
+        transcript: directTranscript,
         debug: {
           htmlContainsCaptionTracks: true,
           trackCount: tracks.length,
-          languageCode: String(track?.languageCode || ""),
-          kind: String(track?.kind || "")
+          source: "watch_html_cuegroups_fallback",
+          attempt,
+          trace: extractionTrace
         }
       };
-    } else {
-      extractionTrace.push(`Failed to fetch track: ${track?.languageCode} (${track?.kind})`);
     }
-  }
 
-  const directTranscript = extractTranscriptFromSource(html);
-  if (directTranscript) {
-    return {
-      ok: true,
-      transcript: directTranscript,
+    extractionTrace.push("No transcript extracted from watch HTML cueGroups fallback");
+    lastResult = {
+      ok: false,
+      error: "background_caption_fetch_failed",
       debug: {
         htmlContainsCaptionTracks: true,
         trackCount: tracks.length,
-        source: "watch_html_cuegroups_fallback",
+        attempt,
         trace: extractionTrace
       }
     };
-  }
-  extractionTrace.push("No transcript extracted from watch HTML cueGroups fallback");
 
-  return {
-    ok: false,
-    error: "background_caption_fetch_failed",
-    debug: {
-      htmlContainsCaptionTracks: true,
-      trackCount: tracks.length,
-      trace: extractionTrace
+    if (attempt < YOUTUBE_EXTRACTION_RETRY_ATTEMPTS) {
+      await sleep(YOUTUBE_EXTRACTION_RETRY_DELAY_MS);
     }
-  };
+  }
+
+  return lastResult;
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
@@ -873,8 +909,23 @@ async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
       return null;
     }
     await waitForTabComplete(tempTab.id);
-    await sleep(TEMP_TAB_READY_DELAY_MS);
-    return await extractYouTubeTranscriptViaMainWorldTab(tempTab.id);
+    let lastResult = null;
+    for (let attempt = 1; attempt <= YOUTUBE_EXTRACTION_RETRY_ATTEMPTS; attempt += 1) {
+      await sleep(TEMP_TAB_READY_DELAY_MS);
+      lastResult = await extractYouTubeTranscriptViaMainWorldTab(tempTab.id);
+      const hasTranscript = Boolean(lastResult?.ok && String(lastResult.transcript || "").trim());
+      if (lastResult?.debug && typeof lastResult.debug === "object") {
+        const existingTrace = Array.isArray(lastResult.debug.trace) ? lastResult.debug.trace : [];
+        lastResult.debug.trace = [`temp_tab_main_world_attempt=${attempt}`, ...existingTrace];
+      }
+      if (hasTranscript) {
+        return lastResult;
+      }
+      if (attempt < YOUTUBE_EXTRACTION_RETRY_ATTEMPTS) {
+        await sleep(YOUTUBE_EXTRACTION_RETRY_DELAY_MS);
+      }
+    }
+    return lastResult;
   } catch (_error) {
     return null;
   } finally {
