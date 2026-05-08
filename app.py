@@ -2861,14 +2861,10 @@ def render_video_processing_tab():
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         fetch_btn = st.button("🚀 一键抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
-        bg_fetch_btn = st.button("后台异步处理 (防超时)", type="secondary", use_container_width=True)
     with col2:
         summary_btn = st.button("🤖 仅重新生成总结", use_container_width=True, key="btn_single_sum")
     with col3:
         check_btn = st.button("🔍 检测可用字幕", use_container_width=True, key="btn_single_check")
-
-    if bg_fetch_btn:
-        st.warning("后台异步视频抓取暂时停用；当前仅保留插件直连文本提取链路。")
 
     if fetch_btn:
         if not resolved_url:
