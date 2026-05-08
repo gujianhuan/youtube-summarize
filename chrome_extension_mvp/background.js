@@ -7,10 +7,10 @@ const BRIDGE_HEALTH_TIMEOUT_MS = 15000;
 const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
-const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.46";
+const TEMP_TAB_READY_DELAY_MS = 2500;
+const EXTENSION_TOOL_VERSION = "0.1.47";
 
-// Release v0.1.46: Add ytInitialData cueGroups fallback when timedtext returns empty.
+// Release v0.1.47: Stabilize ytInitialData parsing and extend temp tab readiness delay.
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -954,6 +954,58 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           return result;
         };
 
+        const extractBalancedBlock = (source, startIndex, openChar, closeChar) => {
+          let depth = 0;
+          let inString = false;
+          let escaped = false;
+          for (let i = startIndex; i < source.length; i += 1) {
+            const ch = source[i];
+            if (inString) {
+              if (escaped) {
+                escaped = false;
+              } else if (ch === "\\") {
+                escaped = true;
+              } else if (ch === "\"") {
+                inString = false;
+              }
+              continue;
+            }
+            if (ch === "\"") {
+              inString = true;
+              continue;
+            }
+            if (ch === openChar) {
+              depth += 1;
+            } else if (ch === closeChar) {
+              depth -= 1;
+              if (depth === 0) {
+                return source.slice(startIndex, i + 1);
+              }
+            }
+          }
+          return "";
+        };
+
+        const parseJsonObjectAfterMarker = (source, marker) => {
+          const markerIndex = source.indexOf(marker);
+          if (markerIndex === -1) {
+            return null;
+          }
+          const braceIndex = source.indexOf("{", markerIndex);
+          if (braceIndex === -1) {
+            return null;
+          }
+          const rawJson = extractBalancedBlock(source, braceIndex, "{", "}");
+          if (!rawJson) {
+            return null;
+          }
+          try {
+            return JSON.parse(rawJson);
+          } catch (_error) {
+            return null;
+          }
+        };
+
         const parseYouTubeJsonTranscript = (payload) => {
           const events = Array.isArray(payload?.events) ? payload.events : [];
           const lines = [];
@@ -1176,32 +1228,31 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           // Fallback to searching all script tags if globals fail
           const scripts = Array.from(document.getElementsByTagName("script"));
           for (const s of scripts) {
-      const text = s.textContent || "";
-      if (text.includes("captionTracks") || text.includes("ytInitialPlayerResponse") || text.includes("ytInitialData")) {
-        const patterns = [
-          /ytInitialPlayerResponse\s*=\s*({.+?});/,
-          /ytInitialData\s*=\s*({.+?});/,
-          /window\["ytInitialPlayerResponse"\]\s*=\s*({.+?});/,
-          /window\["ytInitialData"\]\s*=\s*({.+?});/
-        ];
+            const text = s.textContent || "";
+            if (!text.includes("captionTracks") && !text.includes("ytInitialPlayerResponse") && !text.includes("ytInitialData")) {
+              continue;
+            }
+            const markers = [
+              "ytInitialPlayerResponse =",
+              "var ytInitialPlayerResponse =",
+              "window[\"ytInitialPlayerResponse\"] =",
+              "ytInitialPlayerResponse=",
+              "\"ytInitialPlayerResponse\":",
+              "ytInitialData =",
+              "var ytInitialData =",
+              "window[\"ytInitialData\"] =",
+              "ytInitialData=",
+              "\"ytInitialData\":"
+            ];
 
-        for (const pattern of patterns) {
-          const match = text.match(pattern);
-          if (match) {
-            try {
-              const resp = JSON.parse(match[1]);
-              const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
-                             resp?.engagementPanels?.find(p => p.engagementPanelSectionListRenderer?.targetId === "engagement-panel-transcript")
-                               ?.engagementPanelSectionListRenderer?.content?.transcriptRenderer?.body?.transcriptBodyRenderer?.cueGroups
-                               ?.map(g => g.transcriptCueGroupRenderer?.cues?.[0]?.transcriptCueRenderer)
-                               ?.filter(Boolean);
-
-              if (Array.isArray(tracks) && tracks.length) return tracks;
-            } catch (e) {}
+            for (const marker of markers) {
+              const resp = parseJsonObjectAfterMarker(text, marker);
+              const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+              if (Array.isArray(tracks) && tracks.length) {
+                return tracks;
+              }
+            }
           }
-        }
-      }
-    }
 
           return [];
         };
@@ -1234,22 +1285,18 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
             if (!text.includes("cueGroups") && !text.includes("ytInitialData")) {
               continue;
             }
-            const patterns = [
-              /ytInitialData\s*=\s*({[\s\S]*?});/,
-              /window\["ytInitialData"\]\s*=\s*({[\s\S]*?});/
+            const markers = [
+              "ytInitialData =",
+              "var ytInitialData =",
+              "window[\"ytInitialData\"] =",
+              "ytInitialData=",
+              "\"ytInitialData\":"
             ];
-            for (const pattern of patterns) {
-              const match = text.match(pattern);
-              if (!match) {
-                continue;
-              }
-              try {
-                const transcript = extractTranscriptFromStructuredData(JSON.parse(match[1]));
-                if (transcript) {
-                  return transcript;
-                }
-              } catch (_error) {
-                // Ignore malformed inline data and keep scanning.
+            for (const marker of markers) {
+              const parsed = parseJsonObjectAfterMarker(text, marker);
+              const transcript = extractTranscriptFromStructuredData(parsed);
+              if (transcript) {
+                return transcript;
               }
             }
           }

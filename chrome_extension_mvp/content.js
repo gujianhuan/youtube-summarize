@@ -809,7 +809,7 @@
 
       parent.appendChild(script);
       script.remove();
-      window.setTimeout(() => finalize([]), 1200);
+      window.setTimeout(() => finalize([]), 2500);
     });
   }
 
@@ -974,7 +974,7 @@
 
       parent.appendChild(script);
       script.remove();
-      window.setTimeout(() => finalize(""), 1200);
+      window.setTimeout(() => finalize(""), 2500);
     });
   }
 
