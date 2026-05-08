@@ -10,9 +10,9 @@ const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 2500;
 const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 3;
 const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 1200;
-const EXTENSION_TOOL_VERSION = "0.1.48";
+const EXTENSION_TOOL_VERSION = "0.1.49";
 
-// Release v0.1.48: Retry flaky YouTube extraction paths and log per-attempt track details.
+// Release v0.1.49: Add youtubei get_transcript fallback in Main World to bypass empty timedtext.
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -1308,6 +1308,129 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           return [];
         };
 
+        const getInnertubeConfig = () => {
+          let apiKey = "";
+          let clientVersion = "";
+          try {
+            apiKey = String(globalThis?.ytcfg?.get?.("INNERTUBE_API_KEY") || "");
+            clientVersion = String(globalThis?.ytcfg?.get?.("INNERTUBE_CLIENT_VERSION") || "");
+          } catch (_e) {}
+          if (!apiKey || !clientVersion) {
+            // Try scanning inline bootstrap JSON
+            const scripts = Array.from(document.getElementsByTagName("script"));
+            for (const s of scripts) {
+              const text = s.textContent || "";
+              if (!text) continue;
+              if (!apiKey) {
+                const m1 = text.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+                if (m1) apiKey = m1[1];
+              }
+              if (!clientVersion) {
+                const m2 = text.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+                if (m2) clientVersion = m2[1];
+              }
+              if (apiKey && clientVersion) break;
+            }
+          }
+          return { apiKey, clientVersion };
+        };
+
+        const getTranscriptParams = () => {
+          // Prefer structured initial data if available
+          const initialDataCandidates = [];
+          const parseMaybeJson = (val) => {
+            if (!val) return null;
+            if (typeof val === "object") return val;
+            try { return JSON.parse(val); } catch (_error) { return null; }
+          };
+          initialDataCandidates.push(globalThis.ytInitialData);
+          initialDataCandidates.push(parseMaybeJson(globalThis?.ytcfg?.data_?.INITIAL_DATA));
+          if (typeof globalThis?.ytcfg?.get === "function") {
+            initialDataCandidates.push(parseMaybeJson(globalThis.ytcfg.get("INITIAL_DATA")));
+            initialDataCandidates.push(parseMaybeJson(globalThis.ytcfg.get("ytInitialData")));
+          }
+          for (const candidate of initialDataCandidates) {
+            try {
+              const panels = candidate?.engagementPanels;
+              if (Array.isArray(panels)) {
+                for (const p of panels) {
+                  const cont = p?.engagementPanelSectionListRenderer?.content?.continuationItemRenderer?.continuationEndpoint;
+                  const params = cont?.getTranscriptEndpoint?.params;
+                  if (typeof params === "string" && params.length > 0) {
+                    return params;
+                  }
+                }
+              }
+            } catch (_e) {}
+          }
+          // Fallback: scan inline scripts text
+          const scripts = Array.from(document.getElementsByTagName("script"));
+          for (const s of scripts) {
+            const text = s.textContent || "";
+            if (!text.includes("getTranscriptEndpoint")) continue;
+            const m = text.match(/"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"/);
+            if (m) {
+              return m[1];
+            }
+          }
+          return "";
+        };
+
+        const fetchTranscriptViaYoutubei = async () => {
+          const { apiKey, clientVersion } = getInnertubeConfig();
+          const params = getTranscriptParams();
+          if (!apiKey || !clientVersion || !params) {
+            return null;
+          }
+          try {
+            const resp = await fetch(`https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false&key=${apiKey}`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-YouTube-Client-Name": "1",
+                "X-YouTube-Client-Version": clientVersion
+              },
+              body: JSON.stringify({
+                context: { client: { clientName: "WEB", clientVersion } },
+                params
+              }),
+              credentials: "include",
+              cache: "no-store"
+            });
+            if (!resp.ok) {
+              return null;
+            }
+            const data = await resp.json();
+            const body =
+              data?.actions?.[0]?.updateEngagementPanelAction?.content?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body;
+            const segments =
+              body?.transcriptSegmentListRenderer?.initialSegments ||
+              body?.transcriptSegmentListRenderer?.continuations?.[0]?.reloadContinuationData?.continuation;
+            if (!Array.isArray(segments)) {
+              return null;
+            }
+            const lines = [];
+            for (const seg of segments) {
+              const r = seg?.transcriptSegmentRenderer;
+              const text = extractTextFromRuns(r?.snippet || r?.cue || r?.content || r?.text || r);
+              if (text) {
+                lines.push(text);
+              }
+            }
+            const transcript = normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+            if (transcript) {
+              return {
+                ok: true,
+                transcript,
+                debug: { source: "youtubei_get_transcript" }
+              };
+            }
+          } catch (_error) {
+            return null;
+          }
+          return null;
+        };
+
         const getInlineTranscript = () => {
           const initialDataCandidates = [];
           const parseMaybeJson = (val) => {
@@ -1372,6 +1495,21 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           const bPenalty = b?.kind === "asr" ? 1 : 0;
           return aPenalty - bPenalty;
         });
+
+        // Try youtubei get_transcript first to bypass empty timedtext responses
+        {
+          const ytai = await fetchTranscriptViaYoutubei();
+          if (ytai && ytai.ok && ytai.transcript) {
+            return {
+              ok: true,
+              transcript: ytai.transcript,
+              debug: {
+                trackCount: tracks.length,
+                source: "youtubei_get_transcript"
+              }
+            };
+          }
+        }
 
         for (const track of sortedTracks) {
           const baseUrl = String(track?.baseUrl || "").trim();
