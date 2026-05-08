@@ -728,7 +728,11 @@
     try {
       const parser = new DOMParser();
       const xml = parser.parseFromString(xmlText, "text/xml");
-      const textNodes = Array.from(xml.getElementsByTagName("text"));
+      const textNodes = [
+        ...Array.from(xml.getElementsByTagName("text")),
+        ...Array.from(xml.getElementsByTagName("p")),
+        ...Array.from(xml.getElementsByTagName("s"))
+      ];
       const lines = dedupeTranscriptLines(textNodes
         .map((node) => decodeHtmlEntities(node.textContent || ""))
         .map((line) => normalizeWhitespace(line))
@@ -737,6 +741,44 @@
     } catch (_error) {
       return "";
     }
+  }
+
+  function parseYouTubeVttTranscript(vttText) {
+    const lines = [];
+    const blocks = String(vttText || "")
+      .replace(/\r/g, "")
+      .split(/\n\s*\n/);
+
+    for (const block of blocks) {
+      const rawLines = block
+        .split("\n")
+        .map((line) => normalizeWhitespace(line))
+        .filter(Boolean);
+
+      if (!rawLines.length) {
+        continue;
+      }
+
+      const contentLines = rawLines.filter((line) => {
+        if (line === "WEBVTT") {
+          return false;
+        }
+        if (/^\d+$/.test(line)) {
+          return false;
+        }
+        if (/^\d{2}:\d{2}(?::\d{2})?\.\d{3}\s+-->\s+\d{2}:\d{2}(?::\d{2})?\.\d{3}/.test(line)) {
+          return false;
+        }
+        return true;
+      });
+
+      const cleaned = normalizeWhitespace(decodeHtmlEntities(contentLines.join(" ")));
+      if (cleaned) {
+        lines.push(cleaned);
+      }
+    }
+
+    return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
   }
 
   function parseYouTubeJsonTranscript(payload) {
@@ -787,9 +829,11 @@
             return transcript;
           }
         }
-        const transcript = parseYouTubeXmlTranscript(trimmed);
-        if (transcript) {
-          return transcript;
+        for (const parser of [parseYouTubeXmlTranscript, parseYouTubeVttTranscript]) {
+          const transcript = parser(trimmed);
+          if (transcript) {
+            return transcript;
+          }
         }
       } catch (_error) {
         // try next candidate

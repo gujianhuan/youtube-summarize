@@ -8,7 +8,7 @@ const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
 const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.42";
+const EXTENSION_TOOL_VERSION = "0.1.43";
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -215,13 +215,61 @@ function parseYouTubeJsonTranscript(payload) {
 
 function parseYouTubeXmlTranscript(xmlText) {
   const lines = [];
-  const matches = String(xmlText || "").matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/g);
-  for (const match of matches) {
-    const cleaned = normalizeWhitespace(decodeHtmlEntities(match[1] || ""));
+  const source = String(xmlText || "");
+  const patterns = [
+    /<text\b[^>]*>([\s\S]*?)<\/text>/g,
+    /<p\b[^>]*>([\s\S]*?)<\/p>/g,
+    /<s\b[^>]*>([\s\S]*?)<\/s>/g
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const raw = String(match[1] || "").replace(/<[^>]+>/g, " ");
+      const cleaned = normalizeWhitespace(decodeHtmlEntities(raw));
+      if (cleaned) {
+        lines.push(cleaned);
+      }
+    }
+  }
+
+  return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+}
+
+function parseYouTubeVttTranscript(vttText) {
+  const lines = [];
+  const blocks = String(vttText || "")
+    .replace(/\r/g, "")
+    .split(/\n\s*\n/);
+
+  for (const block of blocks) {
+    const rawLines = block
+      .split("\n")
+      .map((line) => normalizeWhitespace(line))
+      .filter(Boolean);
+
+    if (!rawLines.length) {
+      continue;
+    }
+
+    const contentLines = rawLines.filter((line) => {
+      if (line === "WEBVTT") {
+        return false;
+      }
+      if (/^\d+$/.test(line)) {
+        return false;
+      }
+      if (/^\d{2}:\d{2}(?::\d{2})?\.\d{3}\s+-->\s+\d{2}:\d{2}(?::\d{2})?\.\d{3}/.test(line)) {
+        return false;
+      }
+      return true;
+    });
+
+    const cleaned = normalizeWhitespace(decodeHtmlEntities(contentLines.join(" ")));
     if (cleaned) {
       lines.push(cleaned);
     }
   }
+
   return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
 }
 
@@ -285,9 +333,11 @@ async function fetchYouTubeCaptionTrack(track) {
           return transcript;
         }
       }
-      const transcript = parseYouTubeXmlTranscript(trimmed);
-      if (transcript) {
-        return transcript;
+      for (const parser of [parseYouTubeXmlTranscript, parseYouTubeVttTranscript]) {
+        const transcript = parser(trimmed);
+        if (transcript) {
+          return transcript;
+        }
       }
     } catch (_error) {
       // Try next candidate.
@@ -750,11 +800,53 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         const parseYouTubeXmlTranscript = (xmlText) => {
           const parser = new DOMParser();
           const xml = parser.parseFromString(String(xmlText || ""), "text/xml");
-          const nodes = Array.from(xml.getElementsByTagName("text"));
+          const nodes = [
+            ...Array.from(xml.getElementsByTagName("text")),
+            ...Array.from(xml.getElementsByTagName("p")),
+            ...Array.from(xml.getElementsByTagName("s"))
+          ];
           const lines = nodes
-            .map((node) => decodeHtmlEntities(node.textContent || ""))
+            .map((node) => decodeHtmlEntities((node.textContent || "").replace(/\s+/g, " ")))
             .map((line) => normalizeWhitespace(line))
             .filter(Boolean);
+          return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+        };
+
+        const parseYouTubeVttTranscript = (vttText) => {
+          const lines = [];
+          const blocks = String(vttText || "")
+            .replace(/\r/g, "")
+            .split(/\n\s*\n/);
+
+          for (const block of blocks) {
+            const rawLines = block
+              .split("\n")
+              .map((line) => normalizeWhitespace(line))
+              .filter(Boolean);
+
+            if (!rawLines.length) {
+              continue;
+            }
+
+            const contentLines = rawLines.filter((line) => {
+              if (line === "WEBVTT") {
+                return false;
+              }
+              if (/^\d+$/.test(line)) {
+                return false;
+              }
+              if (/^\d{2}:\d{2}(?::\d{2})?\.\d{3}\s+-->\s+\d{2}:\d{2}(?::\d{2})?\.\d{3}/.test(line)) {
+                return false;
+              }
+              return true;
+            });
+
+            const cleaned = normalizeWhitespace(decodeHtmlEntities(contentLines.join(" ")));
+            if (cleaned) {
+              lines.push(cleaned);
+            }
+          }
+
           return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
         };
 
@@ -897,7 +989,7 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
               if (trimmed.startsWith("{")) {
                 transcript = parseYouTubeJsonTranscript(JSON.parse(trimmed));
               } else {
-                transcript = parseYouTubeXmlTranscript(trimmed);
+                transcript = parseYouTubeXmlTranscript(trimmed) || parseYouTubeVttTranscript(trimmed);
               }
               if (transcript) {
                 return {
