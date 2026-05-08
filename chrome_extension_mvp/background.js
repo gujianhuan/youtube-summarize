@@ -1031,7 +1031,15 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     const logs = res?.detection?.extractionLogs;
     if (Array.isArray(logs)) {
       allExtractionLogs.push(...logs);
-    } else if (res?.error) {
+    }
+    if (res?.debug && typeof res.debug === "object") {
+      try {
+        allExtractionLogs.push(`[Background] ${stageName} debug: ${JSON.stringify(res.debug)}`);
+      } catch (_error) {
+        // Ignore debug serialization issues.
+      }
+    }
+    if (res?.error) {
       allExtractionLogs.push(`[Background] ${stageName} failed: ${res.error}`);
     }
   };
@@ -1087,6 +1095,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
     }
 
     const mainWorldResult = await extractYouTubeTranscriptViaMainWorldTab(matchedTab.id);
+    addLogs(mainWorldResult, "matched_tab_main_world");
     attempts.push({
       stage: "matched_tab_main_world",
       ok: Boolean(mainWorldResult?.ok && String(mainWorldResult.transcript || "").trim()),
@@ -1138,6 +1147,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   }
 
   const tempTabMainWorldResult = await extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrlText);
+  addLogs(tempTabMainWorldResult, "temp_tab_main_world");
   attempts.push({
     stage: "temp_tab_main_world",
     ok: Boolean(tempTabMainWorldResult?.ok && String(tempTabMainWorldResult.transcript || "").trim()),
@@ -1159,6 +1169,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   }
 
   const backgroundResult = await extractYouTubeTranscriptByUrl(sourceUrlText);
+  addLogs(backgroundResult, "background_extract");
   attempts.push({
     stage: "background_extract",
     ok: Boolean(backgroundResult?.ok && String(backgroundResult.transcript || "").trim()),
