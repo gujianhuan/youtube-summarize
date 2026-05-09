@@ -3021,6 +3021,8 @@ def render_video_summary_section():
         st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
         if note:
             st.caption(note)
+        time.sleep(3)
+        st.rerun()
     elif status == "skipped":
         if note:
             st.caption(f"🕵️ {note}")
