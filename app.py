@@ -60,6 +60,14 @@ def _get_shared_lock():
     return threading.Lock()
 
 
+@st.cache_resource
+def _get_video_fact_check_runtime():
+    return {
+        "lock": threading.Lock(),
+        "tasks": {},
+    }
+
+
 def get_render_build_info() -> dict[str, str]:
     """返回当前运行环境的 Render / Git 构建信息。"""
 
@@ -459,6 +467,7 @@ def normalize_extension_bridge_payload(payload: dict | None) -> dict:
         return {
             "payload_id": "",
             "bridge_version": 1,
+            "tool_version": "",
             "source_url": "",
             "title": "",
             "transcript_text": "",
@@ -484,6 +493,7 @@ def normalize_extension_bridge_payload(payload: dict | None) -> dict:
     request_id = str(payload.get("requestId") or payload.get("request_id") or (envelope or {}).get("requestId") or "").strip()
     source_kind = str(payload.get("sourceKind") or payload.get("source_kind") or source_obj.get("kind") or "").strip()
     source_type = str(payload.get("sourceType") or payload.get("source_type") or source_obj.get("sourceType") or "").strip()
+    tool_version = str(payload.get("toolVersion") or payload.get("tool_version") or source_obj.get("toolVersion") or "").strip()
     fallback_used = bool(payload.get("fallbackUsed") if "fallbackUsed" in payload else payload.get("fallback_used"))
     text_source_reason = str(payload.get("textSourceReason") or payload.get("text_source_reason") or diagnostics_obj.get("textSourceReason") or "").strip()
     if not fallback_used:
@@ -492,6 +502,7 @@ def normalize_extension_bridge_payload(payload: dict | None) -> dict:
     return {
         "payload_id": payload_id,
         "bridge_version": bridge_version,
+        "tool_version": tool_version,
         "source_url": source_url,
         "title": title,
         "transcript_text": transcript_text,
@@ -513,6 +524,7 @@ def format_manual_bridge_meta(meta: dict | None) -> str:
     source_kind = str(meta.get("source_kind") or "").strip()
     source_type = str(meta.get("source_type") or "").strip()
     bridge_version = str(meta.get("bridge_version") or "").strip()
+    tool_version = str(meta.get("tool_version") or "").strip()
     request_id = str(meta.get("request_id") or "").strip()
     fallback_used = bool(meta.get("fallback_used"))
 
@@ -522,6 +534,8 @@ def format_manual_bridge_meta(meta: dict | None) -> str:
         bits.append(f"文本类型：`{source_type}`")
     if bridge_version:
         bits.append(f"bridge 版本：`v{bridge_version}`")
+    if tool_version:
+        bits.append(f"扩展版本：`v{tool_version}`")
     if request_id:
         bits.append(f"requestId：`{request_id}`")
     if fallback_used:
@@ -1622,6 +1636,16 @@ if "video_extension_auto_summary_url" not in st.session_state:
     st.session_state.video_extension_auto_summary_url = ""
 if "video_extension_auto_summary_fetch_duration" not in st.session_state:
     st.session_state.video_extension_auto_summary_fetch_duration = 0.0
+if "video_fact_check_task_id" not in st.session_state:
+    st.session_state.video_fact_check_task_id = ""
+if "video_fact_check_status" not in st.session_state:
+    st.session_state.video_fact_check_status = "idle"
+if "video_fact_check_error" not in st.session_state:
+    st.session_state.video_fact_check_error = ""
+if "video_fact_check_url" not in st.session_state:
+    st.session_state.video_fact_check_url = ""
+if "video_fact_check_applied_task_id" not in st.session_state:
+    st.session_state.video_fact_check_applied_task_id = ""
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -1771,6 +1795,7 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
     normalized_video_bridge_payload = normalize_extension_bridge_payload(video_bridge_payload)
     video_bridge_transcript = str(normalized_video_bridge_payload.get("transcript_text") or "").strip()
     if video_bridge_transcript:
+        reset_video_fact_check_state()
         print(
             "VideoBridgePayloadReceived: "
             f"payload_id={str(normalized_video_bridge_payload.get('payload_id') or video_extension_payload_id).strip()}, "
@@ -1924,6 +1949,127 @@ def internal_summarize(
         except Exception as e:
             return None, str(e)
 
+
+def _build_summary_json(summary_markdown: str, fact_check_markdown: str = "") -> str:
+    return json.dumps(
+        {
+            "summary_markdown": str(summary_markdown or "").strip(),
+            "fact_check_markdown": str(fact_check_markdown or "").strip(),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _merge_fact_check_into_summary(summary_content: str, fact_check_markdown: str) -> str:
+    summary_md, _existing_fact_md = _parse_summary_for_ui(summary_content)
+    if not summary_md:
+        summary_md = str(summary_content or "").strip()
+    return _build_summary_json(summary_md, fact_check_markdown)
+
+
+def reset_video_fact_check_state() -> None:
+    st.session_state.video_fact_check_task_id = ""
+    st.session_state.video_fact_check_status = "idle"
+    st.session_state.video_fact_check_error = ""
+    st.session_state.video_fact_check_url = ""
+    st.session_state.video_fact_check_applied_task_id = ""
+
+
+def start_video_fact_check_async(url: str, transcript_text: str, summary_content: str) -> None:
+    summary_md, _fact_md = _parse_summary_for_ui(summary_content)
+    transcript_value = str(transcript_text or "").strip()
+    url_value = str(url or "").strip()
+    if not summary_md or not transcript_value or not api_key:
+        reset_video_fact_check_state()
+        return
+
+    runtime = _get_video_fact_check_runtime()
+    task_id = f"video_fact_check_{uuid.uuid4().hex}"
+    content_len = len(transcript_value)
+    max_claims = 8 if content_len >= 12000 else 6 if content_len >= 7000 else 5
+
+    with runtime["lock"]:
+        runtime["tasks"][task_id] = {
+            "status": "queued",
+            "result": "",
+            "error": "",
+            "url": url_value,
+        }
+
+    st.session_state.video_fact_check_task_id = task_id
+    st.session_state.video_fact_check_status = "queued"
+    st.session_state.video_fact_check_error = ""
+    st.session_state.video_fact_check_url = url_value
+    st.session_state.video_fact_check_applied_task_id = ""
+
+    eff_api_key = api_key
+    eff_base_url = base_url
+    eff_proxy = proxy_input
+    eff_fact_model = fact_check_model_selected
+
+    def _worker():
+        with runtime["lock"]:
+            task = runtime["tasks"].get(task_id) or {}
+            task["status"] = "running"
+            runtime["tasks"][task_id] = task
+        try:
+            fact_markdown = fact_check_document_claims(
+                text=transcript_value,
+                summary_markdown=summary_md,
+                api_key=eff_api_key,
+                base_url=eff_base_url,
+                model=eff_fact_model,
+                proxy_url=eff_proxy,
+                max_claims=max_claims,
+            )
+            with runtime["lock"]:
+                runtime["tasks"][task_id] = {
+                    "status": "success",
+                    "result": str(fact_markdown or "").strip(),
+                    "error": "",
+                    "url": url_value,
+                }
+        except Exception as exc:
+            with runtime["lock"]:
+                runtime["tasks"][task_id] = {
+                    "status": "error",
+                    "result": "",
+                    "error": str(exc),
+                    "url": url_value,
+                }
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def sync_video_fact_check_state() -> None:
+    task_id = str(st.session_state.get("video_fact_check_task_id") or "").strip()
+    if not task_id:
+        return
+
+    runtime = _get_video_fact_check_runtime()
+    with runtime["lock"]:
+        task = dict(runtime["tasks"].get(task_id) or {})
+
+    if not task:
+        return
+
+    status = str(task.get("status") or "idle").strip()
+    st.session_state.video_fact_check_status = status
+    st.session_state.video_fact_check_error = str(task.get("error") or "").strip()
+    st.session_state.video_fact_check_url = str(task.get("url") or st.session_state.get("video_fact_check_url") or "").strip()
+
+    if (
+        status == "success"
+        and st.session_state.get("video_fact_check_applied_task_id") != task_id
+        and str(task.get("result") or "").strip()
+        and st.session_state.summary_text
+    ):
+        st.session_state.summary_text = _merge_fact_check_into_summary(
+            st.session_state.summary_text,
+            str(task.get("result") or "").strip(),
+        )
+        st.session_state.video_fact_check_applied_task_id = task_id
+        st.session_state.video_fact_check_status = "success"
 
 def run_document_summary_pipeline(
     extracted,
@@ -2489,6 +2635,7 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
             st.warning("请先抓取字幕")
         return
 
+    reset_video_fact_check_state()
     print(
         "VideoSummarySingle: "
         f"manual={bool(manual)}, "
@@ -2534,6 +2681,7 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         f"duration={sum_duration:.2f}"
     , flush=True)
     st.session_state.summary_text = summary
+    start_video_fact_check_async(url, st.session_state.transcript_text, summary)
     if manual:
         st.success(f"总结完成 | AI生成耗时: {sum_duration:.1f}s")
 
@@ -2711,10 +2859,12 @@ def try_video_extension_first() -> tuple[str, str, str]:
             error_text = "extension_request_timeout:bridge_waited_150s_no_plugin_reply"
         helper_text = str(normalized_result.get("helperMessage") or normalized_result.get("helper_message") or "").strip()
         debug_obj = normalized_result.get("debug") if isinstance(normalized_result.get("debug"), dict) else None
+        tool_version_text = ""
         debug_summary = ""
         debug_lines: list[str] = []
         extraction_logs: list[str] = []
         if isinstance(debug_obj, dict):
+            tool_version_text = str(debug_obj.get("toolVersion") or debug_obj.get("tool_version") or "").strip()
             attempts = debug_obj.get("attempts")
             extraction_logs = debug_obj.get("extractionLogs") if isinstance(debug_obj.get("extractionLogs"), list) else []
             if isinstance(attempts, list) and attempts:
@@ -2741,6 +2891,8 @@ def try_video_extension_first() -> tuple[str, str, str]:
             st.session_state.video_extension_request_debug_text = "\n".join(debug_lines)
         reset_video_extension_request_state(clear_result=False)
         message = f"插件抓取未接管（{error_text or 'unknown_error'}）。请确认视频是否确实开启了字幕，或手动尝试刷新页面后再试。"
+        if tool_version_text:
+            message += f" 当前扩展版本：v{tool_version_text}。"
         if helper_text:
             message += f" {helper_text}"
         if debug_summary:
@@ -2791,6 +2943,7 @@ def render_video_summary_section():
     if not st.session_state.summary_text:
         return
 
+    sync_video_fact_check_state()
     st.markdown("### 📝 AI 总结")
     if "summary_duration" in st.session_state and st.session_state.summary_duration:
         duration_info = st.session_state.summary_duration
@@ -2804,6 +2957,11 @@ def render_video_summary_section():
         st.session_state.summary_text,
         fact_title="🕵️ 新闻事实核查",
     )
+    status = str(st.session_state.get("video_fact_check_status") or "").strip()
+    if status in {"queued", "running"}:
+        st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
+    elif status == "error":
+        st.warning(f"新闻核查补跑失败：{str(st.session_state.get('video_fact_check_error') or '').strip()}")
 
     st.divider()
 

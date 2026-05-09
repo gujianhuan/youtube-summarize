@@ -10,9 +10,9 @@ const TEMP_TAB_LOAD_TIMEOUT_MS = 30000;
 const TEMP_TAB_READY_DELAY_MS = 5000;
 const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 5;
 const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 1500;
-const EXTENSION_TOOL_VERSION = "0.1.52";
+const EXTENSION_TOOL_VERSION = "0.1.53";
 
-// Release v0.1.52: Prefer temp-tab main-world extraction for page-mode and give YouTube bootstrap data more time to stabilize.
+// Release v0.1.53: Surface extension toolVersion in page-flow debug so stale Chrome extensions are easier to detect.
 
 const CLIENT_NAME_TO_ID = {
   WEB: "1",
@@ -3000,6 +3000,7 @@ async function startSummarizeFlowFromPage(payload) {
       error: String(error?.message || error || "bridge_upload_failed"),
       helperMessage: "插件已抓到文本，但上传 bridge payload 失败。",
       debug: {
+        toolVersion: EXTENSION_TOOL_VERSION,
         attempts: [
           ...attempts,
           ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
@@ -3016,6 +3017,7 @@ async function startSummarizeFlowFromPage(payload) {
     ok: true,
     payloadId,
     debug: {
+      toolVersion: EXTENSION_TOOL_VERSION,
       attempts: [
         ...attempts,
         ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
