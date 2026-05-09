@@ -1694,6 +1694,13 @@ if "last_saved_settings" not in st.session_state:
         "remember_api_key": remember_api_key_initial,
     }
 
+def reset_video_fact_check_state() -> None:
+    st.session_state.video_fact_check_task_id = ""
+    st.session_state.video_fact_check_status = "idle"
+    st.session_state.video_fact_check_error = ""
+    st.session_state.video_fact_check_url = ""
+    st.session_state.video_fact_check_applied_task_id = ""
+
 # --- 后台硬编码/环境变量配置 (对外隐藏设置) ---
 proxy_input = os.environ.get("PROXY_URL", st.session_state.settings.get("proxy", ""))
 use_system_proxy = False
@@ -1965,14 +1972,6 @@ def _merge_fact_check_into_summary(summary_content: str, fact_check_markdown: st
     if not summary_md:
         summary_md = str(summary_content or "").strip()
     return _build_summary_json(summary_md, fact_check_markdown)
-
-
-def reset_video_fact_check_state() -> None:
-    st.session_state.video_fact_check_task_id = ""
-    st.session_state.video_fact_check_status = "idle"
-    st.session_state.video_fact_check_error = ""
-    st.session_state.video_fact_check_url = ""
-    st.session_state.video_fact_check_applied_task_id = ""
 
 
 def start_video_fact_check_async(url: str, transcript_text: str, summary_content: str) -> None:
