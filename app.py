@@ -284,6 +284,32 @@ def render_copy_to_clipboard_button(label: str, text: str, key: str) -> None:
         height=42,
     )
 
+def render_non_blocking_refresh(interval_ms: int, key: str) -> None:
+    refresh_ms = max(500, int(interval_ms or 0))
+    component_id = f"auto_refresh_{re.sub(r'[^a-zA-Z0-9_]+', '_', key)}"
+    components.html(
+        f"""
+        <script>
+        const marker = "{component_id}";
+        if (!window[marker]) {{
+          window[marker] = true;
+          window.setTimeout(() => {{
+            try {{
+              if (window.parent && window.parent.location) {{
+                window.parent.location.reload();
+                return;
+              }}
+            }} catch (err) {{
+              // Fallback to reloading the current frame.
+            }}
+            window.location.reload();
+          }}, {refresh_ms});
+        }}
+        </script>
+        """,
+        height=0,
+    )
+
 def render_issue_report_box(
     context_label: str,
     *,
@@ -3021,8 +3047,7 @@ def render_video_summary_section():
         st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
         if note:
             st.caption(note)
-        time.sleep(3)
-        st.rerun()
+        render_non_blocking_refresh(3000, f"video_fact_check_{status}")
     elif status == "skipped":
         if note:
             st.caption(f"🕵️ {note}")
