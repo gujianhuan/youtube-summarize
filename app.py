@@ -7,6 +7,7 @@ import traceback
 import json
 import os
 import re
+import hashlib
 import html
 import uuid
 import calendar
@@ -28,6 +29,7 @@ from core_logic import (
     summarize_document_text,
     classify_document_for_fact_check,
     fact_check_document_claims,
+    decide_video_fact_check_plan,
     fetch_available_models,
     get_channel_info,
     get_channel_recent_videos,
@@ -65,6 +67,7 @@ def _get_video_fact_check_runtime():
     return {
         "lock": threading.Lock(),
         "tasks": {},
+        "result_cache": {},
     }
 
 
@@ -1646,6 +1649,8 @@ if "video_fact_check_url" not in st.session_state:
     st.session_state.video_fact_check_url = ""
 if "video_fact_check_applied_task_id" not in st.session_state:
     st.session_state.video_fact_check_applied_task_id = ""
+if "video_fact_check_note" not in st.session_state:
+    st.session_state.video_fact_check_note = ""
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -1700,6 +1705,7 @@ def reset_video_fact_check_state() -> None:
     st.session_state.video_fact_check_error = ""
     st.session_state.video_fact_check_url = ""
     st.session_state.video_fact_check_applied_task_id = ""
+    st.session_state.video_fact_check_note = ""
 
 # --- 后台硬编码/环境变量配置 (对外隐藏设置) ---
 proxy_input = os.environ.get("PROXY_URL", st.session_state.settings.get("proxy", ""))
@@ -1807,6 +1813,7 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
         st.session_state.video_fact_check_error = ""
         st.session_state.video_fact_check_url = ""
         st.session_state.video_fact_check_applied_task_id = ""
+        st.session_state.video_fact_check_note = ""
         print(
             "VideoBridgePayloadReceived: "
             f"payload_id={str(normalized_video_bridge_payload.get('payload_id') or video_extension_payload_id).strip()}, "
@@ -1978,6 +1985,17 @@ def _merge_fact_check_into_summary(summary_content: str, fact_check_markdown: st
     return _build_summary_json(summary_md, fact_check_markdown)
 
 
+def _build_video_fact_check_cache_key(url: str, summary_markdown: str, transcript_text: str) -> str:
+    raw = "\n".join(
+        [
+            str(url or "").strip(),
+            str(summary_markdown or "").strip()[:2500],
+            str(transcript_text or "").strip()[:5000],
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 def start_video_fact_check_async(url: str, transcript_text: str, summary_content: str) -> None:
     summary_md, _fact_md = _parse_summary_for_ui(summary_content)
     transcript_value = str(transcript_text or "").strip()
@@ -1987,9 +2005,32 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
         return
 
     runtime = _get_video_fact_check_runtime()
+    plan = decide_video_fact_check_plan(transcript_value, summary_md)
+    if not bool(plan.get("should_fact_check")):
+        reset_video_fact_check_state()
+        st.session_state.video_fact_check_status = "skipped"
+        st.session_state.video_fact_check_note = str(plan.get("reason") or "").strip()
+        st.session_state.video_fact_check_url = url_value
+        return
+
+    max_claims = int(plan.get("recommended_claim_count") or 3)
+    if max_claims not in {3, 5}:
+        max_claims = 3
+    cache_key = _build_video_fact_check_cache_key(url_value, summary_md, transcript_value)
+
+    with runtime["lock"]:
+        cached_result = str((runtime.get("result_cache") or {}).get(cache_key) or "").strip()
+    if cached_result:
+        st.session_state.summary_text = _merge_fact_check_into_summary(summary_content, cached_result)
+        st.session_state.video_fact_check_task_id = f"video_fact_check_cache_{cache_key[:12]}"
+        st.session_state.video_fact_check_status = "success"
+        st.session_state.video_fact_check_error = ""
+        st.session_state.video_fact_check_url = url_value
+        st.session_state.video_fact_check_applied_task_id = st.session_state.video_fact_check_task_id
+        st.session_state.video_fact_check_note = "新闻核查已命中缓存。"
+        return
+
     task_id = f"video_fact_check_{uuid.uuid4().hex}"
-    content_len = len(transcript_value)
-    max_claims = 8 if content_len >= 12000 else 6 if content_len >= 7000 else 5
 
     with runtime["lock"]:
         runtime["tasks"][task_id] = {
@@ -1997,6 +2038,8 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
             "result": "",
             "error": "",
             "url": url_value,
+            "cache_key": cache_key,
+            "note": str(plan.get("reason") or "").strip(),
         }
 
     st.session_state.video_fact_check_task_id = task_id
@@ -2004,6 +2047,7 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
     st.session_state.video_fact_check_error = ""
     st.session_state.video_fact_check_url = url_value
     st.session_state.video_fact_check_applied_task_id = ""
+    st.session_state.video_fact_check_note = str(plan.get("reason") or "").strip()
 
     eff_api_key = api_key
     eff_base_url = base_url
@@ -2026,11 +2070,19 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
                 max_claims=max_claims,
             )
             with runtime["lock"]:
+                result_cache = runtime.setdefault("result_cache", {})
+                result_cache[cache_key] = str(fact_markdown or "").strip()
+                if len(result_cache) > 80:
+                    oldest_key = next(iter(result_cache))
+                    if oldest_key != cache_key:
+                        result_cache.pop(oldest_key, None)
                 runtime["tasks"][task_id] = {
                     "status": "success",
                     "result": str(fact_markdown or "").strip(),
                     "error": "",
                     "url": url_value,
+                    "cache_key": cache_key,
+                    "note": str(plan.get("reason") or "").strip(),
                 }
         except Exception as exc:
             with runtime["lock"]:
@@ -2039,6 +2091,8 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
                     "result": "",
                     "error": str(exc),
                     "url": url_value,
+                    "cache_key": cache_key,
+                    "note": str(plan.get("reason") or "").strip(),
                 }
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -2060,6 +2114,7 @@ def sync_video_fact_check_state() -> None:
     st.session_state.video_fact_check_status = status
     st.session_state.video_fact_check_error = str(task.get("error") or "").strip()
     st.session_state.video_fact_check_url = str(task.get("url") or st.session_state.get("video_fact_check_url") or "").strip()
+    st.session_state.video_fact_check_note = str(task.get("note") or st.session_state.get("video_fact_check_note") or "").strip()
 
     if (
         status == "success"
@@ -2961,10 +3016,18 @@ def render_video_summary_section():
         fact_title="🕵️ 新闻事实核查",
     )
     status = str(st.session_state.get("video_fact_check_status") or "").strip()
+    note = str(st.session_state.get("video_fact_check_note") or "").strip()
     if status in {"queued", "running"}:
         st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
+        if note:
+            st.caption(note)
+    elif status == "skipped":
+        if note:
+            st.caption(f"🕵️ {note}")
     elif status == "error":
         st.warning(f"新闻核查补跑失败：{str(st.session_state.get('video_fact_check_error') or '').strip()}")
+    elif status == "success" and note:
+        st.caption(f"🕵️ {note}")
 
     st.divider()
 

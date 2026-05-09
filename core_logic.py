@@ -4181,7 +4181,8 @@ def extract_key_claims(
 ) -> list[dict]:
     client = _build_openai_client(api_key, base_url, proxy_url)
     cleaned_text = clean_document_text(text)
-    excerpt = cleaned_text[:12000]
+    excerpt = _build_fact_check_excerpt(cleaned_text, max_chars=7000)
+    summary_excerpt = clean_document_text(summary_markdown or "")[:2200]
     prompt = (
         f"请从下面文档中提取最值得做事实核查的 {max_claims} 条关键声明。\n"
         "要求：\n"
@@ -4196,7 +4197,7 @@ def extract_key_claims(
         "  ]\n"
         "}\n"
         "- 每条 queries 最多给 2 个，搜索词中尽量包含主体、时间、地点、数字、机构。\n\n"
-        f"文档总结：\n{summary_markdown[:5000]}\n\n"
+        f"文档总结：\n{summary_excerpt}\n\n"
         f"文档正文节选：\n{excerpt}"
     )
     response = client.chat.completions.create(
@@ -4206,7 +4207,7 @@ def extract_key_claims(
             {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
-        max_tokens=1500,
+        max_tokens=1000,
         temperature=0.1,
     )
     content = _extract_completion_content(response)
@@ -4290,6 +4291,84 @@ def classify_document_for_fact_check(
     }
 
 
+def _build_fact_check_excerpt(text: str, max_chars: int = 7000) -> str:
+    cleaned = clean_document_text(text or "")
+    if len(cleaned) <= max_chars:
+        return cleaned
+    head_chars = max(2500, int(max_chars * 0.72))
+    tail_chars = max(800, max_chars - head_chars - 40)
+    return (
+        cleaned[:head_chars].rstrip()
+        + "\n...(中间内容省略)...\n"
+        + cleaned[-tail_chars:].lstrip()
+    )
+
+
+def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
+    content = str(text or "").strip()
+    summary = clean_document_text(summary_markdown or "")
+    skip_fact_check, skip_reason = _should_skip_fact_check_for_video_text(content)
+    if skip_fact_check:
+        return {
+            "should_fact_check": False,
+            "reason": f"当前视频更像测试/演示/技术链路内容，已跳过新闻核查（{skip_reason}）。",
+            "recommended_claim_count": 0,
+        }
+
+    excerpt = _build_fact_check_excerpt(content, max_chars=5000)
+    combined = f"{summary}\n{excerpt}".lower()
+    negative_markers = [
+        "教程", "教学", "代码", "编程", "开发", "安装", "评测", "开箱",
+        "软件使用", "产品演示", "课程", "训练营", "实操", "案例讲解",
+    ]
+    news_markers = [
+        "新闻", "报道", "记者", "新华社", "央视", "路透", "彭博", "法新社",
+        "government", "official", "breaking", "reported", "according to",
+    ]
+    event_markers = [
+        "发布", "宣布", "通报", "回应", "发生", "遇袭", "逮捕", "起火", "坠毁",
+        "停火", "制裁", "投票", "选举", "协议", "关税", "经济数据", "失业率",
+        "cpi", "gdp", "policy", "tariff", "sanction", "election",
+    ]
+    hard_fact_patterns = [
+        r"\b20\d{2}\b",
+        r"\b\d+(?:\.\d+)?\s*%",
+        r"\b\d+(?:,\d{3})+\b",
+        r"\b\d+(?:\.\d+)?\s*(?:亿|万亿|万人|万例|亿美元|亿元|人)\b",
+    ]
+    negative_hits = sum(1 for marker in negative_markers if marker in combined)
+    news_hits = sum(1 for marker in news_markers if marker in combined)
+    event_hits = sum(1 for marker in event_markers if marker in combined)
+    hard_fact_hits = sum(1 for pattern in hard_fact_patterns if re.search(pattern, combined))
+
+    if negative_hits >= 2 and news_hits == 0 and event_hits == 0:
+        return {
+            "should_fact_check": False,
+            "reason": "当前视频更像教程、产品演示或经验讲解，已默认跳过新闻核查。",
+            "recommended_claim_count": 0,
+        }
+
+    should_fact_check = (
+        (news_hits >= 1 and event_hits >= 1)
+        or (event_hits >= 2 and hard_fact_hits >= 1)
+        or (news_hits >= 2 and hard_fact_hits >= 1)
+    )
+    if not should_fact_check:
+        return {
+            "should_fact_check": False,
+            "reason": "当前视频不够像新闻/事件型内容，已默认跳过新闻核查。",
+            "recommended_claim_count": 0,
+        }
+
+    signal_score = news_hits + event_hits + hard_fact_hits
+    recommended_claim_count = 5 if len(content) >= 9000 and signal_score >= 5 else 3
+    return {
+        "should_fact_check": True,
+        "reason": "当前视频包含较明显的新闻/事件型声明，将只核查最关键的少量条目。",
+        "recommended_claim_count": recommended_claim_count,
+    }
+
+
 def search_claim_sources(claim_items: list[dict], proxy_url: str = None) -> list[dict]:
     results = []
     for item in claim_items:
@@ -4320,11 +4399,12 @@ def fact_check_document_claims(
     if max_claims <= 0:
         return ""
 
+    summary_excerpt = clean_document_text(summary_markdown or "")[:2200]
     if callable(progress_callback):
         progress_callback(5, "正在抽取关键声明...")
     claims = extract_key_claims(
         text=text,
-        summary_markdown=summary_markdown,
+        summary_markdown=summary_excerpt,
         api_key=api_key,
         base_url=base_url,
         model=model,
@@ -4338,11 +4418,12 @@ def fact_check_document_claims(
 
     compiled_sections = []
     for idx, item in enumerate(claim_sources, start=1):
+        search_excerpt = str(item.get("search_markdown") or "").strip()[:1200]
         compiled_sections.append(
             f"### 候选声明{idx}\n"
             f"- 声明：{item['claim']}\n"
             f"- 搜索词：{' | '.join(item.get('queries') or [])}\n"
-            f"- 搜索结果：\n{item['search_markdown']}"
+            f"- 搜索结果：\n{search_excerpt}"
         )
 
     if callable(progress_callback):
@@ -4370,7 +4451,7 @@ def fact_check_document_claims(
         "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
         "- 避免使用“手动搜索未发现”“未搜索到”这类空泛表述，改为说明“现有公开候选来源不足以直接支撑该说法”，并保留候选链接。\n"
         "- 只返回 Markdown，不要 JSON。\n\n"
-        f"文档总结：\n{summary_markdown[:4000]}\n\n"
+        f"文档总结：\n{summary_excerpt}\n\n"
         f"候选声明与搜索结果：\n{compiled_claim_text}"
     )
     response = client.chat.completions.create(
@@ -4379,7 +4460,7 @@ def fact_check_document_claims(
             {"role": "system", "content": "你是一个严谨的事实核查助手。请基于外部来源逐条核查关键声明。"},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=3200,
+        max_tokens=2200,
         temperature=0.15,
     )
     content = _extract_completion_content(response).strip()
