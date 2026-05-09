@@ -1802,7 +1802,11 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
     normalized_video_bridge_payload = normalize_extension_bridge_payload(video_bridge_payload)
     video_bridge_transcript = str(normalized_video_bridge_payload.get("transcript_text") or "").strip()
     if video_bridge_transcript:
-        reset_video_fact_check_state()
+        st.session_state.video_fact_check_task_id = ""
+        st.session_state.video_fact_check_status = "idle"
+        st.session_state.video_fact_check_error = ""
+        st.session_state.video_fact_check_url = ""
+        st.session_state.video_fact_check_applied_task_id = ""
         print(
             "VideoBridgePayloadReceived: "
             f"payload_id={str(normalized_video_bridge_payload.get('payload_id') or video_extension_payload_id).strip()}, "
