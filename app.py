@@ -284,32 +284,6 @@ def render_copy_to_clipboard_button(label: str, text: str, key: str) -> None:
         height=42,
     )
 
-def render_non_blocking_refresh(interval_ms: int, key: str) -> None:
-    refresh_ms = max(500, int(interval_ms or 0))
-    component_id = f"auto_refresh_{re.sub(r'[^a-zA-Z0-9_]+', '_', key)}"
-    components.html(
-        f"""
-        <script>
-        const marker = "{component_id}";
-        if (!window[marker]) {{
-          window[marker] = true;
-          window.setTimeout(() => {{
-            try {{
-              if (window.parent && window.parent.location) {{
-                window.parent.location.reload();
-                return;
-              }}
-            }} catch (err) {{
-              // Fallback to reloading the current frame.
-            }}
-            window.location.reload();
-          }}, {refresh_ms});
-        }}
-        </script>
-        """,
-        height=0,
-    )
-
 def render_issue_report_box(
     context_label: str,
     *,
@@ -3028,35 +3002,45 @@ def render_video_summary_section():
         return
 
     sync_video_fact_check_state()
-    st.markdown("### 📝 AI 总结")
-    if "summary_duration" in st.session_state and st.session_state.summary_duration:
-        duration_info = st.session_state.summary_duration
-        fetch_t = duration_info.get("fetch", 0)
-        sum_t = duration_info.get("summary", 0)
-        total_t = duration_info.get("total", 0)
-        st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (文本抓取: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
-    st.caption(f"🤖 模型流水线：{pipeline_model_label}")
+    initial_status = str(st.session_state.get("video_fact_check_status") or "").strip()
+    run_every = "3s" if initial_status in {"queued", "running"} else None
 
-    render_summary_content(
-        st.session_state.summary_text,
-        fact_title="🕵️ 新闻事实核查",
-    )
-    status = str(st.session_state.get("video_fact_check_status") or "").strip()
-    note = str(st.session_state.get("video_fact_check_note") or "").strip()
-    if status in {"queued", "running"}:
-        st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
-        if note:
-            st.caption(note)
-        render_non_blocking_refresh(3000, f"video_fact_check_{status}")
-    elif status == "skipped":
-        if note:
+    @st.fragment(run_every=run_every)
+    def _render_video_summary_fragment():
+        sync_video_fact_check_state()
+        st.markdown("### 📝 AI 总结")
+        if "summary_duration" in st.session_state and st.session_state.summary_duration:
+            duration_info = st.session_state.summary_duration
+            fetch_t = duration_info.get("fetch", 0)
+            sum_t = duration_info.get("summary", 0)
+            total_t = duration_info.get("total", 0)
+            st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (文本抓取: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
+        st.caption(f"🤖 模型流水线：{pipeline_model_label}")
+
+        render_summary_content(
+            st.session_state.summary_text,
+            fact_title="🕵️ 新闻事实核查",
+        )
+        status = str(st.session_state.get("video_fact_check_status") or "").strip()
+        note = str(st.session_state.get("video_fact_check_note") or "").strip()
+        if status in {"queued", "running"}:
+            st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
+            if note:
+                st.caption(note)
+        elif status == "skipped":
+            if note:
+                st.caption(f"🕵️ {note}")
+        elif status == "error":
+            st.warning(f"新闻核查补跑失败：{str(st.session_state.get('video_fact_check_error') or '').strip()}")
+        elif status == "success" and note:
             st.caption(f"🕵️ {note}")
-    elif status == "error":
-        st.warning(f"新闻核查补跑失败：{str(st.session_state.get('video_fact_check_error') or '').strip()}")
-    elif status == "success" and note:
-        st.caption(f"🕵️ {note}")
 
-    st.divider()
+        st.divider()
+
+        if run_every is not None and status not in {"queued", "running"}:
+            st.rerun()
+
+    _render_video_summary_fragment()
 
     # 当前模式已关闭音频下载/Whisper 转写兜底，不再展示相关脚注。
 
