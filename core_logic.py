@@ -4163,11 +4163,48 @@ def _extract_claim_items(raw_text: str, max_claims: int) -> list[dict]:
             queries = [str(q).strip() for q in queries if str(q).strip()]
         else:
             continue
+        claim = _normalize_fact_check_claim(claim)
         if claim:
             normalized.append({"claim": claim, "queries": queries[:2]})
         if len(normalized) >= max_claims:
             break
     return normalized
+
+
+def _normalize_fact_check_claim(claim: str) -> str:
+    text = normalize_whitespace(str(claim or "").strip())
+    if not text:
+        return ""
+
+    text = re.sub(r"^[\-*•\d\.\)\(（）：:、\s]+", "", text).strip()
+    text = re.sub(r"[：:]\s*$", "", text).strip()
+
+    trailing_phrases = [
+        "其中，", "其中,", "但是，", "但是,", "不过，", "不过,", "并且，", "并且,",
+        "而且，", "而且,", "此外，", "此外,", "另外，", "另外,", "例如，", "例如,",
+        "比如，", "比如,", "随后，", "随后,", "然后，", "然后,", "同时，", "同时,",
+    ]
+    for phrase in trailing_phrases:
+        if text.endswith(phrase):
+            text = text[: -len(phrase)].rstrip(" ，,;；:：")
+            break
+
+    # 如果最后一个分句明显以承接词开头，说明模型大概率只截到半句，直接去掉尾巴。
+    segments = re.split(r"([。！？；;])", text)
+    merged = "".join(segments).strip()
+    tail_match = re.search(
+        r"(?:，|,)\s*(其中|但是|不过|并且|而且|此外|另外|例如|比如|随后|然后|同时)\s*$",
+        merged,
+    )
+    if tail_match:
+        merged = merged[:tail_match.start()].rstrip(" ，,;；:：")
+
+    merged = normalize_whitespace(merged)
+    if not merged:
+        return ""
+    if len(merged) < 8:
+        return ""
+    return merged
 
 
 def extract_key_claims(
@@ -4190,6 +4227,9 @@ def extract_key_claims(
         "- 优先提取：数字、时间、政策、官方表述、事件是否发生、人物公开言论、强因果判断。\n"
         "- 如果原文里存在多条不同主体、不同数字、不同时间点的声明，不要合并成一条笼统表述。\n"
         "- 如果文本里可核查点较多，请尽量提满，不要只返回 1-2 条过于宽泛的声明。\n"
+        "- 每条 claim 必须是完整、自洽、可独立理解的一句话，不要只截半句。\n"
+        "- 不要让 claim 以“其中、但是、并且、而且、例如、比如、随后、然后、同时”等承接词结尾。\n"
+        "- 如果原文句子过长，请改写成完整但更短的独立陈述，保留主体、动作和关键数字/时间。\n"
         "- 只返回 JSON，对象格式如下：\n"
         "{\n"
         '  "claims": [\n'
