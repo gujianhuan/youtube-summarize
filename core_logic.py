@@ -4457,6 +4457,7 @@ def summarize_text(
     proxy_url: str = None,
     stream: bool = False,
     fact_check_model: str | None = None,
+    enable_fact_check: bool = True,
 ):
     if not text or not text.strip():
         return "没有可总结的内容（文本为空）。"
@@ -4480,11 +4481,14 @@ def summarize_text(
         from datetime import datetime
         current_date = datetime.now().strftime("%Y-%m-%d")
 
-        fact_check_enabled = True
-        skip_fact_check, skip_reason = _should_skip_fact_check_for_video_text(content)
-        if skip_fact_check:
-            fact_check_enabled = False
-            print(f"SummarizeText: skip fact check, reason={skip_reason}")
+        fact_check_enabled = bool(enable_fact_check)
+        if fact_check_enabled:
+            skip_fact_check, skip_reason = _should_skip_fact_check_for_video_text(content)
+            if skip_fact_check:
+                fact_check_enabled = False
+                print(f"SummarizeText: skip fact check, reason={skip_reason}", flush=True)
+        else:
+            print("SummarizeText: fact check disabled by caller", flush=True)
 
         prompt = (
             f"你是一个专业的视频内容总结助手。当前真实日期是：{current_date}。\n"
@@ -4517,7 +4521,7 @@ def summarize_text(
             "SummarizeText: "
             f"content_len={content_len}, summary_model={summary_model}, fact_check_model={fact_model}, "
             f"fact_check_enabled={fact_check_enabled}"
-        )
+        , flush=True)
 
         response = client.chat.completions.create(
             model=summary_model,
@@ -4561,7 +4565,7 @@ def summarize_text(
                 repair_content = _extract_completion_content(repair_resp)
                 normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
             except Exception as repair_exc:
-                print(f"Repair summary JSON failed: {repair_exc}")
+                print(f"Repair summary JSON failed: {repair_exc}", flush=True)
 
         if not normalized_payload:
             normalized_payload = {
@@ -4584,7 +4588,7 @@ def summarize_text(
                     max_claims=max_claims,
                 )
             except Exception as fact_exc:
-                print(f"Video fact check pipeline failed: {fact_exc}")
+                print(f"Video fact check pipeline failed: {fact_exc}", flush=True)
                 fact_check_markdown = _build_fact_check_fallback_markdown()
 
         normalized_payload["summary_markdown"] = summary_markdown

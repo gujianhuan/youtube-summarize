@@ -6,13 +6,21 @@ const FLOW_STATUS_KEY = "summarizerFlowStatus";
 const BRIDGE_HEALTH_TIMEOUT_MS = 15000;
 const BRIDGE_UPLOAD_TIMEOUT_MS = 20000;
 const BRIDGE_UPLOAD_RETRY_DELAY_MS = 1200;
-const TEMP_TAB_LOAD_TIMEOUT_MS = 20000;
-const TEMP_TAB_READY_DELAY_MS = 2500;
-const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 3;
-const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 1200;
-const EXTENSION_TOOL_VERSION = "0.1.49";
+const TEMP_TAB_LOAD_TIMEOUT_MS = 30000;
+const TEMP_TAB_READY_DELAY_MS = 5000;
+const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 5;
+const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 1500;
+const EXTENSION_TOOL_VERSION = "0.1.52";
 
-// Release v0.1.49: Add youtubei get_transcript fallback in Main World to bypass empty timedtext.
+// Release v0.1.52: Prefer temp-tab main-world extraction for page-mode and give YouTube bootstrap data more time to stabilize.
+
+const CLIENT_NAME_TO_ID = {
+  WEB: "1",
+  MWEB: "2",
+  ANDROID: "3",
+  IOS: "5",
+  TVHTML5: "7"
+};
 
 function normalizeBaseUrl(value, fallbackValue) {
   const trimmed = String(value || "").trim();
@@ -162,6 +170,49 @@ function parseJsonObjectAfterMarker(source, marker) {
   } catch (_error) {
     return null;
   }
+}
+
+function parseMaybeJson(value) {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === "object") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function findValuesByKey(root, targetKey, results = [], seen = new Set()) {
+  if (!root || typeof root !== "object" || seen.has(root) || results.length >= 20) {
+    return results;
+  }
+  seen.add(root);
+  if (Array.isArray(root)) {
+    for (const item of root) {
+      findValuesByKey(item, targetKey, results, seen);
+      if (results.length >= 20) {
+        break;
+      }
+    }
+    return results;
+  }
+  for (const [key, value] of Object.entries(root)) {
+    if (key === targetKey) {
+      results.push(value);
+      if (results.length >= 20) {
+        break;
+      }
+    }
+    findValuesByKey(value, targetKey, results, seen);
+    if (results.length >= 20) {
+      break;
+    }
+  }
+  return results;
 }
 
 function extractCaptionTracksFromSource(source) {
@@ -435,6 +486,255 @@ function extractTranscriptFromSource(source) {
   return "";
 }
 
+function extractInnertubeConfigFromSource(source) {
+  const config = {
+    apiKey: "",
+    clientVersion: "",
+    clientName: "WEB",
+    visitorData: "",
+    hl: "",
+    gl: "",
+    loggedIn: false,
+    context: null
+  };
+  const text = String(source || "");
+  const assignIfMissing = (key, regex) => {
+    if (config[key]) {
+      return;
+    }
+    const match = text.match(regex);
+    if (match) {
+      config[key] = String(match[1] || "");
+    }
+  };
+
+  assignIfMissing("apiKey", /"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+  assignIfMissing("clientVersion", /"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+  assignIfMissing("clientName", /"INNERTUBE_CONTEXT_CLIENT_NAME"\s*:\s*"([^"]+)"/);
+  assignIfMissing("visitorData", /"VISITOR_DATA"\s*:\s*"([^"]+)"/);
+  assignIfMissing("hl", /"HL"\s*:\s*"([^"]+)"/);
+  assignIfMissing("gl", /"GL"\s*:\s*"([^"]+)"/);
+
+  const loggedInMatch = text.match(/"LOGGED_IN"\s*:\s*(true|false)/);
+  if (loggedInMatch) {
+    config.loggedIn = loggedInMatch[1] === "true";
+  }
+
+  config.context =
+    parseJsonObjectAfterMarker(text, "\"INNERTUBE_CONTEXT\":") ||
+    parseJsonObjectAfterMarker(text, "INNERTUBE_CONTEXT =") ||
+    null;
+
+  if (config.context?.client && typeof config.context.client === "object") {
+    const client = config.context.client;
+    if (!config.clientVersion && client.clientVersion) {
+      config.clientVersion = String(client.clientVersion);
+    }
+    if (!config.clientName && client.clientName) {
+      config.clientName = String(client.clientName);
+    }
+    if (!config.visitorData && client.visitorData) {
+      config.visitorData = String(client.visitorData);
+    }
+    if (!config.hl && client.hl) {
+      config.hl = String(client.hl);
+    }
+    if (!config.gl && client.gl) {
+      config.gl = String(client.gl);
+    }
+  }
+
+  return config;
+}
+
+function getTranscriptParamsCandidatesFromSource(source) {
+  const results = [];
+  const seen = new Set();
+  const pushCandidate = (params, sourceName) => {
+    const value = String(params || "").trim();
+    if (!value || seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    results.push({ params: value, source: sourceName });
+  };
+
+  const markers = [
+    "ytInitialData =",
+    "var ytInitialData =",
+    "window[\"ytInitialData\"] =",
+    "ytInitialData=",
+    "\"ytInitialData\":"
+  ];
+
+  for (const marker of markers) {
+    const initialData = parseJsonObjectAfterMarker(source, marker);
+    const endpoints = findValuesByKey(initialData, "getTranscriptEndpoint");
+    for (const endpoint of endpoints) {
+      pushCandidate(endpoint?.params, marker);
+    }
+  }
+
+  for (const match of String(source || "").matchAll(/"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"/g)) {
+    pushCandidate(match[1], "inline_script");
+  }
+
+  return results;
+}
+
+function buildInnertubeContextFromConfig(config, overrideClientName = "") {
+  const baseContext = (() => {
+    try {
+      return JSON.parse(JSON.stringify(config?.context || {}));
+    } catch (_error) {
+      return {};
+    }
+  })();
+  const client = baseContext.client && typeof baseContext.client === "object"
+    ? baseContext.client
+    : {};
+  const finalClientName = String(overrideClientName || client.clientName || config?.clientName || "WEB");
+  const finalClientVersion = String(client.clientVersion || config?.clientVersion || "");
+  baseContext.client = {
+    ...client,
+    clientName: finalClientName,
+    clientVersion: finalClientVersion
+  };
+  if (!baseContext.client.hl && config?.hl) {
+    baseContext.client.hl = config.hl;
+  }
+  if (!baseContext.client.gl && config?.gl) {
+    baseContext.client.gl = config.gl;
+  }
+  if (!baseContext.client.visitorData && config?.visitorData) {
+    baseContext.client.visitorData = config.visitorData;
+  }
+  if (!baseContext.client.clientScreen) {
+    baseContext.client.clientScreen = "WATCH";
+  }
+  if (!baseContext.request || typeof baseContext.request !== "object") {
+    baseContext.request = {};
+  }
+  if (typeof baseContext.request.useSsl === "undefined") {
+    baseContext.request.useSsl = true;
+  }
+  return baseContext;
+}
+
+function buildYoutubeiHeaders(config, requestContext) {
+  const clientName = String(requestContext?.client?.clientName || config?.clientName || "WEB").toUpperCase();
+  const headers = {
+    "Content-Type": "application/json",
+    "X-YouTube-Client-Name": CLIENT_NAME_TO_ID[clientName] || "1",
+    "X-YouTube-Client-Version": String(requestContext?.client?.clientVersion || config?.clientVersion || ""),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+  };
+  if (config?.visitorData) {
+    headers["X-Goog-Visitor-Id"] = config.visitorData;
+  }
+  headers["X-Youtube-Bootstrap-Logged-In"] = config?.loggedIn ? "true" : "false";
+  return headers;
+}
+
+function extractTranscriptFromYoutubeiData(data) {
+  const renderers = findValuesByKey(data, "transcriptSegmentListRenderer");
+  const lines = [];
+  for (const renderer of renderers) {
+    const segments = Array.isArray(renderer?.initialSegments)
+      ? renderer.initialSegments
+      : Array.isArray(renderer?.segments)
+        ? renderer.segments
+        : [];
+    for (const segment of segments) {
+      const transcriptRenderer = segment?.transcriptSegmentRenderer || segment || {};
+      const text = extractTextFromRuns(
+        transcriptRenderer.snippet ||
+        transcriptRenderer.cue ||
+        transcriptRenderer.content ||
+        transcriptRenderer.text ||
+        transcriptRenderer
+      );
+      if (!text || isLikelyTranscriptTimestamp(text)) {
+        continue;
+      }
+      lines.push(text);
+    }
+  }
+  return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+}
+
+async function fetchTranscriptViaYoutubeiFromSource(source, trace = []) {
+  const config = extractInnertubeConfigFromSource(source);
+  const paramsCandidates = getTranscriptParamsCandidatesFromSource(source);
+  if (!config.apiKey) {
+    trace.push("background_youtubei_missing_api_key");
+  }
+  if (!config.clientVersion) {
+    trace.push("background_youtubei_missing_client_version");
+  }
+  if (!paramsCandidates.length) {
+    trace.push("background_youtubei_missing_transcript_params");
+  }
+  if (!config.apiKey || !config.clientVersion || !paramsCandidates.length) {
+    return "";
+  }
+
+  const contextCandidates = [];
+  const seenContexts = new Set();
+  const pushContext = (clientName) => {
+    const context = buildInnertubeContextFromConfig(config, clientName);
+    const signature = `${String(context?.client?.clientName || "")}|${String(context?.client?.clientVersion || "")}`;
+    if (!context?.client?.clientVersion || seenContexts.has(signature)) {
+      return;
+    }
+    seenContexts.add(signature);
+    contextCandidates.push(context);
+  };
+  pushContext("");
+  pushContext("WEB");
+  pushContext("MWEB");
+
+  for (const candidate of paramsCandidates.slice(0, 4)) {
+    for (const requestContext of contextCandidates) {
+      const clientName = String(requestContext?.client?.clientName || "WEB");
+      try {
+        const url = new URL("https://www.youtube.com/youtubei/v1/get_transcript");
+        url.searchParams.set("prettyPrint", "false");
+        url.searchParams.set("key", config.apiKey);
+        const response = await fetchWithTimeout(
+          url.toString(),
+          {
+            method: "POST",
+            headers: buildYoutubeiHeaders(config, requestContext),
+            body: JSON.stringify({
+              context: requestContext,
+              params: candidate.params
+            }),
+            credentials: "include",
+            cache: "no-store"
+          },
+          20000
+        );
+        const rawText = await response.text();
+        if (!response.ok) {
+          trace.push(`background_youtubei_http_${response.status}:client=${clientName}:source=${candidate.source}:body=${normalizeWhitespace(rawText).slice(0, 160) || "empty"}`);
+          continue;
+        }
+        const data = parseMaybeJson(rawText);
+        const transcript = extractTranscriptFromYoutubeiData(data);
+        if (transcript) {
+          trace.push(`background_youtubei_ok:client=${clientName}:source=${candidate.source}`);
+          return transcript;
+        }
+        trace.push(`background_youtubei_empty_segments:client=${clientName}:source=${candidate.source}`);
+      } catch (error) {
+        trace.push(`background_youtubei_exception:client=${clientName}:source=${candidate.source}:error=${String(error?.message || error || "unknown")}`);
+      }
+    }
+  }
+  return "";
+}
+
 async function fetchYouTubeWatchHtml(url) {
   const response = await fetchWithTimeout(
     url,
@@ -545,6 +845,21 @@ async function extractYouTubeTranscriptByUrl(sourceUrl) {
     });
 
     extractionTrace.push(`tracks=${sortedTracks.map((track) => describeCaptionTrack(track)).join(" | ")}`);
+
+    const youtubeiTranscript = await fetchTranscriptViaYoutubeiFromSource(html, extractionTrace);
+    if (youtubeiTranscript) {
+      return {
+        ok: true,
+        transcript: youtubeiTranscript,
+        debug: {
+          htmlContainsCaptionTracks: true,
+          trackCount: tracks.length,
+          source: "background_youtubei_get_transcript",
+          attempt,
+          trace: extractionTrace
+        }
+      };
+    }
 
     for (const track of sortedTracks) {
       const transcript = await fetchYouTubeCaptionTrack(track);
@@ -798,6 +1113,42 @@ async function waitForTabComplete(tabId, timeoutMs = 5000) {
   });
 }
 
+async function waitForYouTubeTabReadyForExtraction(tabId, timeoutMs = TEMP_TAB_LOAD_TIMEOUT_MS) {
+  if (!tabId) {
+    throw new Error("tab_id_required");
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "";
+  let lastUrl = "";
+
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      lastStatus = String(tab?.status || "");
+      lastUrl = String(tab?.url || "");
+      const isUsableUrl =
+        lastUrl &&
+        !lastUrl.startsWith("about:blank") &&
+        !lastUrl.startsWith("chrome-error://") &&
+        (lastUrl.includes("youtube.com") || lastUrl.includes("youtu.be"));
+      if (isUsableUrl && (lastStatus === "complete" || lastStatus === "loading")) {
+        return {
+          ok: true,
+          status: lastStatus,
+          url: lastUrl
+        };
+      }
+    } catch (error) {
+      lastStatus = "get_tab_failed";
+      lastUrl = String(error?.message || error || "");
+    }
+    await sleep(800);
+  }
+
+  throw new Error(`temp_tab_load_timeout:status=${lastStatus || "unknown"}:url=${lastUrl || "unknown"}`);
+}
+
 async function ensureContentScriptOnTab(tabId) {
   if (!tabId) {
     return;
@@ -810,7 +1161,13 @@ async function ensureContentScriptOnTab(tabId) {
 
 async function extractTranscriptViaContentScriptTab(tabId) {
   if (!tabId) {
-    return null;
+    return {
+      ok: false,
+      error: "content_script_tab_id_required",
+      debug: {
+        tabId
+      }
+    };
   }
 
   try {
@@ -818,15 +1175,29 @@ async function extractTranscriptViaContentScriptTab(tabId) {
   } catch (error) {
     const message = String(error?.message || "");
     if (!message.includes("Receiving end does not exist")) {
-      return null;
+      return {
+        ok: false,
+        error: "content_script_send_message_failed",
+        debug: {
+          tabId,
+          message
+        }
+      };
     }
   }
 
   try {
     await ensureContentScriptOnTab(tabId);
     return await chrome.tabs.sendMessage(tabId, { action: "extractTranscript" });
-  } catch (_error) {
-    return null;
+  } catch (error) {
+    return {
+      ok: false,
+      error: "content_script_reinject_failed",
+      debug: {
+        tabId,
+        message: String(error?.message || error || "unknown")
+      }
+    };
   }
 }
 
@@ -865,23 +1236,40 @@ async function findMatchingYouTubeTab(sourceUrl) {
 async function extractYouTubeTranscriptViaTemporaryTab(sourceUrl) {
   const sourceUrlText = String(sourceUrl || "").trim();
   if (!sourceUrlText) {
-    return null;
+    return {
+      ok: false,
+      error: "temp_tab_source_url_required"
+    };
   }
 
   let tempTab = null;
+  let previousActiveTabId = null;
   try {
-    tempTab = await chrome.tabs.create({
-      url: sourceUrlText,
-      active: false
+    const [previousActiveTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true
     });
+    previousActiveTabId = previousActiveTab?.id || null;
+    tempTab = await chrome.tabs.create({ url: sourceUrlText, active: true });
     if (!tempTab?.id) {
-      return null;
+      return {
+        ok: false,
+        error: "temp_tab_create_failed"
+      };
     }
-    await waitForTabComplete(tempTab.id);
+    await waitForYouTubeTabReadyForExtraction(tempTab.id, TEMP_TAB_LOAD_TIMEOUT_MS);
     await sleep(TEMP_TAB_READY_DELAY_MS);
     return await extractTranscriptViaContentScriptTab(tempTab.id);
-  } catch (_error) {
-    return null;
+  } catch (error) {
+    return {
+      ok: false,
+      error: "temp_tab_content_script_exception",
+      debug: {
+        sourceUrl: sourceUrlText,
+        tabId: tempTab?.id || null,
+        message: String(error?.message || error || "unknown")
+      }
+    };
   } finally {
     if (tempTab?.id) {
       try {
@@ -890,25 +1278,41 @@ async function extractYouTubeTranscriptViaTemporaryTab(sourceUrl) {
         // Ignore cleanup failure for temp tab.
       }
     }
+    if (previousActiveTabId) {
+      try {
+        await chrome.tabs.update(previousActiveTabId, { active: true });
+      } catch (_error) {
+        // Ignore restore focus failures.
+      }
+    }
   }
 }
 
 async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
   const sourceUrlText = String(sourceUrl || "").trim();
   if (!sourceUrlText) {
-    return null;
+    return {
+      ok: false,
+      error: "temp_tab_main_world_source_url_required"
+    };
   }
 
   let tempTab = null;
+  let previousActiveTabId = null;
   try {
-    tempTab = await chrome.tabs.create({
-      url: sourceUrlText,
-      active: false
+    const [previousActiveTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true
     });
+    previousActiveTabId = previousActiveTab?.id || null;
+    tempTab = await chrome.tabs.create({ url: sourceUrlText, active: true });
     if (!tempTab?.id) {
-      return null;
+      return {
+        ok: false,
+        error: "temp_tab_main_world_create_failed"
+      };
     }
-    await waitForTabComplete(tempTab.id);
+    await waitForYouTubeTabReadyForExtraction(tempTab.id, TEMP_TAB_LOAD_TIMEOUT_MS);
     let lastResult = null;
     for (let attempt = 1; attempt <= YOUTUBE_EXTRACTION_RETRY_ATTEMPTS; attempt += 1) {
       await sleep(TEMP_TAB_READY_DELAY_MS);
@@ -925,15 +1329,37 @@ async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
         await sleep(YOUTUBE_EXTRACTION_RETRY_DELAY_MS);
       }
     }
-    return lastResult;
-  } catch (_error) {
-    return null;
+    return lastResult || {
+      ok: false,
+      error: "temp_tab_main_world_empty_result",
+      debug: {
+        sourceUrl: sourceUrlText,
+        tabId: tempTab?.id || null
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: "temp_tab_main_world_exception",
+      debug: {
+        sourceUrl: sourceUrlText,
+        tabId: tempTab?.id || null,
+        message: String(error?.message || error || "unknown")
+      }
+    };
   } finally {
     if (tempTab?.id) {
       try {
         await chrome.tabs.remove(tempTab.id);
       } catch (_error) {
         // Ignore cleanup failure for temp tab.
+      }
+    }
+    if (previousActiveTabId) {
+      try {
+        await chrome.tabs.update(previousActiveTabId, { active: true });
+      } catch (_error) {
+        // Ignore restore focus failures.
       }
     }
   }
@@ -967,7 +1393,10 @@ function normalizePluginExtractionResult(result, fallbackReason = "subtitle_pane
 
 async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
   if (!tabId) {
-    return null;
+    return {
+      ok: false,
+      error: "main_world_tab_id_required"
+    };
   }
 
   try {
@@ -1308,127 +1737,528 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           return [];
         };
 
-        const getInnertubeConfig = () => {
-          let apiKey = "";
-          let clientVersion = "";
-          try {
-            apiKey = String(globalThis?.ytcfg?.get?.("INNERTUBE_API_KEY") || "");
-            clientVersion = String(globalThis?.ytcfg?.get?.("INNERTUBE_CLIENT_VERSION") || "");
-          } catch (_e) {}
-          if (!apiKey || !clientVersion) {
-            // Try scanning inline bootstrap JSON
-            const scripts = Array.from(document.getElementsByTagName("script"));
-            for (const s of scripts) {
-              const text = s.textContent || "";
-              if (!text) continue;
-              if (!apiKey) {
-                const m1 = text.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
-                if (m1) apiKey = m1[1];
-              }
-              if (!clientVersion) {
-                const m2 = text.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
-                if (m2) clientVersion = m2[1];
-              }
-              if (apiKey && clientVersion) break;
-            }
-          }
-          return { apiKey, clientVersion };
+        const CLIENT_NAME_TO_ID = {
+          WEB: "1",
+          MWEB: "2",
+          ANDROID: "3",
+          IOS: "5",
+          TVHTML5: "7"
         };
 
-        const getTranscriptParams = () => {
-          // Prefer structured initial data if available
-          const initialDataCandidates = [];
-          const parseMaybeJson = (val) => {
-            if (!val) return null;
-            if (typeof val === "object") return val;
-            try { return JSON.parse(val); } catch (_error) { return null; }
-          };
-          initialDataCandidates.push(globalThis.ytInitialData);
-          initialDataCandidates.push(parseMaybeJson(globalThis?.ytcfg?.data_?.INITIAL_DATA));
-          if (typeof globalThis?.ytcfg?.get === "function") {
-            initialDataCandidates.push(parseMaybeJson(globalThis.ytcfg.get("INITIAL_DATA")));
-            initialDataCandidates.push(parseMaybeJson(globalThis.ytcfg.get("ytInitialData")));
+        const findValuesByKey = (root, targetKey, results = [], seen = new Set()) => {
+          if (!root || typeof root !== "object" || seen.has(root) || results.length >= 20) {
+            return results;
           }
-          for (const candidate of initialDataCandidates) {
-            try {
-              const panels = candidate?.engagementPanels;
-              if (Array.isArray(panels)) {
-                for (const p of panels) {
-                  const cont = p?.engagementPanelSectionListRenderer?.content?.continuationItemRenderer?.continuationEndpoint;
-                  const params = cont?.getTranscriptEndpoint?.params;
-                  if (typeof params === "string" && params.length > 0) {
-                    return params;
-                  }
-                }
+          seen.add(root);
+          if (Array.isArray(root)) {
+            for (const item of root) {
+              findValuesByKey(item, targetKey, results, seen);
+              if (results.length >= 20) {
+                break;
               }
-            } catch (_e) {}
-          }
-          // Fallback: scan inline scripts text
-          const scripts = Array.from(document.getElementsByTagName("script"));
-          for (const s of scripts) {
-            const text = s.textContent || "";
-            if (!text.includes("getTranscriptEndpoint")) continue;
-            const m = text.match(/"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"/);
-            if (m) {
-              return m[1];
             }
+            return results;
+          }
+          for (const [key, value] of Object.entries(root)) {
+            if (key === targetKey) {
+              results.push(value);
+              if (results.length >= 20) {
+                break;
+              }
+            }
+            findValuesByKey(value, targetKey, results, seen);
+            if (results.length >= 20) {
+              break;
+            }
+          }
+          return results;
+        };
+
+        const getYoutubeVideoId = () => {
+          try {
+            const currentUrl = new URL(String(location.href || ""));
+            const watchId = currentUrl.searchParams.get("v") || "";
+            if (watchId) {
+              return watchId;
+            }
+            const pathParts = currentUrl.pathname.split("/").filter(Boolean);
+            if (pathParts.length >= 2 && ["shorts", "live", "embed"].includes(pathParts[0])) {
+              return pathParts[1];
+            }
+          } catch (_error) {
+            // Ignore malformed location.
           }
           return "";
         };
 
-        const fetchTranscriptViaYoutubei = async () => {
-          const { apiKey, clientVersion } = getInnertubeConfig();
-          const params = getTranscriptParams();
-          if (!apiKey || !clientVersion || !params) {
-            return null;
-          }
+        const getInnertubeConfig = () => {
+          let apiKey = "";
+          let clientVersion = "";
+          let clientName = "";
+          let visitorData = "";
+          let hl = "";
+          let gl = "";
+          let sessionIndex = "";
+          let delegatedSessionId = "";
+          let loggedIn = false;
+          let context = null;
+
+          const contextCandidates = [];
+
           try {
-            const resp = await fetch(`https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false&key=${apiKey}`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-YouTube-Client-Name": "1",
-                "X-YouTube-Client-Version": clientVersion
-              },
-              body: JSON.stringify({
-                context: { client: { clientName: "WEB", clientVersion } },
-                params
-              }),
-              credentials: "include",
-              cache: "no-store"
-            });
-            if (!resp.ok) {
-              return null;
+            apiKey = String(globalThis?.ytcfg?.get?.("INNERTUBE_API_KEY") || "");
+            clientVersion = String(globalThis?.ytcfg?.get?.("INNERTUBE_CLIENT_VERSION") || "");
+            clientName = String(globalThis?.ytcfg?.get?.("INNERTUBE_CONTEXT_CLIENT_NAME") || "");
+            visitorData = String(globalThis?.ytcfg?.get?.("VISITOR_DATA") || "");
+            hl = String(globalThis?.ytcfg?.get?.("HL") || "");
+            gl = String(globalThis?.ytcfg?.get?.("GL") || "");
+            sessionIndex = String(globalThis?.ytcfg?.get?.("SESSION_INDEX") || "");
+            delegatedSessionId = String(globalThis?.ytcfg?.get?.("DELEGATED_SESSION_ID") || "");
+            loggedIn = Boolean(globalThis?.ytcfg?.get?.("LOGGED_IN"));
+            contextCandidates.push(parseMaybeJson(globalThis?.ytcfg?.get?.("INNERTUBE_CONTEXT")));
+          } catch (_e) {}
+
+          contextCandidates.push(parseMaybeJson(globalThis?.ytcfg?.data_?.INNERTUBE_CONTEXT));
+
+          for (const candidate of contextCandidates) {
+            if (!candidate || typeof candidate !== "object") {
+              continue;
             }
-            const data = await resp.json();
-            const body =
-              data?.actions?.[0]?.updateEngagementPanelAction?.content?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body;
-            const segments =
-              body?.transcriptSegmentListRenderer?.initialSegments ||
-              body?.transcriptSegmentListRenderer?.continuations?.[0]?.reloadContinuationData?.continuation;
-            if (!Array.isArray(segments)) {
-              return null;
+            const client = candidate.client || {};
+            context = context || candidate;
+            if (!clientVersion && typeof client.clientVersion === "string") {
+              clientVersion = client.clientVersion;
             }
-            const lines = [];
-            for (const seg of segments) {
-              const r = seg?.transcriptSegmentRenderer;
-              const text = extractTextFromRuns(r?.snippet || r?.cue || r?.content || r?.text || r);
-              if (text) {
-                lines.push(text);
+            if (!clientName && typeof client.clientName === "string") {
+              clientName = client.clientName;
+            }
+            if (!visitorData && typeof client.visitorData === "string") {
+              visitorData = client.visitorData;
+            }
+            if (!hl && typeof client.hl === "string") {
+              hl = client.hl;
+            }
+            if (!gl && typeof client.gl === "string") {
+              gl = client.gl;
+            }
+          }
+
+          if (!apiKey || !clientVersion || !visitorData || !hl || !gl || !clientName || !context) {
+            const scripts = Array.from(document.getElementsByTagName("script"));
+            for (const s of scripts) {
+              const text = s.textContent || "";
+              if (!text) {
+                continue;
+              }
+              if (!apiKey) {
+                const m1 = text.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+                if (m1) {
+                  apiKey = m1[1];
+                }
+              }
+              if (!clientVersion) {
+                const m2 = text.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+                if (m2) {
+                  clientVersion = m2[1];
+                }
+              }
+              if (!clientName) {
+                const m3 = text.match(/"INNERTUBE_CONTEXT_CLIENT_NAME"\s*:\s*"([^"]+)"/);
+                if (m3) {
+                  clientName = m3[1];
+                }
+              }
+              if (!visitorData) {
+                const m4 = text.match(/"VISITOR_DATA"\s*:\s*"([^"]+)"/);
+                if (m4) {
+                  visitorData = m4[1];
+                }
+              }
+              if (!hl) {
+                const m5 = text.match(/"HL"\s*:\s*"([^"]+)"/);
+                if (m5) {
+                  hl = m5[1];
+                }
+              }
+              if (!gl) {
+                const m6 = text.match(/"GL"\s*:\s*"([^"]+)"/);
+                if (m6) {
+                  gl = m6[1];
+                }
+              }
+              if (!context) {
+                context = parseJsonObjectAfterMarker(text, "\"INNERTUBE_CONTEXT\":");
+              }
+              if (apiKey && clientVersion && visitorData && hl && gl && clientName && context) {
+                break;
               }
             }
-            const transcript = normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
-            if (transcript) {
-              return {
-                ok: true,
-                transcript,
-                debug: { source: "youtubei_get_transcript" }
-              };
-            }
-          } catch (_error) {
-            return null;
           }
-          return null;
+
+          return {
+            apiKey,
+            clientVersion,
+            clientName: String(clientName || "WEB"),
+            visitorData,
+            hl,
+            gl,
+            sessionIndex,
+            delegatedSessionId,
+            loggedIn,
+            context: context && typeof context === "object" ? context : null
+          };
+        };
+
+        const buildInnertubeContext = (innertubeConfig, overrideClientName = "") => {
+          const baseContext = (() => {
+            try {
+              return JSON.parse(JSON.stringify(innertubeConfig?.context || {}));
+            } catch (_error) {
+              return {};
+            }
+          })();
+          const client = baseContext.client && typeof baseContext.client === "object"
+            ? baseContext.client
+            : {};
+          const finalClientName = String(overrideClientName || client.clientName || innertubeConfig?.clientName || "WEB");
+          const finalClientVersion = String(client.clientVersion || innertubeConfig?.clientVersion || "");
+
+          baseContext.client = {
+            ...client,
+            clientName: finalClientName,
+            clientVersion: finalClientVersion
+          };
+
+          if (!baseContext.client.hl && innertubeConfig?.hl) {
+            baseContext.client.hl = innertubeConfig.hl;
+          }
+          if (!baseContext.client.gl && innertubeConfig?.gl) {
+            baseContext.client.gl = innertubeConfig.gl;
+          }
+          if (!baseContext.client.visitorData && innertubeConfig?.visitorData) {
+            baseContext.client.visitorData = innertubeConfig.visitorData;
+          }
+          if (!baseContext.client.clientScreen) {
+            baseContext.client.clientScreen = "WATCH";
+          }
+
+          if (!baseContext.request || typeof baseContext.request !== "object") {
+            baseContext.request = {};
+          }
+          if (typeof baseContext.request.useSsl === "undefined") {
+            baseContext.request.useSsl = true;
+          }
+
+          if (!baseContext.user || typeof baseContext.user !== "object") {
+            baseContext.user = {};
+          }
+          if (innertubeConfig?.delegatedSessionId && !baseContext.user.delegatedSessionId) {
+            baseContext.user.delegatedSessionId = innertubeConfig.delegatedSessionId;
+          }
+          return baseContext;
+        };
+
+        const buildYoutubeiHeaders = (innertubeConfig, requestContext) => {
+          const clientName = String(requestContext?.client?.clientName || innertubeConfig?.clientName || "WEB").toUpperCase();
+          const headers = {
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": CLIENT_NAME_TO_ID[clientName] || "1",
+            "X-YouTube-Client-Version": String(requestContext?.client?.clientVersion || innertubeConfig?.clientVersion || "")
+          };
+          if (innertubeConfig?.visitorData) {
+            headers["X-Goog-Visitor-Id"] = innertubeConfig.visitorData;
+          }
+          if (typeof innertubeConfig?.loggedIn !== "undefined") {
+            headers["X-Youtube-Bootstrap-Logged-In"] = innertubeConfig.loggedIn ? "true" : "false";
+          }
+          if (innertubeConfig?.sessionIndex) {
+            headers["X-Goog-AuthUser"] = innertubeConfig.sessionIndex;
+          }
+          return headers;
+        };
+
+        const getTranscriptParamsCandidates = () => {
+          const results = [];
+          const seen = new Set();
+          const pushCandidate = (params, source) => {
+            const value = String(params || "").trim();
+            if (!value || seen.has(value)) {
+              return;
+            }
+            seen.add(value);
+            results.push({ params: value, source });
+          };
+
+          const initialDataCandidates = [
+            { value: globalThis.ytInitialData, source: "ytInitialData" },
+            { value: parseMaybeJson(globalThis?.ytcfg?.data_?.INITIAL_DATA), source: "ytcfg.data_.INITIAL_DATA" }
+          ];
+          if (typeof globalThis?.ytcfg?.get === "function") {
+            initialDataCandidates.push({ value: parseMaybeJson(globalThis.ytcfg.get("INITIAL_DATA")), source: "ytcfg.get(INITIAL_DATA)" });
+            initialDataCandidates.push({ value: parseMaybeJson(globalThis.ytcfg.get("ytInitialData")), source: "ytcfg.get(ytInitialData)" });
+          }
+
+          for (const candidate of initialDataCandidates) {
+            const root = candidate.value;
+            if (!root || typeof root !== "object") {
+              continue;
+            }
+            const endpoints = findValuesByKey(root, "getTranscriptEndpoint");
+            for (const endpoint of endpoints) {
+              pushCandidate(endpoint?.params, candidate.source);
+            }
+          }
+
+          const scripts = Array.from(document.getElementsByTagName("script"));
+          for (const s of scripts) {
+            const text = s.textContent || "";
+            if (!text.includes("getTranscriptEndpoint")) {
+              continue;
+            }
+            for (const match of text.matchAll(/"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"/g)) {
+              pushCandidate(match[1], "inline_script");
+            }
+          }
+
+          return results;
+        };
+
+        const extractTranscriptFromYoutubeiData = (data) => {
+          const renderers = findValuesByKey(data, "transcriptSegmentListRenderer");
+          const lines = [];
+
+          for (const renderer of renderers) {
+            const segments = Array.isArray(renderer?.initialSegments)
+              ? renderer.initialSegments
+              : Array.isArray(renderer?.segments)
+                ? renderer.segments
+                : [];
+            for (const segment of segments) {
+              const transcriptRenderer = segment?.transcriptSegmentRenderer || segment || {};
+              const text = extractTextFromRuns(
+                transcriptRenderer.snippet ||
+                transcriptRenderer.cue ||
+                transcriptRenderer.content ||
+                transcriptRenderer.text ||
+                transcriptRenderer
+              );
+              if (!text || isLikelyTranscriptTimestamp(text)) {
+                continue;
+              }
+              lines.push(text);
+            }
+          }
+
+          return normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+        };
+
+        const fetchInnertubeJson = async (endpointName, innertubeConfig, requestContext, requestBody) => {
+          const url = new URL(`/youtubei/v1/${endpointName}`, location.origin);
+          url.searchParams.set("prettyPrint", "false");
+          if (innertubeConfig?.apiKey) {
+            url.searchParams.set("key", innertubeConfig.apiKey);
+          }
+
+          const response = await fetch(url.toString(), {
+            method: "POST",
+            headers: buildYoutubeiHeaders(innertubeConfig, requestContext),
+            body: JSON.stringify(requestBody),
+            credentials: "same-origin",
+            cache: "no-store"
+          });
+
+          const rawText = await response.text();
+          let data = null;
+          try {
+            data = rawText ? JSON.parse(rawText) : null;
+          } catch (_error) {
+            data = null;
+          }
+
+          return {
+            ok: response.ok,
+            status: response.status,
+            data,
+            bodyPreview: normalizeWhitespace(rawText).slice(0, 240)
+          };
+        };
+
+        const fetchTranscriptViaYoutubei = async () => {
+          const innertubeConfig = getInnertubeConfig();
+          const paramsCandidates = getTranscriptParamsCandidates();
+          const debugTrace = [];
+
+          if (!innertubeConfig.apiKey) {
+            debugTrace.push("youtubei_missing_api_key");
+          }
+          if (!innertubeConfig.clientVersion) {
+            debugTrace.push("youtubei_missing_client_version");
+          }
+          if (!paramsCandidates.length) {
+            debugTrace.push("youtubei_missing_transcript_params");
+          }
+          if (!innertubeConfig.apiKey || !innertubeConfig.clientVersion || !paramsCandidates.length) {
+            return {
+              ok: false,
+              error: "youtubei_prerequisites_missing",
+              debug: {
+                source: "youtubei_get_transcript",
+                trace: debugTrace
+              }
+            };
+          }
+
+          const contextCandidates = [];
+          const contextSeen = new Set();
+          const pushContext = (clientName) => {
+            const context = buildInnertubeContext(innertubeConfig, clientName);
+            const signature = `${String(context?.client?.clientName || "")}|${String(context?.client?.clientVersion || "")}`;
+            if (!context?.client?.clientVersion || contextSeen.has(signature)) {
+              return;
+            }
+            contextSeen.add(signature);
+            contextCandidates.push(context);
+          };
+          pushContext("");
+          pushContext("WEB");
+          pushContext("MWEB");
+
+          for (const candidate of paramsCandidates.slice(0, 4)) {
+            for (const requestContext of contextCandidates) {
+              const clientName = String(requestContext?.client?.clientName || "WEB");
+              try {
+                const response = await fetchInnertubeJson(
+                  "get_transcript",
+                  innertubeConfig,
+                  requestContext,
+                  {
+                    context: requestContext,
+                    params: candidate.params
+                  }
+                );
+                if (!response.ok) {
+                  debugTrace.push(`youtubei_http_${response.status}:client=${clientName}:source=${candidate.source}:body=${response.bodyPreview || "empty"}`);
+                  continue;
+                }
+                const transcript = extractTranscriptFromYoutubeiData(response.data);
+                if (transcript) {
+                  return {
+                    ok: true,
+                    transcript,
+                    debug: {
+                      source: "youtubei_get_transcript",
+                      clientName,
+                      paramsSource: candidate.source,
+                      trace: debugTrace
+                    }
+                  };
+                }
+                debugTrace.push(`youtubei_empty_segments:client=${clientName}:source=${candidate.source}`);
+              } catch (error) {
+                debugTrace.push(`youtubei_exception:client=${clientName}:source=${candidate.source}:error=${String(error?.message || error || "unknown")}`);
+              }
+            }
+          }
+
+          const videoId = getYoutubeVideoId();
+          if (videoId) {
+            for (const requestContext of contextCandidates) {
+              const clientName = String(requestContext?.client?.clientName || "WEB");
+              try {
+                const playerResponse = await fetchInnertubeJson(
+                  "player",
+                  innertubeConfig,
+                  requestContext,
+                  {
+                    context: requestContext,
+                    videoId,
+                    contentCheckOk: true,
+                    racyCheckOk: true
+                  }
+                );
+                if (!playerResponse.ok) {
+                  debugTrace.push(`player_http_${playerResponse.status}:client=${clientName}:body=${playerResponse.bodyPreview || "empty"}`);
+                  continue;
+                }
+                const playerTracks = normalizeCaptionTracks(
+                  playerResponse?.data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+                );
+                if (!playerTracks.length) {
+                  debugTrace.push(`player_no_tracks:client=${clientName}`);
+                  continue;
+                }
+                for (const track of playerTracks) {
+                  const transcript = await (async () => {
+                    const baseUrl = String(track?.baseUrl || "").trim();
+                    if (!baseUrl) {
+                      return "";
+                    }
+                    const candidates = [];
+                    try {
+                      const jsonUrl = new URL(baseUrl);
+                      jsonUrl.searchParams.set("fmt", "json3");
+                      candidates.push(jsonUrl.toString());
+                    } catch (_error) {
+                      // Ignore malformed URL and try the original one.
+                    }
+                    candidates.push(baseUrl);
+                    for (const candidateUrl of candidates) {
+                      try {
+                        const captionResp = await fetch(candidateUrl, {
+                          method: "GET",
+                          credentials: "same-origin",
+                          cache: "no-store"
+                        });
+                        if (!captionResp.ok) {
+                          continue;
+                        }
+                        const rawText = await captionResp.text();
+                        const trimmed = rawText.trim();
+                        if (!trimmed) {
+                          continue;
+                        }
+                        try {
+                          if (trimmed.startsWith("{")) {
+                            return parseYouTubeJsonTranscript(JSON.parse(trimmed));
+                          }
+                        } catch (_error) {
+                          // Continue to XML/VTT parsers below.
+                        }
+                        return parseYouTubeXmlTranscript(trimmed) || parseYouTubeVttTranscript(trimmed);
+                      } catch (_error) {
+                        // Continue to the next caption URL candidate.
+                      }
+                    }
+                    return "";
+                  })();
+                  if (transcript) {
+                    return {
+                      ok: true,
+                      transcript,
+                      debug: {
+                        source: "youtubei_player_caption_track",
+                        clientName,
+                        languageCode: String(track?.languageCode || ""),
+                        trace: debugTrace
+                      }
+                    };
+                  }
+                }
+                debugTrace.push(`player_tracks_unreadable:client=${clientName}`);
+              } catch (error) {
+                debugTrace.push(`player_exception:client=${clientName}:error=${String(error?.message || error || "unknown")}`);
+              }
+            }
+          }
+
+          return {
+            ok: false,
+            error: "youtubei_get_transcript_failed",
+            debug: {
+              source: "youtubei_get_transcript",
+              trace: debugTrace
+            }
+          };
         };
 
         const getInlineTranscript = () => {
@@ -1478,6 +2308,234 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
           return "";
         };
 
+        const getSearchRoots = () => {
+          const roots = [document];
+          const queue = [document];
+          const seen = new Set([document]);
+          while (queue.length) {
+            const root = queue.shift();
+            const elements = root.querySelectorAll ? Array.from(root.querySelectorAll("*")) : [];
+            for (const element of elements) {
+              if (element.shadowRoot && !seen.has(element.shadowRoot)) {
+                seen.add(element.shadowRoot);
+                roots.push(element.shadowRoot);
+                queue.push(element.shadowRoot);
+              }
+            }
+          }
+          return roots;
+        };
+
+        const querySelectorAllDeep = (selector) => {
+          const results = [];
+          const seen = new Set();
+          for (const root of getSearchRoots()) {
+            const nodes = root.querySelectorAll ? Array.from(root.querySelectorAll(selector)) : [];
+            for (const node of nodes) {
+              if (!seen.has(node)) {
+                seen.add(node);
+                results.push(node);
+              }
+            }
+          }
+          return results;
+        };
+
+        const querySelectorDeep = (selector) => querySelectorAllDeep(selector)[0] || null;
+
+        const isVisibleElement = (node) => {
+          if (!node) {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          const style = globalThis.getComputedStyle(node);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        };
+
+        const cleanTranscriptLine = (line) => {
+          let normalized = normalizeWhitespace(line);
+          if (!normalized) {
+            return "";
+          }
+          // New transcript-segment-view-model nodes often flatten timestamp + duration + content into one line.
+          for (let i = 0; i < 2; i += 1) {
+            normalized = normalizeWhitespace(
+              normalized
+                .replace(/^(?:\d{1,2}:)?\d{1,2}:\d{2}\s*/i, "")
+                .replace(/^(?:\d+\s*(?:hours?|hour|hrs?|hr|小时)\s*)?(?:\d+\s*(?:minutes?|minute|mins?|min|分钟)\s*)?(?:\d+\s*(?:seconds?|second|secs?|sec|秒钟|秒))\s*/i, "")
+            );
+          }
+          if (!normalized || isLikelyTranscriptTimestamp(normalized)) {
+            return "";
+          }
+          const lower = normalized.toLowerCase();
+          const skipFragments = [
+            "show transcript",
+            "open transcript",
+            "search in video",
+            "在视频中搜索",
+            "转写文稿",
+            "内容转文字",
+            "文字稿",
+            "转录稿"
+          ];
+          if (skipFragments.some((fragment) => lower === fragment || lower.includes(fragment))) {
+            return "";
+          }
+          if (
+            /^\d+\s*(seconds?|second|secs?|sec|秒钟|秒)$/.test(lower) ||
+            /^(?:\d+\s*(?:hours?|hour|hrs?|hr|小时)\s*)?(?:\d+\s*(?:minutes?|minute|mins?|min|分钟)\s*)?(?:\d+\s*(?:seconds?|second|secs?|sec|秒钟|秒))$/.test(lower)
+          ) {
+            return "";
+          }
+          return normalized;
+        };
+
+        const extractTranscriptFromVisiblePanel = () => {
+          const segmentSelectors = [
+            "ytd-transcript-segment-renderer .segment-text",
+            "ytd-transcript-segment-renderer .cue",
+            "ytd-transcript-segment-renderer yt-formatted-string",
+            "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] ytd-transcript-segment-renderer yt-formatted-string",
+            "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] .segment-text",
+            "ytd-engagement-panel-section-list-renderer[target-id*='transcript'] .cue",
+            "transcript-segment-view-model .segment-text",
+            "transcript-segment-view-model [role='button']",
+            "ytd-transcript-segment-renderer",
+            "transcript-segment-view-model"
+          ];
+          const lines = [];
+          for (const selector of segmentSelectors) {
+            const nodes = querySelectorAllDeep(selector);
+            if (!nodes.length) {
+              continue;
+            }
+            for (const node of nodes) {
+                const tagName = String(node?.tagName || "").toLowerCase();
+                const rawText = normalizeWhitespace(node.innerText || node.textContent || "");
+                if (!rawText) {
+                  continue;
+                }
+                const shouldRequireVisible = !tagName.includes("transcript-segment-view-model");
+                if (shouldRequireVisible && !isVisibleElement(node)) {
+                continue;
+              }
+                const cleaned = cleanTranscriptLine(rawText);
+              if (cleaned) {
+                lines.push(cleaned);
+              }
+            }
+            if (lines.length > 5) {
+              break;
+            }
+          }
+          const directResult = normalizeWhitespace(dedupeTranscriptLines(lines).join("\n"));
+          if (directResult.length > 20) {
+            return directResult;
+          }
+
+          const panel = querySelectorDeep([
+            "ytd-transcript-search-panel-renderer",
+            "ytd-engagement-panel-section-list-renderer[target-id*='transcript']",
+            "ytd-engagement-panel-section-list-renderer[target-id='PAmodern_transcript_view']"
+          ].join(", "));
+          if (!panel || !isVisibleElement(panel)) {
+            return "";
+          }
+          const rawLines = normalizeWhitespace(panel.innerText || panel.textContent || "")
+            .split("\n")
+            .map((line) => cleanTranscriptLine(line))
+            .filter(Boolean);
+          return normalizeWhitespace(dedupeTranscriptLines(rawLines).join("\n"));
+        };
+
+        const findClickableByText = (patterns) => {
+          const nodes = querySelectorAllDeep('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer');
+          for (const node of nodes) {
+            const text = normalizeWhitespace(node.textContent || "").toLowerCase();
+            if (!text) {
+              continue;
+            }
+            if (patterns.some((pattern) => text.includes(pattern))) {
+              return node.closest('button, [role="button"], tp-yt-paper-item, ytd-menu-service-item-renderer') || node;
+            }
+          }
+          return null;
+        };
+
+        const findYouTubeMoreActionsButton = () => {
+          const candidates = querySelectorAllDeep("button, [role='button']");
+          const labels = ["more actions", "更多操作", "更多", "actions"];
+          for (const node of candidates) {
+            const aria = String(node.getAttribute("aria-label") || "").toLowerCase();
+            const title = String(node.getAttribute("title") || "").toLowerCase();
+            const tooltip = String(node.getAttribute("data-tooltip-text") || "").toLowerCase();
+            const text = normalizeWhitespace(node.textContent || "").toLowerCase();
+            const joined = [aria, title, tooltip, text].join(" | ");
+            if (!joined) {
+              continue;
+            }
+            if (!labels.some((label) => joined.includes(label))) {
+              continue;
+            }
+            if (joined.includes("download") || joined.includes("下载") || joined.includes("premium")) {
+              continue;
+            }
+            if (isVisibleElement(node)) {
+              return node;
+            }
+          }
+          return null;
+        };
+
+        const clickNode = async (node) => {
+          if (!node) {
+            return false;
+          }
+          node.click();
+          await new Promise((resolve) => globalThis.setTimeout(resolve, 800));
+          return true;
+        };
+
+        const ensureTranscriptPanelVisible = async () => {
+          if (extractTranscriptFromVisiblePanel()) {
+            return { ok: true, autoOpened: false };
+          }
+          const transcriptPatterns = [
+            "show transcript",
+            "open transcript",
+            "transcript",
+            "显示文字稿",
+            "显示转录稿",
+            "转录稿",
+            "文字稿",
+            "转写文稿",
+            "内容转文字"
+          ];
+          const directButton = findClickableByText(transcriptPatterns);
+          if (await clickNode(directButton)) {
+            for (let i = 0; i < 16; i += 1) {
+              await new Promise((resolve) => globalThis.setTimeout(resolve, 1000));
+              if (extractTranscriptFromVisiblePanel()) {
+                return { ok: true, autoOpened: true, path: "direct_button" };
+              }
+            }
+          }
+          const moreActionsButton = findYouTubeMoreActionsButton();
+          if (await clickNode(moreActionsButton)) {
+            const menuTranscriptButton = findClickableByText(transcriptPatterns);
+            if (await clickNode(menuTranscriptButton)) {
+              for (let i = 0; i < 16; i += 1) {
+                await new Promise((resolve) => globalThis.setTimeout(resolve, 1000));
+                if (extractTranscriptFromVisiblePanel()) {
+                  return { ok: true, autoOpened: true, path: "more_actions_menu" };
+                }
+              }
+            }
+          }
+          return { ok: false, autoOpened: false, path: "none" };
+        };
+
         const tracks = getCaptionTracks();
         const extractionTrace = [];
         if (!tracks.length) {
@@ -1499,13 +2557,19 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         // Try youtubei get_transcript first to bypass empty timedtext responses
         {
           const ytai = await fetchTranscriptViaYoutubei();
+          if (Array.isArray(ytai?.debug?.trace)) {
+            extractionTrace.push(...ytai.debug.trace);
+          }
           if (ytai && ytai.ok && ytai.transcript) {
             return {
               ok: true,
               transcript: ytai.transcript,
               debug: {
                 trackCount: tracks.length,
-                source: "youtubei_get_transcript"
+                source: String(ytai?.debug?.source || "youtubei_get_transcript"),
+                clientName: String(ytai?.debug?.clientName || ""),
+                paramsSource: String(ytai?.debug?.paramsSource || ""),
+                trace: extractionTrace
               }
             };
           }
@@ -1592,6 +2656,24 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         }
         extractionTrace.push("No transcript extracted from ytInitialData cueGroups fallback");
 
+        const panelVisibilityResult = await ensureTranscriptPanelVisible();
+        extractionTrace.push(`transcript_panel_visible=${panelVisibilityResult.ok}:autoOpened=${panelVisibilityResult.autoOpened}:path=${String(panelVisibilityResult.path || "")}`);
+        const panelTranscript = extractTranscriptFromVisiblePanel();
+        if (panelTranscript) {
+          extractionTrace.push(`transcript_panel_dom_chars=${panelTranscript.length}`);
+          extractionTrace.push("Recovered transcript from transcript panel DOM");
+          return {
+            ok: true,
+            transcript: panelTranscript,
+            debug: {
+              trackCount: tracks.length,
+              source: "main_world_transcript_panel_dom",
+              trace: extractionTrace
+            }
+          };
+        }
+        extractionTrace.push("No transcript extracted from transcript panel DOM");
+
         return {
           ok: false,
           error: "main_world_caption_fetch_failed",
@@ -1602,9 +2684,22 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
         };
       }
     });
-    return injectionResult?.result || null;
-  } catch (_error) {
-    return null;
+    return injectionResult?.result || {
+      ok: false,
+      error: "main_world_empty_injection_result",
+      debug: {
+        tabId
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: "main_world_execute_script_failed",
+      debug: {
+        tabId,
+        message: String(error?.message || error || "unknown")
+      }
+    };
   }
 }
 
@@ -1631,7 +2726,6 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
   const matchedTab = await findMatchingYouTubeTab(sourceUrlText);
   const attempts = [];
   let contentResult = null;
-  let tempTabResult = null;
 
   if (matchedTab?.id) {
     attempts.push({
@@ -1656,28 +2750,6 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
       });
     }
 
-    const rawContentResult = await extractTranscriptViaContentScriptTab(matchedTab.id);
-    addLogs(rawContentResult, "matched_tab_content_script");
-    contentResult = normalizePluginExtractionResult(
-      rawContentResult,
-      "content_script_extract"
-    );
-    attempts.push({
-      stage: "matched_tab_content_script",
-      ok: Boolean(contentResult?.ok),
-      error: contentResult?.ok ? "" : String(rawContentResult?.error || "content_script_extract_failed"),
-      reason: String(rawContentResult?.detection?.reason || "")
-    });
-    if (contentResult?.ok) {
-      return {
-        ...contentResult,
-        detection: {
-          ...contentResult.detection,
-          extractionLogs: allExtractionLogs
-        }
-      };
-    }
-
     const mainWorldResult = await extractYouTubeTranscriptViaMainWorldTab(matchedTab.id);
     addLogs(mainWorldResult, "matched_tab_main_world");
     attempts.push({
@@ -1700,34 +2772,34 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
         }
       };
     }
+
+    const rawContentResult = await extractTranscriptViaContentScriptTab(matchedTab.id);
+    addLogs(rawContentResult, "matched_tab_content_script");
+    contentResult = normalizePluginExtractionResult(
+      rawContentResult,
+      "content_script_extract"
+    );
+    attempts.push({
+      stage: "matched_tab_content_script",
+      ok: Boolean(contentResult?.ok),
+      error: contentResult?.ok ? "" : String(rawContentResult?.error || "content_script_extract_failed"),
+      reason: String(rawContentResult?.detection?.reason || "")
+    });
+    if (contentResult?.ok) {
+      return {
+        ...contentResult,
+        detection: {
+          ...contentResult.detection,
+          extractionLogs: allExtractionLogs
+        }
+      };
+    }
   } else {
     attempts.push({
       stage: "matched_tab_found",
       ok: false,
       error: "no_matching_tab"
     });
-  }
-
-  const tempTabRawResult = await extractYouTubeTranscriptViaTemporaryTab(sourceUrlText);
-  addLogs(tempTabRawResult, "temp_tab_content_script");
-  const normalizedTempTabResult = normalizePluginExtractionResult(
-    tempTabRawResult,
-    "temp_tab_content_script_extract"
-  );
-  attempts.push({
-    stage: "temp_tab_content_script",
-    ok: Boolean(normalizedTempTabResult?.ok),
-    error: normalizedTempTabResult?.ok ? "" : String(tempTabRawResult?.error || "temp_tab_content_script_extract_failed"),
-    reason: String(tempTabRawResult?.detection?.reason || "")
-  });
-  if (normalizedTempTabResult?.ok) {
-    return {
-      ...normalizedTempTabResult,
-      detection: {
-        ...normalizedTempTabResult.detection,
-        extractionLogs: allExtractionLogs
-      }
-    };
   }
 
   const tempTabMainWorldResult = await extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrlText);
@@ -1747,6 +2819,28 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl) {
         confidence: 0.99,
         reason: "temp_tab_main_world_caption_fetch",
         canFallbackToLocal: false,
+        extractionLogs: allExtractionLogs
+      }
+    };
+  }
+
+  const tempTabRawResult = await extractYouTubeTranscriptViaTemporaryTab(sourceUrlText);
+  addLogs(tempTabRawResult, "temp_tab_content_script");
+  const normalizedTempTabResult = normalizePluginExtractionResult(
+    tempTabRawResult,
+    "temp_tab_content_script_extract"
+  );
+  attempts.push({
+    stage: "temp_tab_content_script",
+    ok: Boolean(normalizedTempTabResult?.ok),
+    error: normalizedTempTabResult?.ok ? "" : String(tempTabRawResult?.error || "temp_tab_content_script_extract_failed"),
+    reason: String(tempTabRawResult?.detection?.reason || "")
+  });
+  if (normalizedTempTabResult?.ok) {
+    return {
+      ...normalizedTempTabResult,
+      detection: {
+        ...normalizedTempTabResult.detection,
         extractionLogs: allExtractionLogs
       }
     };

@@ -275,7 +275,18 @@
   }
 
   function cleanTranscriptLine(line) {
-    const normalized = normalizeWhitespace(line);
+    let normalized = normalizeWhitespace(line);
+    if (!normalized) {
+      return "";
+    }
+    // New transcript-segment-view-model nodes often flatten timestamp + duration + content into one line.
+    for (let i = 0; i < 2; i += 1) {
+      normalized = normalizeWhitespace(
+        normalized
+          .replace(/^(?:\d{1,2}:)?\d{1,2}:\d{2}\s*/i, "")
+          .replace(/^(?:\d+\s*(?:hours?|hour|hrs?|hr|小时)\s*)?(?:\d+\s*(?:minutes?|minute|mins?|min|分钟)\s*)?(?:\d+\s*(?:seconds?|second|secs?|sec|秒钟|秒))\s*/i, "")
+      );
+    }
     if (!normalized) {
       return "";
     }
@@ -328,15 +339,21 @@
 
     const lines = [];
     for (const node of nodes) {
-      if (!isVisibleElement(node)) {
+      const tagName = String(node?.tagName || "").toLowerCase();
+      const rawText = node.innerText || node.textContent || "";
+      if (!normalizeWhitespace(rawText)) {
+        continue;
+      }
+      const shouldRequireVisible = !tagName.includes("transcript-segment-view-model");
+      if (shouldRequireVisible && !isVisibleElement(node)) {
         continue;
       }
 
       // 优先抓取特定的文本类或属性
       const textContainer = node.querySelector(".segment-text, .cue, [role='button'], yt-formatted-string, span");
-      const rawText = textContainer ? textContainer.innerText : (node.innerText || node.textContent);
+      const extractedRawText = textContainer ? textContainer.innerText : rawText;
       
-      const rawLines = normalizeWhitespace(rawText || "")
+      const rawLines = normalizeWhitespace(extractedRawText || "")
         .split("\n")
         .map((line) => normalizeWhitespace(line))
         .filter(Boolean);
@@ -1325,7 +1342,7 @@
     return true;
   });
 
-  const handledPageFlowRequests = new Set();
+  const pageFlowRequestStates = new Map();
 
   function replyEnvelope(requestId, replyPayload) {
     return {
@@ -1375,10 +1392,42 @@
 
   function handlePageFlowRequest(requestId, payload, targetWindow, receivedStage) {
     const normalizedRequestId = String(requestId || "").trim();
-    if (!normalizedRequestId || handledPageFlowRequests.has(normalizedRequestId)) {
+    if (!normalizedRequestId) {
       return;
     }
-    handledPageFlowRequests.add(normalizedRequestId);
+
+    const existingState = pageFlowRequestStates.get(normalizedRequestId);
+    if (existingState) {
+      if (existingState.replyPayload && typeof existingState.replyPayload === "object") {
+        const replayPayload = {
+          ...existingState.replyPayload,
+          debug: {
+            ...((existingState.replyPayload.debug && typeof existingState.replyPayload.debug === "object")
+              ? existingState.replyPayload.debug
+              : {}),
+            attempts: [
+              {
+                stage: receivedStage,
+                ok: true,
+                requestId: normalizedRequestId,
+                sourceUrl: String(payload?.sourceUrl || "").trim(),
+                duplicateRequest: true
+              },
+              {
+                stage: "content_script_replay_cached_reply",
+                ok: true
+              },
+              ...((Array.isArray(existingState.replyPayload?.debug?.attempts)
+                ? existingState.replyPayload.debug.attempts
+                : []).filter(Boolean))
+            ]
+          }
+        };
+        postReplyToKnownWindows(normalizedRequestId, replayPayload, targetWindow);
+        writePageFlowStorageResponse(normalizedRequestId, replayPayload);
+      }
+      return;
+    }
 
     const attempts = [
       {
@@ -1388,6 +1437,11 @@
         sourceUrl: String(payload?.sourceUrl || "").trim()
       }
     ];
+    pageFlowRequestStates.set(normalizedRequestId, {
+      requestId: normalizedRequestId,
+      sourceUrl: String(payload?.sourceUrl || "").trim(),
+      replyPayload: null
+    });
 
     attempts.push({
       stage: "content_script_send_runtime_message",
@@ -1447,6 +1501,11 @@
             ...((Array.isArray(replyPayload.debug.attempts) ? replyPayload.debug.attempts : []).filter(Boolean))
           ];
         }
+        pageFlowRequestStates.set(normalizedRequestId, {
+          requestId: normalizedRequestId,
+          sourceUrl: String(payload?.sourceUrl || "").trim(),
+          replyPayload
+        });
         writePageFlowStorageResponse(normalizedRequestId, replyPayload);
       }
     );
@@ -1582,8 +1641,8 @@
       "内容转文字"
     ]);
     if (await clickNode(directTranscriptButton)) {
-      for (let i = 0; i < 5; i += 1) {
-        await sleep(800);
+      for (let i = 0; i < 16; i += 1) {
+        await sleep(1000);
         if (extractYouTubeTranscript()) {
           return { ok: true, autoOpened: true };
         }
@@ -1603,8 +1662,8 @@
         "内容转文字"
       ]);
       if (await clickNode(menuTranscriptButton)) {
-        for (let i = 0; i < 6; i += 1) {
-          await sleep(900);
+        for (let i = 0; i < 16; i += 1) {
+          await sleep(1000);
           if (extractYouTubeTranscript()) {
             return { ok: true, autoOpened: true };
           }
@@ -1620,8 +1679,8 @@
       "转录稿"
     ]);
     if (await clickNode(transcriptTabButton)) {
-      for (let i = 0; i < 6; i += 1) {
-        await sleep(700);
+      for (let i = 0; i < 16; i += 1) {
+        await sleep(1000);
         if (extractYouTubeTranscript()) {
           return { ok: true, autoOpened: true };
         }

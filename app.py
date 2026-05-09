@@ -419,7 +419,7 @@ def request_extension_summarize_flow(
         action="requestExtensionSummarize",
         sourceUrl=source_url,
         requestId=request_id,
-        timeoutMs=60000,
+        timeoutMs=150000,
         height=0,
         key=component_key,
         default=None,
@@ -1771,6 +1771,15 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
     normalized_video_bridge_payload = normalize_extension_bridge_payload(video_bridge_payload)
     video_bridge_transcript = str(normalized_video_bridge_payload.get("transcript_text") or "").strip()
     if video_bridge_transcript:
+        print(
+            "VideoBridgePayloadReceived: "
+            f"payload_id={str(normalized_video_bridge_payload.get('payload_id') or video_extension_payload_id).strip()}, "
+            f"request_id={str(normalized_video_bridge_payload.get('request_id') or '').strip()}, "
+            f"source_url={str(normalized_video_bridge_payload.get('source_url') or '').strip()}, "
+            f"transcript_len={len(video_bridge_transcript)}, "
+            f"source_type={str(normalized_video_bridge_payload.get('source_type') or '').strip()}, "
+            f"text_source_reason={str(normalized_video_bridge_payload.get('text_source_reason') or '').strip()}"
+        , flush=True)
         st.session_state.transcript_text = video_bridge_transcript
         st.session_state.summary_text = ""
         st.session_state.whisper_device_tag = ""
@@ -1881,6 +1890,7 @@ def internal_summarize(
     api_key_override=None,
     base_url_override=None,
     proxy_override=None,
+    enable_fact_check=True,
 ):
         """
         核心总结逻辑，返回 (summary_text, error_msg)
@@ -1893,6 +1903,13 @@ def internal_summarize(
         if not eff_api_key:
             return None, "请在侧边栏填写 API Key"
         try:
+            print(
+                "InternalSummarize: "
+                f"text_len={len(str(text or ''))}, "
+                f"summary_model={summary_model_name}, "
+                f"fact_check_model={fact_check_model_name}, "
+                f"enable_fact_check={bool(enable_fact_check)}"
+            , flush=True)
             summary = summarize_text(
                 text,
                 eff_api_key,
@@ -1900,6 +1917,7 @@ def internal_summarize(
                 summary_model_name,
                 eff_proxy,
                 fact_check_model=fact_check_model_name,
+                enable_fact_check=enable_fact_check,
                 stream=False  # 后台任务默认不使用流式
             )
             return summary, None
@@ -2471,12 +2489,21 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
             st.warning("请先抓取字幕")
         return
 
+    print(
+        "VideoSummarySingle: "
+        f"manual={bool(manual)}, "
+        f"url={str(url or '').strip()}, "
+        f"fetch_duration={float(fetch_duration):.2f}, "
+        f"transcript_len={len(str(st.session_state.transcript_text or ''))}, "
+        "enable_fact_check=False"
+    , flush=True)
     t_sum_start = time.time()
     with st.spinner(f"正在请求 AI 总结 ({pipeline_model_label})..."):
         summary, err = internal_summarize(
             st.session_state.transcript_text,
             summary_model_selected,
             fact_check_model_selected,
+            enable_fact_check=False,
         )
 
     sum_duration = time.time() - t_sum_start
@@ -2488,6 +2515,7 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
     }
 
     if err:
+        print(f"VideoSummarySingle: failed error={err}", flush=True)
         st.error(f"总结失败: {err}")
         render_issue_report_box(
             "单视频总结失败",
@@ -2499,6 +2527,12 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         )
         return
 
+    print(
+        "VideoSummarySingle: success "
+        f"url={str(url or '').strip()}, "
+        f"summary_len={len(str(summary or ''))}, "
+        f"duration={sum_duration:.2f}"
+    , flush=True)
     st.session_state.summary_text = summary
     if manual:
         st.success(f"总结完成 | AI生成耗时: {sum_duration:.1f}s")
@@ -2674,7 +2708,7 @@ def try_video_extension_first() -> tuple[str, str, str]:
     if not bool(normalized_result.get("ok")):
         error_text = str(normalized_result.get("error") or "").strip()
         if error_text == "extension_request_timeout":
-            error_text = "extension_request_timeout:bridge_waited_60s_no_plugin_reply"
+            error_text = "extension_request_timeout:bridge_waited_150s_no_plugin_reply"
         helper_text = str(normalized_result.get("helperMessage") or normalized_result.get("helper_message") or "").strip()
         debug_obj = normalized_result.get("debug") if isinstance(normalized_result.get("debug"), dict) else None
         debug_summary = ""
