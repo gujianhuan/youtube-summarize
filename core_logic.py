@@ -4440,21 +4440,42 @@ def fact_check_document_claims(
         return ""
 
     summary_excerpt = clean_document_text(summary_markdown or "")[:2200]
+    claims: list[dict] = []
+    claim_sources: list[dict] = []
     if callable(progress_callback):
         progress_callback(5, "正在抽取关键声明...")
-    claims = extract_key_claims(
-        text=text,
-        summary_markdown=summary_excerpt,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        proxy_url=proxy_url,
-        max_claims=max_claims,
-    )
+    try:
+        claims = extract_key_claims(
+            text=text,
+            summary_markdown=summary_excerpt,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            proxy_url=proxy_url,
+            max_claims=max_claims,
+        )
+    except Exception as exc:
+        print(f"Extract key claims failed: {exc}", flush=True)
+        return _build_fact_check_fallback_markdown()
+
+    if not claims:
+        return _build_fact_check_fallback_markdown()
 
     if callable(progress_callback):
         progress_callback(35, "正在检索外部来源...")
-    claim_sources = search_claim_sources(claims, proxy_url=proxy_url)
+    try:
+        claim_sources = search_claim_sources(claims, proxy_url=proxy_url)
+    except Exception as exc:
+        print(f"Search claim sources failed: {exc}", flush=True)
+        claim_sources = [
+            {
+                "claim": str(item.get("claim") or "").strip(),
+                "queries": list(item.get("queries") or []),
+                "search_markdown": "",
+            }
+            for item in claims
+            if str(item.get("claim") or "").strip()
+        ]
 
     compiled_sections = []
     for idx, item in enumerate(claim_sources, start=1):
@@ -4469,41 +4490,46 @@ def fact_check_document_claims(
     if callable(progress_callback):
         progress_callback(70, "正在生成逐条核查结果...")
 
-    client = _build_openai_client(api_key, base_url, proxy_url)
-    compiled_claim_text = "\n\n".join(compiled_sections)
-    prompt = (
-        "请根据下面的关键声明与搜索结果，输出逐条事实核查 Markdown。\n"
-        "要求：\n"
-        "- 每条都使用下面结构：\n"
-        "### 条目1\n"
-        "- 关键声明：...\n"
-        "- 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
-        "- 判断依据：\n"
-        "  - 支持/对应的公开信息：...\n"
-        "  - 冲突点或证据不足之处：...\n"
-        "  - 当前判断原因：...\n"
-        "- 待补充核查点：...\n"
-        "- 来源/出处：给出 2-4 个外部来源链接，格式如 [新华社](https://...)\n"
-        "- 如果原文包含多条不同声明，请分别成条输出，不要把多个数字或多个事件揉成一条。\n"
-        "- 如果一条声明涉及数字、时间、机构、排名，请尽量分别说明这些要素是否匹配。\n"
-        "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
-        "- 禁止把文档本身当来源。\n"
-        "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
-        "- 避免使用“手动搜索未发现”“未搜索到”这类空泛表述，改为说明“现有公开候选来源不足以直接支撑该说法”，并保留候选链接。\n"
-        "- 只返回 Markdown，不要 JSON。\n\n"
-        f"文档总结：\n{summary_excerpt}\n\n"
-        f"候选声明与搜索结果：\n{compiled_claim_text}"
-    )
-    response = client.chat.completions.create(
-        model=model.strip() or "gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "你是一个严谨的事实核查助手。请基于外部来源逐条核查关键声明。"},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=2200,
-        temperature=0.15,
-    )
-    content = _extract_completion_content(response).strip()
+    try:
+        client = _build_openai_client(api_key, base_url, proxy_url)
+        compiled_claim_text = "\n\n".join(compiled_sections)
+        prompt = (
+            "请根据下面的关键声明与搜索结果，输出逐条事实核查 Markdown。\n"
+            "要求：\n"
+            "- 每条都使用下面结构：\n"
+            "### 条目1\n"
+            "- 关键声明：...\n"
+            "- 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
+            "- 判断依据：\n"
+            "  - 支持/对应的公开信息：...\n"
+            "  - 冲突点或证据不足之处：...\n"
+            "  - 当前判断原因：...\n"
+            "- 待补充核查点：...\n"
+            "- 来源/出处：给出 2-4 个外部来源链接，格式如 [新华社](https://...)\n"
+            "- 如果原文包含多条不同声明，请分别成条输出，不要把多个数字或多个事件揉成一条。\n"
+            "- 如果一条声明涉及数字、时间、机构、排名，请尽量分别说明这些要素是否匹配。\n"
+            "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
+            "- 禁止把文档本身当来源。\n"
+            "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
+            "- 避免使用“手动搜索未发现”“未搜索到”这类空泛表述，改为说明“现有公开候选来源不足以直接支撑该说法”，并保留候选链接。\n"
+            "- 只返回 Markdown，不要 JSON。\n\n"
+            f"文档总结：\n{summary_excerpt}\n\n"
+            f"候选声明与搜索结果：\n{compiled_claim_text}"
+        )
+        response = client.chat.completions.create(
+            model=model.strip() or "gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "你是一个严谨的事实核查助手。请基于外部来源逐条核查关键声明。"},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=2200,
+            temperature=0.15,
+        )
+        content = _extract_completion_content(response).strip()
+    except Exception as exc:
+        print(f"Generate fact check markdown failed: {exc}", flush=True)
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
+
     if callable(progress_callback):
         progress_callback(100, "关键声明事实核查完成。")
     if not content:
