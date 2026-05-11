@@ -484,6 +484,17 @@ async function extractYouTubeTranscriptViaBackground(sourceUrl) {
 
 function buildYouTubeBackgroundSuccessResponse(baseResponse, fallbackResult, tab) {
   const sourceUrl = baseResponse?.url || tab?.url || "";
+  const detection = fallbackResult?.detection || {};
+  const reason = String(detection.reason || "");
+  const helperMessageByReason = {
+    main_world_caption_fetch: "已通过当前页面播放器上下文直接提取 YouTube 字幕。",
+    temp_tab_main_world_caption_fetch: "已通过临时标签页的播放器上下文补强提取 YouTube 字幕。",
+    temp_tab_content_script_extract: "已通过临时标签页页面结构补强提取 YouTube 字幕。",
+    content_script_extract: "已通过当前页面结构补强提取 YouTube 字幕。",
+    background_caption_fetch: "已通过扩展补强链路提取 YouTube 字幕。",
+    main_world_cuegroups_fallback: "已通过当前页面内嵌 transcript 数据提取 YouTube 字幕。",
+    temp_tab_main_world_extract: "已通过临时标签页播放器数据补强提取 YouTube 字幕。"
+  };
   return {
     ...(baseResponse || {}),
     ok: true,
@@ -491,13 +502,14 @@ function buildYouTubeBackgroundSuccessResponse(baseResponse, fallbackResult, tab
     title: baseResponse?.title || tab?.title || "",
     url: sourceUrl,
     transcript: fallbackResult.transcript,
-    helperMessage: "已通过扩展后台直连 YouTube 字幕接口完成提取。",
+    helperMessage: helperMessageByReason[reason] || "已通过扩展补强链路提取 YouTube 字幕。",
     detection: {
       hasText: true,
-      sourceType: "transcript",
-      confidence: 0.99,
-      reason: "background_caption_fetch",
-      canFallbackToLocal: false
+      sourceType: String(detection.sourceType || "transcript"),
+      confidence: Number(detection.confidence || 0.99),
+      reason: reason || "background_caption_fetch",
+      canFallbackToLocal: false,
+      extractionLogs: Array.isArray(detection.extractionLogs) ? detection.extractionLogs : []
     },
     debug: fallbackResult.debug || {}
   };

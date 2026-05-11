@@ -3047,7 +3047,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
       try {
         const sourceUrl = String(message.url || "");
-        const result = await extractYouTubeTranscriptByUrl(sourceUrl);
+        const result = await extractYouTubeTranscriptForPageFlow(sourceUrl);
         sendResponse(result);
       } catch (error) {
         sendResponse({
