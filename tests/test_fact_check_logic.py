@@ -2,6 +2,7 @@
 
 from core_logic import (
     _build_fact_check_fallback_markdown,
+    _build_heuristic_claim_items,
     _enrich_fact_check_items_with_claim_sources,
     _find_authoritative_sources,
 )
@@ -68,3 +69,24 @@ def test_build_fact_check_fallback_markdown_keeps_more_detail() -> None:
     assert "待补充核查点" in fallback
     assert "https://www.twse.com.tw/en/" in fallback
     assert "https://www.bloomberg.com/" in fallback
+
+
+def test_build_heuristic_claim_items_prefers_specific_summary_claims() -> None:
+    """当模型抽取声明失败时，应尽量从总结要点里提取具体声明而不是退回泛化模板。"""
+
+    summary_md = (
+        "## 核心主题\n"
+        "- 美国政府高级官员称，目前美国境内有超过10万名非法滞留的中国公民。\n"
+        "## 主要内容\n"
+        "- 报道提到美国政府正加强对非法移民与签证逾期滞留问题的执法。\n"
+        "- 视频还提到部分案件与人口走线网络有关。\n"
+    )
+
+    claims = _build_heuristic_claim_items(
+        text=summary_md,
+        summary_markdown=summary_md,
+        max_claims=3,
+    )
+
+    assert claims
+    assert "超过10万名非法滞留的中国公民" in claims[0]["claim"]

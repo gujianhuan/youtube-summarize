@@ -4207,6 +4207,101 @@ def _normalize_fact_check_claim(claim: str) -> str:
     return merged
 
 
+def _extract_claims_from_summary_heuristic(summary_markdown: str, max_claims: int) -> list[dict]:
+    summary_text = clean_document_text(summary_markdown or "")
+    if not summary_text or max_claims <= 0:
+        return []
+
+    candidates: list[tuple[int, str]] = []
+    lines = [line.strip() for line in str(summary_markdown or "").splitlines() if line.strip()]
+    stop_markers = {"核心主题", "主要内容", "关键信息", "结论", "本块要点", "本块关键信息"}
+    news_markers = [
+        "表示", "称", "宣布", "通报", "回应", "指出", "发布", "发生", "遇袭", "逮捕",
+        "选举", "关税", "制裁", "协议", "政策", "政府", "官方", "记者", "报道",
+    ]
+    for raw_line in lines:
+        cleaned_line = re.sub(r"^#+\s*", "", raw_line).strip()
+        cleaned_line = re.sub(r"^[-*•]\s*", "", cleaned_line).strip()
+        cleaned_line = _normalize_fact_check_claim(cleaned_line)
+        if not cleaned_line or cleaned_line in stop_markers:
+            continue
+        if len(cleaned_line) > 140:
+            continue
+        score = 0
+        if re.search(r"\d", cleaned_line):
+            score += 2
+        if any(marker in cleaned_line for marker in news_markers):
+            score += 2
+        if len(cleaned_line) >= 18:
+            score += 1
+        if score > 0:
+            candidates.append((score, cleaned_line))
+
+    seen: set[str] = set()
+    results: list[dict] = []
+    for _score, claim in sorted(candidates, key=lambda item: (-item[0], -len(item[1]))):
+        lowered = claim.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        results.append({"claim": claim, "queries": [claim]})
+        if len(results) >= max_claims:
+            break
+    return results
+
+
+def _extract_claims_from_text_heuristic(text: str, max_claims: int) -> list[dict]:
+    cleaned = clean_document_text(text or "")
+    if not cleaned or max_claims <= 0:
+        return []
+
+    fragments = re.split(r"[。！？\n]+", cleaned)
+    keywords = ["表示", "称", "宣布", "通报", "回应", "政府", "官方", "记者", "报道", "数据显示", "according to", "official"]
+    scored: list[tuple[int, str]] = []
+    for fragment in fragments:
+        claim = _normalize_fact_check_claim(fragment)
+        if not claim or len(claim) < 16 or len(claim) > 150:
+            continue
+        score = 0
+        if re.search(r"\d", claim):
+            score += 2
+        if any(keyword.lower() in claim.lower() for keyword in keywords):
+            score += 2
+        if score > 0:
+            scored.append((score, claim))
+
+    seen: set[str] = set()
+    results: list[dict] = []
+    for _score, claim in sorted(scored, key=lambda item: (-item[0], -len(item[1]))):
+        lowered = claim.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        results.append({"claim": claim, "queries": [claim]})
+        if len(results) >= max_claims:
+            break
+    return results
+
+
+def _build_heuristic_claim_items(text: str, summary_markdown: str, max_claims: int) -> list[dict]:
+    claims = _extract_claims_from_summary_heuristic(summary_markdown, max_claims=max_claims)
+    if len(claims) >= max_claims:
+        return claims[:max_claims]
+
+    supplemental = _extract_claims_from_text_heuristic(text, max_claims=max_claims)
+    seen = {str(item.get("claim") or "").strip().lower() for item in claims}
+    for item in supplemental:
+        claim = str(item.get("claim") or "").strip()
+        lowered = claim.lower()
+        if not claim or lowered in seen:
+            continue
+        seen.add(lowered)
+        claims.append(item)
+        if len(claims) >= max_claims:
+            break
+    return claims[:max_claims]
+
+
 def extract_key_claims(
     text: str,
     summary_markdown: str,
@@ -4220,6 +4315,7 @@ def extract_key_claims(
     cleaned_text = clean_document_text(text)
     excerpt = _build_fact_check_excerpt(cleaned_text, max_chars=7000)
     summary_excerpt = clean_document_text(summary_markdown or "")[:2200]
+    heuristic_claims = _build_heuristic_claim_items(cleaned_text, summary_excerpt, max_claims=max_claims)
     prompt = (
         f"请从下面文档中提取最值得做事实核查的 {max_claims} 条关键声明。\n"
         "要求：\n"
@@ -4240,18 +4336,23 @@ def extract_key_claims(
         f"文档总结：\n{summary_excerpt}\n\n"
         f"文档正文节选：\n{excerpt}"
     )
-    response = client.chat.completions.create(
-        model=model.strip() or "gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "你是一个事实核查分析助手。请只返回合法 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=1000,
-        temperature=0.1,
-    )
-    content = _extract_completion_content(response)
-    claims = _extract_claim_items(content, max_claims=max_claims)
+    try:
+        response = client.chat.completions.create(
+            model=model.strip() or "gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "你是一个事实核查分析助手。请只返回合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=1000,
+            temperature=0.1,
+        )
+        content = _extract_completion_content(response)
+        claims = _extract_claim_items(content, max_claims=max_claims)
+    except Exception:
+        claims = []
+    if not claims:
+        claims = heuristic_claims
     if not claims:
         raise RuntimeError("未能从文档中提取到可核查的关键声明。")
     return claims

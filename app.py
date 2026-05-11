@@ -49,8 +49,10 @@ BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
 BRIDGE_API_URL = str(os.environ.get("BRIDGE_API_URL", "https://youtube-summarize-bridge.onrender.com") or "").strip().rstrip("/")
 BRIDGE_API_TOKEN = str(os.environ.get("BRIDGE_API_TOKEN", "") or "").strip()
-DEFAULT_SUMMARY_MODEL = "Pro/MiniMaxAI/MiniMax-M2.5"
-DEFAULT_FACT_CHECK_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+LEGACY_DEFAULT_SUMMARY_MODEL = "Pro/MiniMaxAI/MiniMax-M2.5"
+LEGACY_DEFAULT_FACT_CHECK_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+DEFAULT_SUMMARY_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+DEFAULT_FACT_CHECK_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 
 extension_bridge_reader = components.declare_component(
     "extension_bridge_reader",
@@ -132,6 +134,17 @@ def _looks_like_siliconflow_base_url(base_url_value: str) -> bool:
     return "siliconflow" in lowered
 
 
+def _remap_siliconflow_legacy_model(model_value: str, fallback_value: str) -> str:
+    model_text = str(model_value or "").strip()
+    if not model_text:
+        return str(fallback_value or "").strip()
+    legacy_map = {
+        LEGACY_DEFAULT_SUMMARY_MODEL: DEFAULT_SUMMARY_MODEL,
+        LEGACY_DEFAULT_FACT_CHECK_MODEL: DEFAULT_FACT_CHECK_MODEL,
+    }
+    return legacy_map.get(model_text, model_text)
+
+
 def resolve_pipeline_models(
     settings_dict: dict | None = None,
     *,
@@ -158,6 +171,9 @@ def resolve_pipeline_models(
         or str(settings_dict.get("fact_check_model") or "").strip()
         or default_fact_check_model
     )
+    if _looks_like_siliconflow_base_url(base_url_value):
+        summary_model = _remap_siliconflow_legacy_model(summary_model, DEFAULT_SUMMARY_MODEL)
+        fact_check_model = _remap_siliconflow_legacy_model(fact_check_model, DEFAULT_FACT_CHECK_MODEL)
     return summary_model, fact_check_model
 
 
@@ -1711,6 +1727,7 @@ if "available_models" not in st.session_state:
         "gpt-3.5-turbo",
         "gpt-4o",
         "gpt-4-turbo",
+        "deepseek-ai/DeepSeek-V4-Flash",
         "deepseek-chat",
         "deepseek-reasoner",
         "qwen-plus",
