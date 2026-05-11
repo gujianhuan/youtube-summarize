@@ -3265,7 +3265,6 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
         st.session_state.summary_text = ""
         st.session_state.whisper_device_tag = ""
         st.session_state.current_video_url = str(manual_source_url or "").strip()
-        st.session_state.input_url = str(manual_source_url or "").strip()
         reset_video_fact_check_state()
         if current_payload_id:
             st.session_state.manual_last_payload_id = current_payload_id
