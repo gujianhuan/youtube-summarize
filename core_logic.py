@@ -4381,7 +4381,7 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
     event_hits = sum(1 for marker in event_markers if marker in combined)
     hard_fact_hits = sum(1 for pattern in hard_fact_patterns if re.search(pattern, combined))
 
-    if negative_hits >= 2 and news_hits == 0 and event_hits == 0:
+    if negative_hits >= 3 and news_hits == 0 and event_hits == 0 and hard_fact_hits == 0:
         return {
             "should_fact_check": False,
             "reason": "当前视频更像教程、产品演示或经验讲解，已默认跳过新闻核查。",
@@ -4392,6 +4392,8 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
         (news_hits >= 1 and event_hits >= 1)
         or (event_hits >= 2 and hard_fact_hits >= 1)
         or (news_hits >= 2 and hard_fact_hits >= 1)
+        or (len(content) >= 3500 and hard_fact_hits >= 1)
+        or len(content) >= 7000
     )
     if not should_fact_check:
         return {

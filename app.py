@@ -670,6 +670,37 @@ def _raw_transcript_for_display(text: str) -> str:
     return cleaned.strip()
 
 
+def _repair_mojibake_text(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+
+    def _score(candidate: str) -> tuple[int, int]:
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", candidate))
+        mojibake_count = sum(candidate.count(marker) for marker in ("Ã", "Â", "â", "æ", "å", "ç", "ï", "ð", "�"))
+        return cjk_count, -mojibake_count
+
+    original_score = _score(value)
+    suspicious = "�" in value or original_score[1] < -1
+    if not suspicious:
+        return value
+
+    best = value
+    best_score = original_score
+    for source_encoding in ("latin-1", "cp1252"):
+        try:
+            repaired = value.encode(source_encoding, errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not repaired.strip():
+            continue
+        repaired_score = _score(repaired)
+        if repaired_score > best_score:
+            best = repaired
+            best_score = repaired_score
+    return best
+
+
 def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
     """尽量把模型返回的 JSON/伪 JSON 拆成总结与事实核查两部分。"""
     text = (summary_text or "").strip()
@@ -708,20 +739,21 @@ def _parse_summary_for_ui(summary_text: str) -> tuple[str, str]:
                 except Exception:
                     continue
             if isinstance(data, dict):
-                summary_md = str(data.get("summary_markdown") or data.get("summary") or "").strip()
+                summary_md = _repair_mojibake_text(str(data.get("summary_markdown") or data.get("summary") or "").strip())
                 fact_md = str(
                     data.get("fact_check_markdown")
                     or data.get("fact_check")
                     or data.get("factcheck_markdown")
                     or ""
                 ).strip()
+                fact_md = _repair_mojibake_text(fact_md)
                 if summary_md:
                     return summary_md, fact_md
         except Exception:
             continue
 
-    summary_md = _extract_field(text, ["summary_markdown", "summary", "summary_md"])
-    fact_md = _extract_field(text, ["fact_check_markdown", "fact_check", "factcheck_markdown", "fact_check_md"])
+    summary_md = _repair_mojibake_text(_extract_field(text, ["summary_markdown", "summary", "summary_md"]))
+    fact_md = _repair_mojibake_text(_extract_field(text, ["fact_check_markdown", "fact_check", "factcheck_markdown", "fact_check_md"]))
     if summary_md:
         return summary_md, fact_md
 
@@ -1800,8 +1832,7 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
     st.session_state.manual_transcript_text = ext_transcript
     st.session_state.manual_summary_text = ""
     st.session_state.manual_summary_duration = {}
-    route_extension_payload_to_video = ext_autosubmit and _is_supported_video_source_url(ext_source_url)
-    st.session_state.prefer_paste_tab = not route_extension_payload_to_video
+    st.session_state.prefer_paste_tab = True
     if not st.session_state.manual_bridge_meta:
         # 兼容 bridge 元信息未及时返回的情况，至少明确这是扩展直提文本。
         st.session_state.manual_bridge_meta = {
@@ -1814,23 +1845,7 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
             "text_source_reason": "extension_direct_extract",
             "title": "",
         }
-    if route_extension_payload_to_video:
-        st.session_state.transcript_text = ext_transcript
-        st.session_state.summary_text = ""
-        st.session_state.whisper_device_tag = ""
-        reset_video_fact_check_state()
-        st.session_state.current_video_url = ext_source_url
-        st.session_state.input_url = ext_source_url
-        st.session_state.video_extension_auto_summary_pending = True
-        st.session_state.video_extension_auto_summary_url = ext_source_url
-        st.session_state.video_extension_auto_summary_fetch_duration = 0.0
-        st.session_state.manual_last_payload_id = ext_payload_id
-        st.session_state.manual_auto_payload_id = ""
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
-    elif ext_autosubmit:
+    if ext_autosubmit:
         st.session_state.manual_auto_payload_id = ext_payload_id
 
 video_extension_payload_id = st.session_state.get("video_extension_payload_id") or ""
@@ -2041,6 +2056,12 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
 
     runtime = _get_video_fact_check_runtime()
     plan = decide_video_fact_check_plan(transcript_value, summary_md)
+    print(
+        "VideoFactCheckPlan: "
+        f"url={url_value}, should_fact_check={bool(plan.get('should_fact_check'))}, "
+        f"reason={str(plan.get('reason') or '').strip()}, "
+        f"recommended_claim_count={int(plan.get('recommended_claim_count') or 0)}"
+    , flush=True)
     if not bool(plan.get("should_fact_check")):
         reset_video_fact_check_state()
         st.session_state.video_fact_check_status = "skipped"
@@ -2095,6 +2116,7 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
             task["status"] = "running"
             runtime["tasks"][task_id] = task
         try:
+            print(f"VideoFactCheckWorker: started task_id={task_id} url={url_value} max_claims={max_claims}", flush=True)
             fact_markdown = fact_check_document_claims(
                 text=transcript_value,
                 summary_markdown=summary_md,
@@ -2119,6 +2141,7 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
                     "cache_key": cache_key,
                     "note": str(plan.get("reason") or "").strip(),
                 }
+            print(f"VideoFactCheckWorker: success task_id={task_id} url={url_value}", flush=True)
         except Exception as exc:
             with runtime["lock"]:
                 runtime["tasks"][task_id] = {
@@ -2129,6 +2152,7 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
                     "cache_key": cache_key,
                     "note": str(plan.get("reason") or "").strip(),
                 }
+            print(f"VideoFactCheckWorker: error task_id={task_id} url={url_value} error={exc}", flush=True)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -3218,6 +3242,15 @@ def render_manual_bridge_status():
             st.caption(bridge_meta_text)
 
 
+def _should_use_video_pipeline_for_extension_summary(manual_source_url: str, manual_transcript: str) -> bool:
+    if not str(manual_transcript or "").strip():
+        return False
+    if not _is_supported_video_source_url(manual_source_url):
+        return False
+    manual_meta = st.session_state.manual_bridge_meta or {}
+    return str(manual_meta.get("source_kind") or "").strip() == "extension"
+
+
 def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_paste_sum):
     """
     对手动粘贴或 bridge 自动注入的字幕文本执行总结。
@@ -3227,6 +3260,23 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
         return
 
     current_payload_id = st.session_state.manual_auto_payload_id if auto_paste_sum else ""
+    if _should_use_video_pipeline_for_extension_summary(manual_source_url, manual_transcript):
+        st.session_state.transcript_text = manual_transcript.strip()
+        st.session_state.summary_text = ""
+        st.session_state.whisper_device_tag = ""
+        st.session_state.current_video_url = str(manual_source_url or "").strip()
+        st.session_state.input_url = str(manual_source_url or "").strip()
+        reset_video_fact_check_state()
+        if current_payload_id:
+            st.session_state.manual_last_payload_id = current_payload_id
+            st.session_state.manual_auto_payload_id = ""
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+        do_video_summary_single(str(manual_source_url or "").strip(), manual=False, fetch_duration=0.0)
+        return
+
     t_manual_start = time.time()
     with st.spinner(f"正在请求 AI 总结 ({pipeline_model_label})..."):
         summary, err = internal_summarize(
@@ -3277,6 +3327,15 @@ def render_manual_summary_section():
     """
     渲染手动字幕总结结果与原文查看区域。
     """
+    manual_source_url = str(st.session_state.get("manual_source_url") or "").strip()
+    if _should_use_video_pipeline_for_extension_summary(manual_source_url, st.session_state.get("manual_transcript_text") or ""):
+        if not st.session_state.summary_text:
+            return
+        render_video_summary_section()
+        with st.expander("查看粘贴的字幕原文", expanded=False):
+            st.text_area("字幕原文", st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
+        return
+
     if not st.session_state.manual_summary_text:
         return
 
