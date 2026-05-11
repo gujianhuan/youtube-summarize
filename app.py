@@ -2054,7 +2054,7 @@ def _merge_fact_check_into_summary(summary_content: str, fact_check_markdown: st
 def _build_video_fact_check_cache_key(url: str, summary_markdown: str, transcript_text: str) -> str:
     raw = "\n".join(
         [
-            "video_fact_check_v2",
+            "video_fact_check_v3",
             str(url or "").strip(),
             str(summary_markdown or "").strip()[:2500],
             str(transcript_text or "").strip()[:5000],

@@ -5,6 +5,7 @@ from core_logic import (
     _build_heuristic_claim_items,
     _enrich_fact_check_items_with_claim_sources,
     _find_authoritative_sources,
+    decide_video_fact_check_plan,
 )
 
 
@@ -90,3 +91,44 @@ def test_build_heuristic_claim_items_prefers_specific_summary_claims() -> None:
 
     assert claims
     assert "超过10万名非法滞留的中国公民" in claims[0]["claim"]
+
+
+def test_decide_video_fact_check_plan_skips_explicit_test_transcript() -> None:
+    """明显的测试/链路字幕仍应直接跳过，避免误触发新闻核查。"""
+
+    transcript = (
+        "这是一次产品主路径的模拟测试，用于回归验证 Chrome 插件到 Render 主站的自动开始总结链路。"
+        "本次只检查 bridge payload 和 transcript 回传是否正常。"
+    )
+    summary_md = (
+        "## 核心主题\n"
+        "- 该视频用于测试插件与主站联动，不属于真实新闻内容。\n"
+    )
+
+    plan = decide_video_fact_check_plan(transcript, summary_md)
+
+    assert plan["should_fact_check"] is False
+    assert plan["recommended_claim_count"] == 0
+
+
+def test_decide_video_fact_check_plan_defaults_to_basic_fact_check_for_real_video() -> None:
+    """真实视频即使新闻关键词不强，也不应轻易被误判为 skipped。"""
+
+    transcript = (
+        "视频围绕一家机构最近公布的多项说法展开，主持人反复提到 2026 年、3 个时间点和两组数字，"
+        "还比较了不同口径之间的差异。随后又讨论相关部门、企业和公开表态之间是否一致，"
+        "并逐条解释这些数字为什么会影响外界判断。"
+    )
+    summary_md = (
+        "## 核心主题\n"
+        "- 视频围绕现实中的机构说法、数字变化和时间线展开梳理。\n\n"
+        "## 主要内容\n"
+        "- 主讲人整理了多组数字口径，并比较不同来源之间是否一致。\n"
+        "- 内容涉及公开表态、时间节点和可交叉验证的具体说法。\n"
+        "- 虽然没有明显新闻播报措辞，但整体仍属于适合进一步核查的真实视频内容。\n"
+    )
+
+    plan = decide_video_fact_check_plan(transcript, summary_md)
+
+    assert plan["should_fact_check"] is True
+    assert plan["recommended_claim_count"] == 3

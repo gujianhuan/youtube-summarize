@@ -4172,7 +4172,7 @@ def _extract_claim_items(raw_text: str, max_claims: int) -> list[dict]:
 
 
 def _normalize_fact_check_claim(claim: str) -> str:
-    text = normalize_whitespace(str(claim or "").strip())
+    text = re.sub(r"\s+", " ", str(claim or "").strip()).strip()
     if not text:
         return ""
 
@@ -4199,7 +4199,7 @@ def _normalize_fact_check_claim(claim: str) -> str:
     if tail_match:
         merged = merged[:tail_match.start()].rstrip(" ，,;；:：")
 
-    merged = normalize_whitespace(merged)
+    merged = re.sub(r"\s+", " ", merged).strip()
     if not merged:
         return ""
     if len(merged) < 8:
@@ -4503,8 +4503,17 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
     news_hits = sum(1 for marker in news_markers if marker in combined)
     event_hits = sum(1 for marker in event_markers if marker in combined)
     hard_fact_hits = sum(1 for pattern in hard_fact_patterns if re.search(pattern, combined))
+    content_len = len(content)
+    summary_len = len(summary)
 
-    if negative_hits >= 3 and news_hits == 0 and event_hits == 0 and hard_fact_hits == 0:
+    if content_len < 180 and summary_len < 60:
+        return {
+            "should_fact_check": False,
+            "reason": "当前视频可用于核查的文本过少，暂不启动新闻核查。",
+            "recommended_claim_count": 0,
+        }
+
+    if negative_hits >= 3 and news_hits == 0 and event_hits == 0 and hard_fact_hits == 0 and content_len < 2500:
         return {
             "should_fact_check": False,
             "reason": "当前视频更像教程、产品演示或经验讲解，已默认跳过新闻核查。",
@@ -4515,21 +4524,29 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
         (news_hits >= 1 and event_hits >= 1)
         or (event_hits >= 2 and hard_fact_hits >= 1)
         or (news_hits >= 2 and hard_fact_hits >= 1)
-        or (len(content) >= 3500 and hard_fact_hits >= 1)
-        or len(content) >= 7000
+        or (content_len >= 3500 and hard_fact_hits >= 1)
+        or content_len >= 7000
     )
+
+    # 真实视频默认跑基础核查，避免新闻/事件词命中不足时被误跳过。
+    if not should_fact_check and (content_len >= 800 or summary_len >= 120):
+        should_fact_check = True
+
     if not should_fact_check:
         return {
             "should_fact_check": False,
-            "reason": "当前视频不够像新闻/事件型内容，已默认跳过新闻核查。",
+            "reason": "当前视频不够像可核查内容，已默认跳过新闻核查。",
             "recommended_claim_count": 0,
         }
 
     signal_score = news_hits + event_hits + hard_fact_hits
-    recommended_claim_count = 5 if len(content) >= 9000 and signal_score >= 5 else 3
+    recommended_claim_count = 5 if content_len >= 9000 and signal_score >= 5 else 3
+    reason = "当前视频包含较明显的新闻/事件型声明，将只核查最关键的少量条目。"
+    if signal_score == 0:
+        reason = "当前视频未命中强新闻关键词，但已按真实视频默认补跑基础核查。"
     return {
         "should_fact_check": True,
-        "reason": "当前视频包含较明显的新闻/事件型声明，将只核查最关键的少量条目。",
+        "reason": reason,
         "recommended_claim_count": recommended_claim_count,
     }
 
