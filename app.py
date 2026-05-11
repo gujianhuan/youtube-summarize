@@ -1707,6 +1707,23 @@ def reset_video_fact_check_state() -> None:
     st.session_state.video_fact_check_applied_task_id = ""
     st.session_state.video_fact_check_note = ""
 
+
+def _is_supported_video_source_url(url: str) -> bool:
+    value = str(url or "").strip().lower()
+    if not value:
+        return False
+    return any(
+        marker in value
+        for marker in (
+            "youtube.com/watch",
+            "youtube.com/shorts/",
+            "youtube.com/live/",
+            "youtu.be/",
+            "bilibili.com/video/",
+            "b23.tv/",
+        )
+    )
+
 # --- 后台硬编码/环境变量配置 (对外隐藏设置) ---
 proxy_input = os.environ.get("PROXY_URL", st.session_state.settings.get("proxy", ""))
 use_system_proxy = False
@@ -1783,7 +1800,8 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
     st.session_state.manual_transcript_text = ext_transcript
     st.session_state.manual_summary_text = ""
     st.session_state.manual_summary_duration = {}
-    st.session_state.prefer_paste_tab = True
+    route_extension_payload_to_video = ext_autosubmit and _is_supported_video_source_url(ext_source_url)
+    st.session_state.prefer_paste_tab = not route_extension_payload_to_video
     if not st.session_state.manual_bridge_meta:
         # 兼容 bridge 元信息未及时返回的情况，至少明确这是扩展直提文本。
         st.session_state.manual_bridge_meta = {
@@ -1796,7 +1814,23 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
             "text_source_reason": "extension_direct_extract",
             "title": "",
         }
-    if ext_autosubmit:
+    if route_extension_payload_to_video:
+        st.session_state.transcript_text = ext_transcript
+        st.session_state.summary_text = ""
+        st.session_state.whisper_device_tag = ""
+        reset_video_fact_check_state()
+        st.session_state.current_video_url = ext_source_url
+        st.session_state.input_url = ext_source_url
+        st.session_state.video_extension_auto_summary_pending = True
+        st.session_state.video_extension_auto_summary_url = ext_source_url
+        st.session_state.video_extension_auto_summary_fetch_duration = 0.0
+        st.session_state.manual_last_payload_id = ext_payload_id
+        st.session_state.manual_auto_payload_id = ""
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+    elif ext_autosubmit:
         st.session_state.manual_auto_payload_id = ext_payload_id
 
 video_extension_payload_id = st.session_state.get("video_extension_payload_id") or ""
