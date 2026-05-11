@@ -4302,6 +4302,28 @@ def _build_heuristic_claim_items(text: str, summary_markdown: str, max_claims: i
     return claims[:max_claims]
 
 
+def _looks_like_siliconflow_base_url(base_url_value: str) -> bool:
+    lowered = str(base_url_value or "").strip().lower()
+    return "siliconflow" in lowered
+
+
+def _build_summary_model_candidates(model: str, base_url: str) -> list[str]:
+    preferred = str(model or "").strip() or "gpt-3.5-turbo"
+    candidates: list[str] = [preferred]
+    if _looks_like_siliconflow_base_url(base_url):
+        fallbacks = [
+            "Pro/deepseek-ai/DeepSeek-V4-Flash",
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "Pro/MiniMaxAI/MiniMax-M2.5",
+            "MiniMaxAI/MiniMax-M2.5",
+            "deepseek-ai/DeepSeek-V3.2",
+        ]
+        for fallback in fallbacks:
+            if fallback and fallback not in candidates:
+                candidates.append(fallback)
+    return candidates
+
+
 def extract_key_claims(
     text: str,
     summary_markdown: str,
@@ -4773,19 +4795,44 @@ def summarize_text(
             f"fact_check_enabled={fact_check_enabled}"
         , flush=True)
 
-        response = client.chat.completions.create(
-            model=summary_model,
-            messages=[
-                {"role": "system", "content": "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            stream=stream,
-        )
+        summary_model_candidates = _build_summary_model_candidates(summary_model, base_url)
+        response = None
+        content_str = ""
+        normalized_payload = None
+        summary_errors: list[str] = []
+        active_summary_model = summary_model
+        for candidate_model in summary_model_candidates:
+            active_summary_model = candidate_model
+            try:
+                response = client.chat.completions.create(
+                    model=candidate_model,
+                    messages=[
+                        {"role": "system", "content": "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    stream=stream,
+                )
+                break
+            except Exception as summary_exc:
+                summary_errors.append(f"{candidate_model}: {summary_exc}")
+                print(
+                    f"SummarizeText: model retry candidate failed: {candidate_model} -> {summary_exc}",
+                    flush=True,
+                )
+                response = None
+        if response is None:
+            raise RuntimeError(" | ".join(summary_errors) if summary_errors else "无法完成总结请求")
         if stream:
             return response
+
+        if active_summary_model != summary_model:
+            print(
+                f"SummarizeText: fallback summary model applied -> {active_summary_model}",
+                flush=True,
+            )
 
         content_str = _extract_completion_content(response)
         if not content_str:
@@ -4803,7 +4850,7 @@ def summarize_text(
                     f"原始内容：\n{content_str}"
                 )
                 repair_resp = client.chat.completions.create(
-                    model=summary_model,
+                    model=active_summary_model,
                     messages=[
                         {"role": "system", "content": "你是一个 JSON 修复助手，只返回合法 JSON。"},
                         {"role": "user", "content": repair_prompt},
