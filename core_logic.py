@@ -4581,7 +4581,14 @@ def fact_check_document_claims(
         )
     except Exception as exc:
         print(f"Extract key claims failed: {exc}", flush=True)
-        return _build_fact_check_fallback_markdown()
+        try:
+            claims = _build_heuristic_claim_items(
+                clean_document_text(text),
+                clean_document_text(summary_markdown or "")[:2200],
+                max_claims=max_claims,
+            )
+        except Exception:
+            claims = []
 
     if not claims:
         return _build_fact_check_fallback_markdown()
