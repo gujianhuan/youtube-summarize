@@ -1699,6 +1699,18 @@ if "video_fact_check_applied_task_id" not in st.session_state:
     st.session_state.video_fact_check_applied_task_id = ""
 if "video_fact_check_note" not in st.session_state:
     st.session_state.video_fact_check_note = ""
+if "manual_video_fact_check_task_id" not in st.session_state:
+    st.session_state.manual_video_fact_check_task_id = ""
+if "manual_video_fact_check_status" not in st.session_state:
+    st.session_state.manual_video_fact_check_status = "idle"
+if "manual_video_fact_check_error" not in st.session_state:
+    st.session_state.manual_video_fact_check_error = ""
+if "manual_video_fact_check_url" not in st.session_state:
+    st.session_state.manual_video_fact_check_url = ""
+if "manual_video_fact_check_applied_task_id" not in st.session_state:
+    st.session_state.manual_video_fact_check_applied_task_id = ""
+if "manual_video_fact_check_note" not in st.session_state:
+    st.session_state.manual_video_fact_check_note = ""
 if "prefer_paste_tab" not in st.session_state:
     st.session_state.prefer_paste_tab = False
 if "document_raw_text" not in st.session_state:
@@ -1748,13 +1760,17 @@ if "last_saved_settings" not in st.session_state:
         "remember_api_key": remember_api_key_initial,
     }
 
-def reset_video_fact_check_state() -> None:
-    st.session_state.video_fact_check_task_id = ""
-    st.session_state.video_fact_check_status = "idle"
-    st.session_state.video_fact_check_error = ""
-    st.session_state.video_fact_check_url = ""
-    st.session_state.video_fact_check_applied_task_id = ""
-    st.session_state.video_fact_check_note = ""
+def _fact_check_state_key(prefix: str, field_name: str) -> str:
+    return f"{prefix}_{field_name}"
+
+
+def reset_video_fact_check_state(prefix: str = "video_fact_check") -> None:
+    st.session_state[_fact_check_state_key(prefix, "task_id")] = ""
+    st.session_state[_fact_check_state_key(prefix, "status")] = "idle"
+    st.session_state[_fact_check_state_key(prefix, "error")] = ""
+    st.session_state[_fact_check_state_key(prefix, "url")] = ""
+    st.session_state[_fact_check_state_key(prefix, "applied_task_id")] = ""
+    st.session_state[_fact_check_state_key(prefix, "note")] = ""
 
 
 def _is_supported_video_source_url(url: str) -> bool:
@@ -1849,6 +1865,7 @@ if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id
     st.session_state.manual_transcript_text = ext_transcript
     st.session_state.manual_summary_text = ""
     st.session_state.manual_summary_duration = {}
+    reset_video_fact_check_state("manual_video_fact_check")
     st.session_state.prefer_paste_tab = True
     if not st.session_state.manual_bridge_meta:
         # 兼容 bridge 元信息未及时返回的情况，至少明确这是扩展直提文本。
@@ -2063,27 +2080,35 @@ def _build_video_fact_check_cache_key(url: str, summary_markdown: str, transcrip
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def start_video_fact_check_async(url: str, transcript_text: str, summary_content: str) -> None:
+def start_video_fact_check_async(
+    url: str,
+    transcript_text: str,
+    summary_content: str,
+    *,
+    summary_state_key: str = "summary_text",
+    state_prefix: str = "video_fact_check",
+) -> None:
     summary_md, _fact_md = _parse_summary_for_ui(summary_content)
     transcript_value = str(transcript_text or "").strip()
     url_value = str(url or "").strip()
     if not summary_md or not transcript_value or not api_key:
-        reset_video_fact_check_state()
+        reset_video_fact_check_state(state_prefix)
         return
 
     runtime = _get_video_fact_check_runtime()
     plan = decide_video_fact_check_plan(transcript_value, summary_md)
     print(
         "VideoFactCheckPlan: "
+        f"state_prefix={state_prefix}, "
         f"url={url_value}, should_fact_check={bool(plan.get('should_fact_check'))}, "
         f"reason={str(plan.get('reason') or '').strip()}, "
         f"recommended_claim_count={int(plan.get('recommended_claim_count') or 0)}"
     , flush=True)
     if not bool(plan.get("should_fact_check")):
-        reset_video_fact_check_state()
-        st.session_state.video_fact_check_status = "skipped"
-        st.session_state.video_fact_check_note = str(plan.get("reason") or "").strip()
-        st.session_state.video_fact_check_url = url_value
+        reset_video_fact_check_state(state_prefix)
+        st.session_state[_fact_check_state_key(state_prefix, "status")] = "skipped"
+        st.session_state[_fact_check_state_key(state_prefix, "note")] = str(plan.get("reason") or "").strip()
+        st.session_state[_fact_check_state_key(state_prefix, "url")] = url_value
         return
 
     max_claims = int(plan.get("recommended_claim_count") or 3)
@@ -2094,13 +2119,14 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
     with runtime["lock"]:
         cached_result = str((runtime.get("result_cache") or {}).get(cache_key) or "").strip()
     if cached_result:
-        st.session_state.summary_text = _merge_fact_check_into_summary(summary_content, cached_result)
-        st.session_state.video_fact_check_task_id = f"video_fact_check_cache_{cache_key[:12]}"
-        st.session_state.video_fact_check_status = "success"
-        st.session_state.video_fact_check_error = ""
-        st.session_state.video_fact_check_url = url_value
-        st.session_state.video_fact_check_applied_task_id = st.session_state.video_fact_check_task_id
-        st.session_state.video_fact_check_note = "新闻核查已命中缓存。"
+        st.session_state[summary_state_key] = _merge_fact_check_into_summary(summary_content, cached_result)
+        cache_task_id = f"{state_prefix}_cache_{cache_key[:12]}"
+        st.session_state[_fact_check_state_key(state_prefix, "task_id")] = cache_task_id
+        st.session_state[_fact_check_state_key(state_prefix, "status")] = "success"
+        st.session_state[_fact_check_state_key(state_prefix, "error")] = ""
+        st.session_state[_fact_check_state_key(state_prefix, "url")] = url_value
+        st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = cache_task_id
+        st.session_state[_fact_check_state_key(state_prefix, "note")] = "新闻核查已命中缓存。"
         return
 
     task_id = f"video_fact_check_{uuid.uuid4().hex}"
@@ -2115,12 +2141,12 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
             "note": str(plan.get("reason") or "").strip(),
         }
 
-    st.session_state.video_fact_check_task_id = task_id
-    st.session_state.video_fact_check_status = "queued"
-    st.session_state.video_fact_check_error = ""
-    st.session_state.video_fact_check_url = url_value
-    st.session_state.video_fact_check_applied_task_id = ""
-    st.session_state.video_fact_check_note = str(plan.get("reason") or "").strip()
+    st.session_state[_fact_check_state_key(state_prefix, "task_id")] = task_id
+    st.session_state[_fact_check_state_key(state_prefix, "status")] = "queued"
+    st.session_state[_fact_check_state_key(state_prefix, "error")] = ""
+    st.session_state[_fact_check_state_key(state_prefix, "url")] = url_value
+    st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = ""
+    st.session_state[_fact_check_state_key(state_prefix, "note")] = str(plan.get("reason") or "").strip()
 
     eff_api_key = api_key
     eff_base_url = base_url
@@ -2174,8 +2200,12 @@ def start_video_fact_check_async(url: str, transcript_text: str, summary_content
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def sync_video_fact_check_state() -> None:
-    task_id = str(st.session_state.get("video_fact_check_task_id") or "").strip()
+def sync_video_fact_check_state(
+    *,
+    summary_state_key: str = "summary_text",
+    state_prefix: str = "video_fact_check",
+) -> None:
+    task_id = str(st.session_state.get(_fact_check_state_key(state_prefix, "task_id")) or "").strip()
     if not task_id:
         return
 
@@ -2187,23 +2217,27 @@ def sync_video_fact_check_state() -> None:
         return
 
     status = str(task.get("status") or "idle").strip()
-    st.session_state.video_fact_check_status = status
-    st.session_state.video_fact_check_error = str(task.get("error") or "").strip()
-    st.session_state.video_fact_check_url = str(task.get("url") or st.session_state.get("video_fact_check_url") or "").strip()
-    st.session_state.video_fact_check_note = str(task.get("note") or st.session_state.get("video_fact_check_note") or "").strip()
+    st.session_state[_fact_check_state_key(state_prefix, "status")] = status
+    st.session_state[_fact_check_state_key(state_prefix, "error")] = str(task.get("error") or "").strip()
+    st.session_state[_fact_check_state_key(state_prefix, "url")] = str(
+        task.get("url") or st.session_state.get(_fact_check_state_key(state_prefix, "url")) or ""
+    ).strip()
+    st.session_state[_fact_check_state_key(state_prefix, "note")] = str(
+        task.get("note") or st.session_state.get(_fact_check_state_key(state_prefix, "note")) or ""
+    ).strip()
 
     if (
         status == "success"
-        and st.session_state.get("video_fact_check_applied_task_id") != task_id
+        and st.session_state.get(_fact_check_state_key(state_prefix, "applied_task_id")) != task_id
         and str(task.get("result") or "").strip()
-        and st.session_state.summary_text
+        and st.session_state.get(summary_state_key)
     ):
-        st.session_state.summary_text = _merge_fact_check_into_summary(
-            st.session_state.summary_text,
+        st.session_state[summary_state_key] = _merge_fact_check_into_summary(
+            st.session_state[summary_state_key],
             str(task.get("result") or "").strip(),
         )
-        st.session_state.video_fact_check_applied_task_id = task_id
-        st.session_state.video_fact_check_status = "success"
+        st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = task_id
+        st.session_state[_fact_check_state_key(state_prefix, "status")] = "success"
 
 def run_document_summary_pipeline(
     extracted,
@@ -2760,28 +2794,43 @@ def render_settings_diagnostics_page(task_status_value, task_logs, task_runs, ta
     render_guestbook_section(task_logs, task_runs, task_run_items)
 
 
-def do_video_summary_single(url, manual=True, fetch_duration=0.0):
+def do_video_summary_single(
+    url,
+    manual=True,
+    fetch_duration=0.0,
+    *,
+    transcript_text_override: str | None = None,
+    summary_state_key: str = "summary_text",
+    duration_state_key: str = "summary_duration",
+    fact_check_state_prefix: str = "video_fact_check",
+    history_source_type: str = "single",
+):
     """
     基于当前字幕内容生成单视频 AI 总结。
     """
-    if not st.session_state.transcript_text:
+    transcript_value = str(
+        transcript_text_override if transcript_text_override is not None else st.session_state.get("transcript_text") or ""
+    ).strip()
+    if not transcript_value:
         if manual:
             st.warning("请先抓取字幕")
         return
 
-    reset_video_fact_check_state()
+    reset_video_fact_check_state(fact_check_state_prefix)
     print(
         "VideoSummarySingle: "
         f"manual={bool(manual)}, "
         f"url={str(url or '').strip()}, "
         f"fetch_duration={float(fetch_duration):.2f}, "
-        f"transcript_len={len(str(st.session_state.transcript_text or ''))}, "
+        f"summary_state_key={summary_state_key}, "
+        f"fact_check_state_prefix={fact_check_state_prefix}, "
+        f"transcript_len={len(transcript_value)}, "
         "enable_fact_check=False"
     , flush=True)
     t_sum_start = time.time()
     with st.spinner(f"正在请求 AI 总结 ({pipeline_model_label})..."):
         summary, err = internal_summarize(
-            st.session_state.transcript_text,
+            transcript_value,
             summary_model_selected,
             fact_check_model_selected,
             enable_fact_check=False,
@@ -2789,7 +2838,7 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
 
     sum_duration = time.time() - t_sum_start
     total_duration = fetch_duration + sum_duration
-    st.session_state.summary_duration = {
+    st.session_state[duration_state_key] = {
         "fetch": fetch_duration,
         "summary": sum_duration,
         "total": total_duration,
@@ -2814,13 +2863,19 @@ def do_video_summary_single(url, manual=True, fetch_duration=0.0):
         f"summary_len={len(str(summary or ''))}, "
         f"duration={sum_duration:.2f}"
     , flush=True)
-    st.session_state.summary_text = summary
-    start_video_fact_check_async(url, st.session_state.transcript_text, summary)
+    st.session_state[summary_state_key] = summary
+    start_video_fact_check_async(
+        url,
+        transcript_value,
+        summary,
+        summary_state_key=summary_state_key,
+        state_prefix=fact_check_state_prefix,
+    )
     if manual:
         st.success(f"总结完成 | AI生成耗时: {sum_duration:.1f}s")
 
     try:
-        add_history_entry("single", url, summary, st.session_state.transcript_text)
+        add_history_entry(history_source_type, url, summary, transcript_value)
     except Exception as e_hist:
         print(f"Failed to save history: {e_hist}")
 
@@ -3070,55 +3125,105 @@ def do_video_check_single(url):
         )
 
 
-def render_video_summary_section():
+def _render_video_summary_panel(
+    *,
+    summary_state_key: str = "summary_text",
+    duration_state_key: str = "summary_duration",
+    fact_check_state_prefix: str = "video_fact_check",
+) -> None:
+    sync_video_fact_check_state(summary_state_key=summary_state_key, state_prefix=fact_check_state_prefix)
+    st.markdown("### 📝 AI 总结")
+    duration_info = st.session_state.get(duration_state_key) or {}
+    if duration_info:
+        fetch_t = duration_info.get("fetch", 0)
+        sum_t = duration_info.get("summary", 0)
+        total_t = duration_info.get("total", 0)
+        st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (文本抓取: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
+    st.caption(f"🤖 模型流水线：{pipeline_model_label}")
+
+    render_summary_content(
+        str(st.session_state.get(summary_state_key) or ""),
+        fact_title="🕵️ 新闻事实核查",
+    )
+    status = str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "status")) or "").strip()
+    note = str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "note")) or "").strip()
+    if status in {"queued", "running"}:
+        st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
+        if note:
+            st.caption(note)
+    elif status == "skipped":
+        if note:
+            st.caption(f"🕵️ {note}")
+    elif status == "error":
+        st.warning(
+            f"新闻核查补跑失败：{str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, 'error')) or '').strip()}"
+        )
+    elif status == "success" and note:
+        st.caption(f"🕵️ {note}")
+
+    return status
+
+
+def render_video_summary_section(
+    *,
+    summary_state_key: str = "summary_text",
+    duration_state_key: str = "summary_duration",
+    fact_check_state_prefix: str = "video_fact_check",
+) -> None:
     """
-    渲染视频总结结果与耗时信息。
+    渲染视频链接入口的总结结果与耗时信息。
     """
-    if not st.session_state.summary_text:
+    summary_value = str(st.session_state.get(summary_state_key) or "").strip()
+    if not summary_value:
         return
 
-    sync_video_fact_check_state()
-    initial_status = str(st.session_state.get("video_fact_check_status") or "").strip()
+    initial_status = str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "status")) or "").strip()
     run_every = "3s" if initial_status in {"queued", "running"} else None
 
     @st.fragment(run_every=run_every)
     def _render_video_summary_fragment():
-        sync_video_fact_check_state()
-        st.markdown("### 📝 AI 总结")
-        if "summary_duration" in st.session_state and st.session_state.summary_duration:
-            duration_info = st.session_state.summary_duration
-            fetch_t = duration_info.get("fetch", 0)
-            sum_t = duration_info.get("summary", 0)
-            total_t = duration_info.get("total", 0)
-            st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (文本抓取: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
-        st.caption(f"🤖 模型流水线：{pipeline_model_label}")
-
-        render_summary_content(
-            st.session_state.summary_text,
-            fact_title="🕵️ 新闻事实核查",
+        status = _render_video_summary_panel(
+            summary_state_key=summary_state_key,
+            duration_state_key=duration_state_key,
+            fact_check_state_prefix=fact_check_state_prefix,
         )
-        status = str(st.session_state.get("video_fact_check_status") or "").strip()
-        note = str(st.session_state.get("video_fact_check_note") or "").strip()
-        if status in {"queued", "running"}:
-            st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
-            if note:
-                st.caption(note)
-        elif status == "skipped":
-            if note:
-                st.caption(f"🕵️ {note}")
-        elif status == "error":
-            st.warning(f"新闻核查补跑失败：{str(st.session_state.get('video_fact_check_error') or '').strip()}")
-        elif status == "success" and note:
-            st.caption(f"🕵️ {note}")
-
         st.divider()
-
         if run_every is not None and status not in {"queued", "running"}:
             st.rerun()
 
     _render_video_summary_fragment()
 
     # 当前模式已关闭音频下载/Whisper 转写兜底，不再展示相关脚注。
+
+
+def render_manual_video_summary_section(
+    *,
+    summary_state_key: str = "manual_summary_text",
+    duration_state_key: str = "manual_summary_duration",
+    fact_check_state_prefix: str = "manual_video_fact_check",
+) -> None:
+    """
+    渲染插件直达粘贴文本入口的总结结果与耗时信息。
+    """
+    summary_value = str(st.session_state.get(summary_state_key) or "").strip()
+    if not summary_value:
+        return
+
+    initial_status = str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "status")) or "").strip()
+    run_every = "3s" if initial_status in {"queued", "running"} else None
+
+    @st.fragment(run_every=run_every)
+    def _render_manual_video_summary_fragment():
+        status = _render_video_summary_panel(
+            summary_state_key=summary_state_key,
+            duration_state_key=duration_state_key,
+            fact_check_state_prefix=fact_check_state_prefix,
+        )
+        st.divider()
+        if run_every is not None and status not in {"queued", "running"}:
+            st.rerun()
+
+    _render_manual_video_summary_fragment()
 
 
 def render_video_transcript_section():
@@ -3278,11 +3383,10 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
 
     current_payload_id = st.session_state.manual_auto_payload_id if auto_paste_sum else ""
     if _should_use_video_pipeline_for_extension_summary(manual_source_url, manual_transcript):
-        st.session_state.transcript_text = manual_transcript.strip()
-        st.session_state.summary_text = ""
-        st.session_state.whisper_device_tag = ""
+        st.session_state.manual_summary_text = ""
+        st.session_state.manual_summary_duration = {}
         st.session_state.current_video_url = str(manual_source_url or "").strip()
-        reset_video_fact_check_state()
+        reset_video_fact_check_state("manual_video_fact_check")
         if current_payload_id:
             st.session_state.manual_last_payload_id = current_payload_id
             st.session_state.manual_auto_payload_id = ""
@@ -3290,7 +3394,16 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
                 st.query_params.clear()
             except Exception:
                 pass
-        do_video_summary_single(str(manual_source_url or "").strip(), manual=False, fetch_duration=0.0)
+        do_video_summary_single(
+            str(manual_source_url or "").strip(),
+            manual=False,
+            fetch_duration=0.0,
+            transcript_text_override=manual_transcript.strip(),
+            summary_state_key="manual_summary_text",
+            duration_state_key="manual_summary_duration",
+            fact_check_state_prefix="manual_video_fact_check",
+            history_source_type="extension_bridge",
+        )
         return
 
     t_manual_start = time.time()
@@ -3345,9 +3458,13 @@ def render_manual_summary_section():
     """
     manual_source_url = str(st.session_state.get("manual_source_url") or "").strip()
     if _should_use_video_pipeline_for_extension_summary(manual_source_url, st.session_state.get("manual_transcript_text") or ""):
-        if not st.session_state.summary_text:
+        if not st.session_state.manual_summary_text:
             return
-        render_video_summary_section()
+        render_manual_video_summary_section(
+            summary_state_key="manual_summary_text",
+            duration_state_key="manual_summary_duration",
+            fact_check_state_prefix="manual_video_fact_check",
+        )
         with st.expander("查看粘贴的字幕原文", expanded=False):
             st.text_area("字幕原文", st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
         return
