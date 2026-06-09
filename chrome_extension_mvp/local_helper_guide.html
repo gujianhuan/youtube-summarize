@@ -1,77 +1,77 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>本地转写助手引导</title>
+    <title>Local Transcription Helper Guide</title>
     <link rel="stylesheet" href="local_helper_guide.css">
   </head>
   <body>
     <main class="wrap">
       <header class="hero">
         <p class="eyebrow">YouTubeSummarizer</p>
-        <h1>本地转写助手引导</h1>
+        <h1 id="guideTitle">Local Transcription Helper Guide</h1>
         <p class="subtext">
-          当前视频没有可直接提取的公开文本时，才需要使用本地转写助手做兜底转写。
+          <span id="guideSubtext">Use the local transcription helper only when the current video has no directly extractable public text.</span>
         </p>
         <div id="contextNotice" class="context-notice context-notice-hidden" aria-live="polite"></div>
       </header>
 
       <section class="card">
-        <h2>什么时候需要它</h2>
-        <ul>
-          <li>视频没有公开字幕，也没有可提取的 transcript。</li>
-          <li>扩展已经明确提示“建议使用本地转写助手”。</li>
-          <li>你需要先本地转写，再回主站继续总结。</li>
+        <h2 id="needTitle">When You Need It</h2>
+        <ul id="needList">
+          <li>The video has no public captions and no extractable transcript.</li>
+          <li>The extension explicitly recommends the local transcription helper.</li>
+          <li>You want local transcription first, then continue summarizing on the main site.</li>
         </ul>
       </section>
 
       <section class="card">
-        <h2>你现在要做什么</h2>
-        <ol>
-          <li>复制当前视频链接。</li>
-          <li>打开本地转写助手。</li>
-          <li>把视频链接粘贴进去。</li>
-          <li>点击开始转写。</li>
-          <li>转写完成后自动回到主站继续总结。</li>
+        <h2 id="stepsTitle">What To Do Now</h2>
+        <ol id="stepsList">
+          <li>Copy the current video URL.</li>
+          <li>Open the local transcription helper.</li>
+          <li>Paste the video URL into it.</li>
+          <li>Start transcription.</li>
+          <li>After transcription completes, return to the main site and continue summarizing.</li>
         </ol>
       </section>
 
       <section class="card">
-        <h2>当前视频链接</h2>
-        <textarea id="sourceUrlInput" rows="4" readonly placeholder="这里会显示从扩展带过来的视频链接"></textarea>
+        <h2 id="sourceSectionTitle">Current Video URL</h2>
+        <textarea id="sourceUrlInput" rows="4" readonly placeholder="The video URL passed from the extension will appear here"></textarea>
         <p id="sourceUrlHint" class="muted">
-          如果这里没有链接，请回到视频页面后重新点击扩展里的“查看本地工具说明”。
+          If no link appears here, go back to the video page and open this guide again from the extension.
         </p>
         <div class="actions">
-          <button id="copySourceUrlBtn">复制视频链接</button>
+          <button id="copySourceUrlBtn">Copy Video URL</button>
         </div>
       </section>
 
       <section class="card">
-        <h2>版本选择建议</h2>
-        <ul>
-          <li><strong>在线安装版</strong>：首包更小，首次运行需要联网下载完整运行包。</li>
-          <li><strong>便携瘦身版</strong>：包更大，但适合离线分发和测试。</li>
-          <li><strong>开发命令行版</strong>：只适合开发者调试，不适合普通用户。</li>
+        <h2 id="versionTitle">Version Suggestions</h2>
+        <ul id="versionList">
+          <li><strong>Online installer</strong>: smaller initial package, but downloads the full runtime on first launch.</li>
+          <li><strong>Portable slim build</strong>: larger package, but better for offline sharing and testing.</li>
+          <li><strong>Developer CLI build</strong>: only for development and debugging, not for regular users.</li>
         </ul>
       </section>
 
       <section class="card warning">
-        <h2>注意</h2>
-        <ul>
-          <li>如果扩展提示的是“提取失败”，不要急着装本地工具，先重试或手动展开 transcript 面板。</li>
-          <li>本地工具只处理“确实没有可提取文本”的视频，不应该拿来掩盖扩展故障。</li>
-          <li>如果视频需要登录验证，可能还需要读取浏览器 cookies。</li>
+        <h2 id="warningTitle">Notes</h2>
+        <ul id="warningList">
+          <li>If the extension says extraction failed, do not jump to the local tool immediately. Retry first or manually open the transcript panel.</li>
+          <li>The local tool is only for videos that truly have no extractable text. It should not hide extension failures.</li>
+          <li>If the video requires login, browser cookies may also be needed.</li>
         </ul>
       </section>
 
       <section class="card">
-        <h2>补充说明</h2>
-        <ul>
-          <li>在线安装版更适合直接发给朋友，首包更小，但第一次运行必须联网。</li>
-          <li>便携瘦身版适合离线分发，但包体更大。</li>
-          <li>如果你只是想继续总结，不需要手动复制 transcript，本地工具完成后会自动回到主站。</li>
+        <h2 id="extraTitle">Extra Notes</h2>
+        <ul id="extraList">
+          <li>The online installer is easier to share because the package is smaller, but the first launch requires network access.</li>
+          <li>The portable slim build is better for offline distribution, but the package is larger.</li>
+          <li>If you only want to continue summarizing, you usually do not need to copy the transcript manually. The local tool can take you back to the main site after it finishes.</li>
         </ul>
       </section>
     </main>

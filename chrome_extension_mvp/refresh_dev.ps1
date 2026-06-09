@@ -2,30 +2,29 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$zipPath = Join-Path $root "chrome_extension_mvp.zip"
-$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("chrome_extension_mvp_" + [guid]::NewGuid().ToString("N"))
+$buildScript = Join-Path $root "build_packages.ps1"
+$manifestPath = Join-Path $root "manifest.json"
 
-New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-Copy-Item -Path (Join-Path $root "*") -Destination $tempDir -Recurse -Force
-
-$excludeNames = @(
-    "chrome_extension_mvp.zip",
-    "refresh_dev.ps1"
-)
-
-foreach ($name in $excludeNames) {
-    $target = Join-Path $tempDir $name
-    if (Test-Path $target) {
-        Remove-Item $target -Recurse -Force
-    }
+if (-not (Test-Path $buildScript)) {
+    throw "未找到 build_packages.ps1: $buildScript"
 }
 
-if (Test-Path $zipPath) {
-    Remove-Item $zipPath -Force
+if (-not (Test-Path $manifestPath)) {
+    throw "未找到 manifest.json: $manifestPath"
 }
 
-Compress-Archive -Path (Join-Path $tempDir "*") -DestinationPath $zipPath -Force
-Remove-Item $tempDir -Recurse -Force
+$manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+$version = [string]$manifest.version
+if ([string]::IsNullOrWhiteSpace($version)) {
+    throw "manifest.json 中缺少 version"
+}
 
-Write-Output "插件打包完成: $zipPath"
-Write-Output "如果你使用“加载已解压的扩展程序”，请到 chrome://extensions/ 手动点一次刷新。"
+& powershell -ExecutionPolicy Bypass -File $buildScript
+
+$distDir = Join-Path $root "dist"
+$chromeDir = Join-Path $distDir ("chrome_unpacked_v{0}" -f $version)
+
+Write-Output ""
+Write-Output "开发刷新提示:"
+Write-Output "- Chrome: 打开 chrome://extensions/ ，刷新已加载的 $chromeDir"
+Write-Output "- 当前发布范围为 Chrome-only；Edge / Firefox 暂不处理"

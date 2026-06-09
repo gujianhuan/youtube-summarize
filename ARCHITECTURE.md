@@ -8,7 +8,7 @@
 - 当前项目本质上是一个以 `Streamlit` 为入口的单体应用。
 - 核心能力集中在 Python 侧，页面、业务编排、部分状态管理、媒体处理入口都聚合在一个项目中。
 - 项目同时连接了多个外围组件：
-  - Chrome 插件
+  - 浏览器扩展（Chrome / Edge / Firefox）
   - bridge API
   - 本地转写工具
   - Render 部署环境
@@ -50,12 +50,13 @@
 - 事实核查
 - 频道更新抓取
 
-### 3.3 Chrome 插件
+### 3.3 浏览器扩展
 - 目录：`chrome_extension_mvp/`
 - 主要职责：
   - 在页面侧提取可用文本
   - 在无法直接在线稳定抓取时提供主路径兜底
   - 调用 bridge API 上传 payload
+  - 从统一源码产出 `Chrome / Edge / Firefox` 三个浏览器版本
 
 ### 3.4 bridge API
 - 主要文件：`bridge_api.py`

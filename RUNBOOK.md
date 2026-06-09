@@ -157,26 +157,59 @@ streamlit run app.py
 
 ## 9. 插件联调手册
 ### 9.1 目标
-用于验证 Chrome 插件 -> bridge -> 主站总结 的主链路。
+用于验证 `Chrome` 扩展 -> bridge -> 主站总结的当前正式主链路。
 
 ### 9.2 基本流程
-1. 打开目标视频页面。
-2. 启动并加载 Chrome 插件。
-3. 插件提取文本。
-4. 通过 bridge API 上传 payload。
-5. 主站读取 `ext_payload_id`。
-6. 自动注入文本并触发总结。
+1. 启动本地主站和 bridge。
+2. 在 `chrome://extensions/` 打开开发者模式并加载 `chrome_extension_mvp`。
+3. 打开目标 YouTube 视频页。
+4. 点击插件弹窗中的“提取字幕”。
+5. 验证提取结果、复制文本和“一键总结”是否正常。
+6. 检查主站是否成功读取 transcript 并进入总结流程。
 
-### 9.3 重点检查项
-- 插件是否提取到正确文本，而不是页面推荐区噪音
-- bridge API 是否可访问
-- 主站是否成功读取 payload
-- 是否成功自动开始总结
+### 9.3 启动命令
 
-### 9.4 常见问题
-- 插件提取到杂讯：优先检查页面选择器或提取逻辑
-- bridge 无法读取：检查 payload id、bridge 服务状态、网络环境
-- 总结未自动触发：检查 query 参数和主站自动注入逻辑
+```powershell
+cd "D:\Program Files\Trae\YouTubeSummarizer"
+.\start.ps1
+```
+
+如果只想单独启动主站：
+
+```powershell
+.\.python313\python.exe -m streamlit run app.py --server.port 8501 --server.address 127.0.0.1
+```
+
+如果只想单独启动 bridge：
+
+```powershell
+.\.python313\python.exe bridge_api.py
+```
+
+### 9.4 自动化发布前回归
+
+```powershell
+.\.python313\python.exe .\run_chrome_release_regression.py
+```
+
+成功时重点查看：
+- `chrome_release_regression_summary.json`
+- `chrome_release_regression_trace.log`
+- `chrome_release_regression_input_link.png`
+- `chrome_release_regression_popup.png`
+- `chrome_release_regression_flow.png`
+
+### 9.5 重点检查项
+- 插件是否提取到正确字幕，而不是页面推荐区噪音
+- `http://127.0.0.1:8765/health` 是否返回正常
+- 主站是否成功读取 payload 并进入总结流程
+- `popup` 的“提取字幕 / 复制文本 / 一键总结”是否都可用
+
+### 9.6 常见问题
+- 插件提取到杂讯：优先检查页面选择器、YouTube transcript 读取逻辑或页面上下文注入是否失效
+- bridge 无法读取：检查 bridge 服务状态、payload id、本地端口和网络权限
+- 总结未自动触发：检查 `startSummarizeFlow`、主站 query 参数和自动注入逻辑
+- 本地按钮切到开发地址后仍失败：检查 `8501` 和 `8765` 是否真的在线
 
 ## 10. 本地工具联调手册
 ### 10.1 目标

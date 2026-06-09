@@ -1,17 +1,16 @@
-# Chrome 扩展 MVP
+# 浏览器扩展 MVP
 
-这是一个最小可用的 Chrome 扩展骨架，用于在用户自己的浏览器页面里提取 YouTube / Bilibili 的可见字幕文本。
+这是一个最小可用的浏览器扩展骨架，当前以 `Chrome-only` 发布为目标，用于在用户自己的浏览器页面里提取 YouTube 的可见字幕文本。
 
 ## MVP 目标
 
-- 在用户自己的浏览器上下文中提取页面可见字幕
+- 在用户自己的浏览器上下文中提取 YouTube 页面可见字幕
 - 把字幕复制到剪贴板
 - 或自动打开主站的 `✍️ 粘贴字幕` 页签并自动填入文本
 
 ## 当前能力
 
 - YouTube：优先尝试读取页面内嵌字幕数据；若失败，再尝试读取 transcript 面板中的可见字幕节点并自动展开
-- Bilibili：尝试读取页面中的可见字幕节点
 - Popup 中支持：
   - 提取字幕
   - 复制字幕
@@ -26,35 +25,38 @@
 - 当前仍是 MVP，YouTube 会优先尝试读取页面内嵌字幕数据；若拿不到，再自动尝试展开 transcript 面板
 - YouTube 页面结构变化、字幕轨道不可用或视频本身无公开字幕时，仍可能失败
 - 视频画面中出现“硬字幕”不代表 YouTube 提供了可提取 transcript；若无公开字幕轨道，扩展仍会失败
-- Bilibili 当前仍更依赖页面中已经可见的字幕节点
 - 当前不直接走主站 API；为避免超长 URL 导致站点打不开，扩展会优先打开主站，再尝试自动填入，失败时回退到剪贴板手动粘贴
 
 ## 安装方式
 
-1. 打开 Chrome 扩展管理页面：`chrome://extensions/`
+### Chrome
+
+1. 打开扩展管理页：`chrome://extensions/`
 2. 打开“开发者模式”
-3. 选择“加载已解压的扩展程序”
+3. 点击“加载已解压的扩展程序”
 4. 选择当前目录 `chrome_extension_mvp`
+
+当前版本仅提供 `Chrome` 安装说明；`Edge / Firefox` 暂不作为本期发布范围。
 
 ## 新电脑本地联调建议
 
 如果你当前想测试的是“插件 -> 本地主站”的链路，推荐这样配：
 
-1. 先启动本地主站：`http://127.0.0.1:8501/`
+1. 先启动本地主站：`http://127.0.0.1:8501/` 或 `http://127.0.0.1:8502/`
 2. 打开插件弹窗里的“联调配置”
-3. 将“主站地址”设为：`http://127.0.0.1:8501/`
-4. `Bridge 地址` 默认可先保持：`https://youtube-summarize-bridge.onrender.com`
-5. 点击“保存配置”
+3. 直接点击“切到本地并保存”
+4. 插件会优先自动探测本地主站与本地 bridge；若没探测到，会先写入默认本地地址
+5. 如需手动覆盖，再修改“主站地址”与 `Bridge 地址` 后点击“保存配置”
 
 说明：
 
-- 这样插件会继续把 transcript 上传到线上 bridge
-- 但总结页会直接打开你本机的主站，便于在新电脑验证本地联调
-- 如果你后面也把本地 bridge 跑起来了，再把 `Bridge 地址` 改成本地地址即可
+- 如果本地 bridge 已启动，插件会优先切到本地 bridge
+- 如果本地 bridge 没启动，插件会先保留本地默认地址，等你启动后即可继续联调
+- 总结页会直接打开你本机的主站，便于在新电脑验证本地联调
 
 ## 更新方式
 
-- 当前如果你使用的是“加载已解压的扩展程序”，**每次代码更新后都需要在 `chrome://extensions/` 里点一次刷新**
+- 当前如果你使用的是“加载已解压的扩展程序”，`Chrome` 每次代码更新后都需要在扩展页点一次刷新
 - 现在项目里已经提供开发辅助脚本：
 
 ```powershell
@@ -64,20 +66,18 @@ Set-Location "D:\Workspace\YouTubeSummarizer\chrome_extension_mvp"
 
 - 这个脚本会：
   - 读取当前扩展版本
-  - 重新打包 `chrome_extension_mvp.zip`
-  - 提示你去 Chrome 扩展页刷新
+  - 调用 `build_packages.ps1` 重新生成 `Chrome` 发布产物
+  - 提示你去 `chrome://extensions/` 刷新已加载扩展
 
 注意：
 
 - **加载目录模式不能真正自动更新**
-- 真正的自动更新需要后续走：
-  - Chrome Web Store
-  - 或自托管 CRX + `update_url`
+- 真正的自动更新需要后续接入 `Chrome Web Store`
 
 ## 建议使用流程
 
-1. 打开 YouTube / Bilibili 视频页面
-2. YouTube 可直接点击扩展尝试自动展开 transcript；Bilibili 建议先展开字幕面板
+1. 打开 YouTube 视频页面
+2. 直接点击扩展尝试自动展开 transcript
 3. 点击扩展图标
 4. 点击“提取字幕”
 5. 如果提取成功，点击“一键总结”
@@ -90,3 +90,4 @@ Set-Location "D:\Workspace\YouTubeSummarizer\chrome_extension_mvp"
 - 直接调用主站 API 上传 transcript
 - 保存最近一次提取结果
 - 支持更多页面结构和字幕来源
+- `Edge / Firefox` 兼容适配可在 `Chrome` 稳定发布后单独评估

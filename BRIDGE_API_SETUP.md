@@ -96,14 +96,16 @@ GET https://你的-bridge-服务.onrender.com/health
 
 ## 第六步：刷新浏览器扩展
 
-当前扩展版本已切到服务端桥接流。
+当前扩展版本已切到服务端桥接流，并支持统一维护 `Chrome / Edge / Firefox` 三个浏览器版本。
 
 操作：
 
-1. 打开 `chrome://extensions/`
-2. 找到 `Video Transcript Helper MVP`
-3. 点一次 `刷新`
-4. 确认版本已更新到最新打包版本
+1. 在 `chrome_extension_mvp` 目录执行 `build_packages.ps1`
+2. 按浏览器加载最新产物：
+   - Chrome：在 `chrome://extensions/` 加载 `dist\chrome_edge_unpacked_v<version>`
+   - Edge：在 `edge://extensions/` 加载 `dist\chrome_edge_unpacked_v<version>`
+   - Firefox：在 `about:debugging#/runtime/this-firefox` 临时载入 `dist\firefox_unpacked_v<version>\manifest.json`
+3. 确认扩展版本已更新到最新打包版本
 
 ## 当前接口
 

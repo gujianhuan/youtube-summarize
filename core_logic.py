@@ -16,9 +16,11 @@ import subprocess
 import traceback
 import requests
 import platform
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, quote
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, quote, urlunparse
 
 from portable_runtime import configure_portable_environment, get_models_dir
 
@@ -460,17 +462,6 @@ def _strip_trailing_punct(text: str) -> str:
 def extract_video_id(url_or_id: str) -> str:
     candidate = _strip_trailing_punct(url_or_id.strip())
     
-    # Bilibili BV ID (BV1xxxxxxxxx) - 12 chars usually, starts with BV
-    if re.fullmatch(r"BV[a-zA-Z0-9]{10}", candidate):
-        return candidate
-        
-    # Bilibili URL
-    if "bilibili.com" in candidate:
-        # Match BV id in url
-        m = re.search(r"(BV[a-zA-Z0-9]{10})", candidate)
-        if m:
-            return m.group(1)
-            
     # YouTube ID (11 chars)
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
         return candidate
@@ -499,20 +490,12 @@ def extract_video_id(url_or_id: str) -> str:
         if m:
             return m.group(2)
 
-    raise ValueError("无法从输入解析出视频 ID（支持 YouTube 11位 ID / Bilibili BV号）")
+    raise ValueError("无法从输入解析出视频 ID（支持 YouTube 11位 ID）")
 
 
 def normalize_video_url(url_or_id: str) -> str:
     s = _strip_trailing_punct(url_or_id.strip())
     
-    # Bilibili
-    if re.fullmatch(r"BV[a-zA-Z0-9]{10}", s) or "bilibili.com" in s:
-        if not s.startswith("http"):
-             if re.fullmatch(r"BV[a-zA-Z0-9]{10}", s):
-                 return f"https://www.bilibili.com/video/{s}"
-             return "https://" + s
-        return s
-
     # YouTube
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
         return f"https://www.youtube.com/watch?v={s}"
@@ -801,6 +784,7 @@ def has_login_required(lines: list[str], msg: str = "") -> bool:
 
 
 def has_premium_only_warning(lines: list[str], msg: str = "") -> bool:
+    """检查是否为会员专享或高码率受限。"""
     tail = "\n".join(lines[-160:]).lower()
     m = (msg or "").lower()
     premium_markers = [
@@ -2326,7 +2310,6 @@ def transcribe_video_audio_with_ytdlp(
     normalized_video_url = normalize_video_url(video_url)
     parsed_video_host = (urlparse(normalized_video_url).netloc or "").lower()
     is_youtube_url = ("youtube.com" in parsed_video_host) or ("youtu.be" in parsed_video_host)
-    is_bilibili_url = ("bilibili.com" in parsed_video_host) or ("b23.tv" in parsed_video_host)
 
     cache_path = _audio_cache_path(normalized_video_url)
     if cache_path and cache_path.exists():
@@ -2432,11 +2415,6 @@ def transcribe_video_audio_with_ytdlp(
                             "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
                             "logger": logger,
                         }
-                        if is_bilibili_url:
-                            opts["http_headers"].update({
-                                "Referer": "https://www.bilibili.com/",
-                                "Origin": "https://www.bilibili.com",
-                            })
                         if is_youtube_url and client_set:
                             opts["extractor_args"] = {"youtube": {"player_client": client_set}}
                         if ffmpeg_binary_path:
@@ -2610,7 +2588,7 @@ def transcribe_video_audio_with_ytdlp(
                                         last_attempt_note = attempt_note + " (challenge/po token)"
                                         last_debug_lines = logger.lines[-80:]
                                         continue
-                                    if has_login_required([], msg) and not (is_bilibili_url and has_premium_only_warning([], msg)):
+                                    if has_login_required([], msg):
                                         force_browser_cookie = True
                                         for c in client_set:
                                             if c in {"tv", "tv_embedded"}:
@@ -2634,7 +2612,7 @@ def transcribe_video_audio_with_ytdlp(
                                     raise e
 
                                 try:
-                                    if has_login_required(logger.lines) and not (is_bilibili_url and has_premium_only_warning(logger.lines)):
+                                    if has_login_required(logger.lines):
                                         force_browser_cookie = True
                                         for c in client_set:
                                             if c in {"tv", "tv_embedded"}:
@@ -2722,34 +2700,19 @@ def transcribe_video_audio_with_ytdlp(
                                                 last_attempt_note = attempt_note + " (no output files)"
                                                 last_debug_lines = logger.lines[-80:]
                                                 continue
-                                            else:
-                                                last_err = RuntimeError("yt-dlp 未返回可用音频入口摘要，无法执行下载。")
-                                                last_err_type = type(last_err).__name__
-                                                last_attempt_note = attempt_note + " (no selected audio entry)"
-                                                last_debug_lines = logger.lines[-80:]
-                                                continue
-                                    last_err = None
-                                    last_err_type = ""
-                                    last_traceback_text = ""
-                                    download_ready = True
-                                    break
-                                except DownloadError as dl_err:
-                                    last_err = dl_err
-                                    last_err_type = type(dl_err).__name__
-                                    last_traceback_text = traceback.format_exc()
-                                    last_attempt_note = attempt_note
-                                    last_debug_lines = logger.lines[-80:]
-                                    if "HTTP Error 429" in strip_ansi(str(dl_err)):
-                                        time.sleep(2.0 * (attempt + 1))
-                                    continue
-                                except Exception as dl_err:
-                                    last_err = dl_err
-                                    last_err_type = type(dl_err).__name__
+                                except Exception as e:
+                                    last_err = e
+                                    last_err_type = type(e).__name__
                                     last_traceback_text = traceback.format_exc()
                                     last_attempt_note = attempt_note
                                     last_debug_lines = logger.lines[-80:]
                                     continue
 
+                                last_err = None
+                                last_err_type = ""
+                                last_traceback_text = ""
+                                download_ready = True
+                                break
                         except DownloadError as e:
                             msg = strip_ansi(str(e))
                             has_cookie_in_log = any(CookieManager.is_cookie_error(line) for line in logger.lines)
@@ -2972,9 +2935,339 @@ def fetch_available_models(api_key: str, base_url: str, proxy_url: str = None) -
 
 AUTHORITATIVE_SOURCE_RULES = [
     {
+        "label": "美国经济分析局",
+        "url": "https://www.bea.gov/",
+        "aliases": [
+            "美国经济分析局",
+            "bureau of economic analysis",
+            "u.s. bureau of economic analysis",
+            "bea",
+            "pce",
+            "个人消费支出物价指数",
+            "个人消费支出价格指数",
+            "美国pce",
+            "美国gdp",
+            "耐用品订单",
+            "durable goods orders",
+        ],
+        "query_terms": [
+            "BEA PCE inflation",
+            "BEA GDP release",
+            "BEA durable goods orders",
+        ],
+    },
+    {
+        "label": "加拿大统计局",
+        "url": "https://www.statcan.gc.ca/en/start",
+        "aliases": [
+            "加拿大统计局",
+            "statistics canada",
+            "statcan",
+            "canada gdp",
+            "加拿大gdp",
+        ],
+        "query_terms": [
+            "Statistics Canada GDP",
+            "StatCan gross domestic product",
+        ],
+    },
+    {
+        "label": "欧盟统计局",
+        "url": "https://ec.europa.eu/eurostat",
+        "aliases": [
+            "欧盟统计局",
+            "欧元区通胀",
+            "欧元区cpi",
+            "eurostat",
+            "euro area inflation",
+            "eurozone inflation",
+        ],
+        "query_terms": [
+            "Eurostat euro area inflation",
+            "Eurostat euro area CPI",
+        ],
+    },
+    {
+        "label": "欧洲央行",
+        "url": "https://www.ecb.europa.eu/",
+        "aliases": [
+            "欧洲央行",
+            "ecb",
+            "european central bank",
+            "euro area inflation",
+        ],
+        "query_terms": [
+            "ECB inflation outlook",
+            "ECB euro area inflation",
+        ],
+    },
+    {
+        "label": "德国联邦统计局",
+        "url": "https://www.destatis.de/EN/Home/_node.html",
+        "aliases": [
+            "德国gdp",
+            "德国国内生产总值",
+            "destatis",
+            "federal statistical office of germany",
+            "germany gdp",
+        ],
+        "query_terms": [
+            "Destatis Germany GDP",
+        ],
+    },
+    {
+        "label": "法国国家统计与经济研究所",
+        "url": "https://www.insee.fr/en/accueil",
+        "aliases": [
+            "法国gdp",
+            "法国国内生产总值",
+            "insee",
+            "france gdp",
+        ],
+        "query_terms": [
+            "INSEE France GDP",
+        ],
+    },
+    {
+        "label": "意大利国家统计局",
+        "url": "https://www.istat.it/en/",
+        "aliases": [
+            "意大利gdp",
+            "意大利国内生产总值",
+            "istat",
+            "italy gdp",
+        ],
+        "query_terms": [
+            "ISTAT Italy GDP",
+        ],
+    },
+    {
+        "label": "日本统计局",
+        "url": "https://www.stat.go.jp/english/",
+        "aliases": [
+            "日本cpi",
+            "日本通胀",
+            "日本统计局",
+            "statistics bureau of japan",
+            "stat.go.jp",
+            "japan cpi",
+        ],
+        "query_terms": [
+            "Japan CPI Statistics Bureau",
+        ],
+    },
+    {
+        "label": "日本经济产业省",
+        "url": "https://www.meti.go.jp/english/",
+        "aliases": [
+            "日本工业生产",
+            "meti",
+            "japan industrial production",
+            "日本经济产业省",
+            "ministry of economy trade and industry japan",
+        ],
+        "query_terms": [
+            "METI Japan industrial production",
+        ],
+    },
+    {
+        "label": "日本银行",
+        "url": "https://www.boj.or.jp/en/",
+        "aliases": [
+            "日本银行",
+            "日本央行",
+            "boj",
+            "bank of japan",
+        ],
+        "query_terms": [
+            "Bank of Japan outlook",
+        ],
+    },
+    {
+        "label": "新西兰储备银行",
+        "url": "https://www.rbnz.govt.nz/",
+        "aliases": [
+            "新西兰央行",
+            "新西兰储备银行",
+            "rbnz",
+            "reserve bank of new zealand",
+            "official cash rate",
+        ],
+        "query_terms": [
+            "RBNZ official cash rate",
+            "RBNZ monetary policy statement",
+        ],
+    },
+    {
+        "label": "澳大利亚统计局",
+        "url": "https://www.abs.gov.au/",
+        "aliases": [
+            "澳大利亚通胀",
+            "澳洲通胀",
+            "australia inflation",
+            "australian inflation",
+            "abs",
+            "australian bureau of statistics",
+        ],
+        "query_terms": [
+            "ABS Australia CPI",
+            "Australian Bureau of Statistics inflation",
+        ],
+    },
+    {
+        "label": "澳大利亚储备银行",
+        "url": "https://www.rba.gov.au/",
+        "aliases": [
+            "澳大利亚央行",
+            "澳洲央行",
+            "rba",
+            "reserve bank of australia",
+        ],
+        "query_terms": [
+            "RBA rate decision",
+            "RBA inflation outlook",
+        ],
+    },
+    {
+        "label": "中国人民银行",
+        "url": "https://www.pbc.gov.cn/en/3688006/index.html",
+        "aliases": [
+            "中国人民银行",
+            "中国央行",
+            "人民银行",
+            "央行",
+            "pboc",
+            "people's bank of china",
+            "mlf",
+            "中期借贷便利",
+            "一年期mlf",
+        ],
+        "query_terms": [
+            "PBOC one-year MLF rate",
+            "People's Bank of China MLF operation",
+        ],
+    },
+    {
+        "label": "国家外汇管理局",
+        "url": "https://www.safe.gov.cn/en/",
+        "aliases": [
+            "国家外汇管理局",
+            "外汇管理局",
+            "safe",
+            "state administration of foreign exchange",
+            "资本外流",
+            "资金外流",
+        ],
+        "query_terms": [
+            "SAFE China cross-border capital flows",
+            "SAFE China balance of payments",
+        ],
+    },
+    {
+        "label": "中国证监会",
+        "url": "https://www.csrc.gov.cn/csrc_en/",
+        "aliases": [
+            "中国证监会",
+            "证监会",
+            "csrc",
+            "china securities regulatory commission",
+            "跨境证券",
+            "老虎证券",
+            "富途",
+            "长桥",
+            "tiger brokers",
+            "futu",
+            "longbridge",
+        ],
+        "query_terms": [
+            "CSRC cross-border brokerage",
+            "China broker crackdown CSRC",
+        ],
+    },
+    {
+        "label": "中国国家统计局",
+        "url": "https://www.stats.gov.cn/",
+        "aliases": [
+            "中国国家统计局",
+            "国家统计局",
+            "中国工业利润",
+            "中国pmi",
+            "工业利润",
+            "制造业pmi",
+            "nbs china",
+            "national bureau of statistics of china",
+        ],
+        "query_terms": [
+            "NBS China industrial profits",
+            "NBS China PMI",
+        ],
+    },
+    {
+        "label": "中国物流与采购联合会",
+        "url": "https://www.chinawuliu.com.cn/",
+        "aliases": [
+            "中国物流与采购联合会",
+            "cflp",
+            "china federation of logistics and purchasing",
+            "中国pmi",
+            "制造业pmi",
+        ],
+        "query_terms": [
+            "CFLP PMI China",
+        ],
+    },
+    {
+        "label": "香港交易所",
+        "url": "https://www.hkex.com.hk/",
+        "aliases": [
+            "香港ipo",
+            "香港上市",
+            "港交所",
+            "hkex",
+            "hong kong ipo",
+            "hong kong exchange",
+        ],
+        "query_terms": [
+            "HKEX IPO filing",
+        ],
+    },
+    {
+        "label": "美国众议院中国问题特别委员会",
+        "url": "https://selectcommitteeontheccp.house.gov/",
+        "aliases": [
+            "中国问题特别委员会",
+            "美国国会",
+            "house select committee on the chinese communist party",
+            "select committee on the ccp",
+            "众议院中国委员会",
+        ],
+        "query_terms": [
+            "House CCP committee CATL Hong Kong IPO",
+        ],
+    },
+    {
+        "label": "以色列总理办公室",
+        "url": "https://www.gov.il/en/departments/prime_ministers_office",
+        "aliases": [
+            "以色列总理办公室",
+            "内塔尼亚胡",
+            "netanyahu",
+            "prime minister's office israel",
+            "israeli prime minister office",
+        ],
+        "query_terms": [
+            "Netanyahu meeting statement",
+        ],
+    },
+    {
         "label": "乌克兰国防部官网",
         "url": "https://mod.gov.ua/en",
         "aliases": ["乌克兰国防部", "ukrainian ministry of defence", "ministry of defence of ukraine", "mod ukraine"],
+    },
+    {
+        "label": "基辅市政府",
+        "url": "https://kyivcity.gov.ua/",
+        "aliases": ["基辅市政府", "基辅市政", "kyiv city government", "kyiv city state administration", "kyiv city"],
     },
     {
         "label": "Defense News",
@@ -3017,9 +3310,19 @@ AUTHORITATIVE_SOURCE_RULES = [
         "aliases": ["ukmto", "united kingdom maritime trade operations", "英国海事贸易行动中心"],
     },
     {
+        "label": "Yahoo Finance",
+        "url": "https://finance.yahoo.com/",
+        "aliases": ["雅虎财经", "yahoo finance"],
+        "query_terms": [
+            "Yahoo Finance blue-chip stocks",
+            "Yahoo Finance Walmart Realty Income Philip Morris",
+        ],
+    },
+    {
         "label": "彭博社",
         "url": "https://www.bloomberg.com/",
         "aliases": ["彭博社", "彭博", "bloomberg"],
+        "query_terms": ["Bloomberg markets", "Bloomberg politics"],
     },
     {
         "label": "台湾证券交易所",
@@ -3035,8 +3338,167 @@ AUTHORITATIVE_SOURCE_RULES = [
         "label": "路透社",
         "url": "https://www.reuters.com/",
         "aliases": ["路透社", "reuters"],
+        "query_terms": ["Reuters world", "Reuters markets"],
+    },
+    {
+        "label": "美联社",
+        "url": "https://apnews.com/",
+        "aliases": ["美联社", "associated press", "ap news", "apnews"],
+    },
+    {
+        "label": "纽约时报",
+        "url": "https://www.nytimes.com/",
+        "aliases": ["纽约时报", "new york times", "nytimes", "nyt"],
+        "query_terms": ["New York Times world", "New York Times business"],
+    },
+    {
+        "label": "华尔街日报",
+        "url": "https://www.wsj.com/",
+        "aliases": ["华尔街日报", "wall street journal", "wsj"],
+        "query_terms": ["Wall Street Journal world", "Wall Street Journal markets"],
+    },
+    {
+        "label": "金融时报",
+        "url": "https://www.ft.com/",
+        "aliases": ["金融时报", "financial times", "ft.com"],
+        "query_terms": ["Financial Times world", "Financial Times markets"],
+    },
+    {
+        "label": "华盛顿邮报",
+        "url": "https://www.washingtonpost.com/",
+        "aliases": ["华盛顿邮报", "washington post", "wapo"],
+    },
+    {
+        "label": "基辅独立报",
+        "url": "https://kyivindependent.com/",
+        "aliases": ["基辅独立报", "kyiv independent", "the kyiv independent"],
+    },
+    {
+        "label": "乌克兰国家通讯社",
+        "url": "https://www.ukrinform.net/",
+        "aliases": ["ukrinform", "乌克兰国家通讯社", "ukrainian national news"],
+    },
+    {
+        "label": "日经亚洲",
+        "url": "https://asia.nikkei.com/",
+        "aliases": ["日经", "nikkei", "nikkei asia"],
+    },
+    {
+        "label": "Axios",
+        "url": "https://www.axios.com/",
+        "aliases": ["axios"],
+    },
+    {
+        "label": "CNBC",
+        "url": "https://www.cnbc.com/",
+        "aliases": ["cnbc"],
     },
 ]
+
+
+MAJOR_MEDIA_DOMAINS = {
+    "reuters.com",
+    "www.reuters.com",
+    "apnews.com",
+    "www.apnews.com",
+    "bloomberg.com",
+    "www.bloomberg.com",
+    "nytimes.com",
+    "www.nytimes.com",
+    "washingtonpost.com",
+    "www.washingtonpost.com",
+    "cnn.com",
+    "www.cnn.com",
+    "bbc.com",
+    "www.bbc.com",
+    "bbc.co.uk",
+    "www.bbc.co.uk",
+    "wsj.com",
+    "www.wsj.com",
+    "ft.com",
+    "www.ft.com",
+    "theguardian.com",
+    "www.theguardian.com",
+    "caixin.com",
+    "www.caixin.com",
+    "axios.com",
+    "www.axios.com",
+    "cnbc.com",
+    "www.cnbc.com",
+    "nikkei.com",
+    "www.nikkei.com",
+    "asia.nikkei.com",
+    "kyivindependent.com",
+    "www.kyivindependent.com",
+    "ukrinform.net",
+    "www.ukrinform.net",
+    "aljazeera.com",
+    "www.aljazeera.com",
+    "thehill.com",
+    "www.thehill.com",
+    "politico.com",
+    "www.politico.com",
+    "foxbusiness.com",
+    "www.foxbusiness.com",
+}
+
+NOISY_FACT_CHECK_DOMAIN_TOKENS = (
+    "google.",
+    "bing.",
+    "youtube.com",
+    "youtu.be",
+    "bilibili.com",
+    "douyin.com",
+    "tiktok.com",
+    "x.com",
+    "twitter.com",
+    "facebook.com",
+    "instagram.com",
+    "weibo.com",
+)
+
+NOISY_FACT_CHECK_PATH_TOKENS = (
+    "/search",
+    "/video",
+    "/videos",
+    "/shorts",
+    "/playlist",
+    "/account",
+    "/login",
+    "/signin",
+    "/signup",
+    "/register",
+    "/tag/",
+    "/tags/",
+    "/topic/",
+    "/topics/",
+    "/category/",
+    "/categories/",
+    "/biography/",
+    "/encyclopedia/",
+    "/dictionary/",
+    "/hans/",
+)
+
+SYNDICATED_FACT_CHECK_DOMAINS = {
+    "msn.com",
+    "www.msn.com",
+}
+
+PRIMARY_SOURCE_DOMAIN_HINTS = (
+    ("wall street journal", "www.wsj.com"),
+    ("wsj", "www.wsj.com"),
+    ("financial times", "www.ft.com"),
+)
+
+WIRE_SERVICE_DOMAIN_HINTS = (
+    (r"\breuters\b", "www.reuters.com"),
+    (r"\bassociated press\b|\bap\b", "apnews.com"),
+    (r"\bbloomberg\b", "www.bloomberg.com"),
+)
+
+
+_FACT_CHECK_ARTICLE_MATCH_CACHE: dict[tuple[str, str], dict] = {}
 
 
 def _build_search_url(query: str, *, engine: str = "google", news: bool = False) -> str:
@@ -3049,6 +3511,1544 @@ def _build_search_url(query: str, *, engine: str = "google", news: bool = False)
     if news:
         return f"https://www.google.com/search?tbm=nws&q={encoded_q}"
     return f"https://www.google.com/search?q={encoded_q}"
+
+
+def _normalize_fact_check_source_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        filtered_query_pairs = []
+        for key, value in parse_qsl(parsed.query or "", keep_blank_values=True):
+            lowered_key = str(key or "").strip().lower()
+            if not lowered_key:
+                continue
+            if (
+                lowered_key.startswith("utm_")
+                or lowered_key in {
+                    "ved", "ei", "usg", "at", "ref", "ref_src", "feature", "fbclid", "gclid",
+                    "igshid", "mc_cid", "mc_eid", "src", "source", "spm", "from", "mkt_tok",
+                }
+            ):
+                continue
+            filtered_query_pairs.append((key, value))
+        normalized_path = re.sub(r"/+$", "", parsed.path or "")
+        normalized_query = urlencode(filtered_query_pairs, doseq=True)
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), normalized_path, parsed.params, normalized_query, ""))
+    except Exception:
+        return raw
+
+
+def _extract_fact_check_tokens(text: str) -> list[str]:
+    raw_tokens = re.findall(
+        r"(?:19|20)\d{2}|\d+(?:\.\d+)?(?:%|万亿|亿|万美元|美元|元|桶)?|[A-Za-z][A-Za-z0-9._-]{2,}|[\u4e00-\u9fff]{2,16}",
+        str(text or ""),
+        re.I,
+    )
+    stopwords = {
+        "相关",
+        "有关",
+        "消息",
+        "报道",
+        "报道称",
+        "消息称",
+        "视频",
+        "新闻",
+        "网页",
+        "官网",
+        "official",
+        "statement",
+        "reported",
+        "report",
+        "news",
+    }
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        cleaned = re.sub(r"\s+", " ", str(token or "")).strip().lower()
+        if not cleaned or cleaned in seen or cleaned in stopwords:
+            continue
+        seen.add(cleaned)
+        tokens.append(cleaned)
+    return tokens
+
+
+def _collect_fact_check_match_stats(
+    haystack: str,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+) -> dict:
+    tokens = _extract_fact_check_tokens(" ".join([claim_text, query_text]))
+    matched_tokens: list[str] = []
+    numeric_matches: list[str] = []
+    substantive_matches: list[str] = []
+    haystack_lower = str(haystack or "").lower()
+    for token in tokens:
+        if not token or token not in haystack_lower:
+            continue
+        matched_tokens.append(token)
+        if re.search(r"\d", token):
+            if not (token.isdigit() and len(token) < 3):
+                numeric_matches.append(token)
+            continue
+        if len(token) >= 4:
+            substantive_matches.append(token)
+    return {
+        "tokens": tokens,
+        "matched_tokens": matched_tokens,
+        "matched_token_count": len(matched_tokens),
+        "numeric_tokens": [token for token in tokens if re.search(r"\d", token) and not (token.isdigit() and len(token) < 3)],
+        "matched_numeric_tokens": numeric_matches,
+        "matched_substantive_tokens": substantive_matches,
+    }
+
+
+def _is_noise_fact_check_hit(item: dict) -> bool:
+    url = str(item.get("url") or "").strip()
+    title = str(item.get("title") or "").strip().lower()
+    source_name = str(item.get("source") or "").strip().lower()
+    snippet = str(item.get("snippet") or "").strip().lower()
+    if not url:
+        return True
+    parsed = urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    normalized_url = _normalize_fact_check_source_url(url)
+    if not normalized_url or not domain:
+        return True
+    if any(token in domain for token in NOISY_FACT_CHECK_DOMAIN_TOKENS):
+        return True
+    if any(token in path for token in NOISY_FACT_CHECK_PATH_TOKENS):
+        return True
+    if any(token in normalized_url.lower() for token in ("?s=", "?search=", "/search?", "tbm=nws", "bing.com/news/search")):
+        return True
+    noisy_title_tokens = [
+        "watch video",
+        "watch live",
+        "playlist",
+        "login",
+        "sign in",
+        "register",
+        "subscribe",
+        "results for",
+        "search result",
+        "topic",
+        "tag",
+        "biography",
+        "encyclopedia",
+        "dictionary",
+        "britannica",
+        "汉典",
+    ]
+    if any(token in title for token in noisy_title_tokens):
+        return True
+    if any(token in source_name for token in ("youtube", "bilibili", "douyin", "tiktok")):
+        return True
+    if not title and not snippet:
+        return True
+    return False
+
+
+def _is_relevant_fact_check_hit(
+    item: dict,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+) -> bool:
+    haystack = " ".join(
+        [
+            str(item.get("title") or ""),
+            str(item.get("source") or ""),
+            str(item.get("snippet") or ""),
+        ]
+    ).lower()
+    if not haystack:
+        return False
+    match_stats = _collect_fact_check_match_stats(
+        haystack,
+        claim_text=claim_text,
+        query_text=query_text,
+    )
+    if len(match_stats.get("matched_substantive_tokens") or []) >= 2:
+        return True
+    if (
+        len(match_stats.get("matched_substantive_tokens") or []) >= 1
+        and len(match_stats.get("matched_numeric_tokens") or []) >= 1
+    ):
+        return True
+    if _find_authoritative_sources(haystack):
+        return True
+    return False
+
+
+def _score_fact_check_hit(
+    item: dict,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    preferred_domains: set[str] | None = None,
+) -> int:
+    preferred_domains = {str(domain or "").lower() for domain in (preferred_domains or set()) if str(domain or "").strip()}
+    url = str(item.get("url") or "").strip()
+    title = str(item.get("title") or "").strip()
+    source_name = str(item.get("source") or "").strip()
+    snippet = str(item.get("snippet") or "").strip()
+    parsed = urlparse(str(item.get("source_url") or "").strip()) if _get_fact_check_hit_domain(item) != (urlparse(url).netloc or "").lower() else urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    haystack = " ".join([title, source_name, snippet]).lower()
+    score = 0
+    preferred_domain = _is_preferred_fact_check_domain(domain, preferred_domains)
+    match_stats = _collect_fact_check_match_stats(
+        haystack,
+        claim_text=claim_text,
+        query_text=query_text,
+    )
+
+    if preferred_domains and any(domain == preferred or domain.endswith(f".{preferred}") for preferred in preferred_domains):
+        score += 16
+    if domain in MAJOR_MEDIA_DOMAINS:
+        score += 12
+    if ".gov" in domain or domain.startswith("gov.") or domain.endswith(".gov"):
+        score += 11
+    if any(token in domain for token in ("reuters.com", "apnews.com", "bloomberg.com", "nytimes.com", "washingtonpost.com", "bbc.com", "cnn.com", "wsj.com", "ft.com")):
+        score += 8
+    if path.count("/") >= 2:
+        score += 3
+    if any(token in path for token in ("/news/", "/world/", "/business/", "/politics/", "/markets/", "/article/", "/articles/", "/story/", "/stories/")):
+        score += 5
+    if path in {"", "/"}:
+        score -= 6
+
+    for token in _extract_fact_check_tokens(" ".join([claim_text, query_text])):
+        if token in haystack:
+            if re.search(r"\d", token):
+                if token.isdigit() and len(token) < 3:
+                    continue
+                score += 5
+            elif len(token) >= 6:
+                score += 4
+            else:
+                score += 2
+
+    if match_stats["numeric_tokens"] and not match_stats["matched_numeric_tokens"]:
+        score -= 8
+    if not preferred_domain and match_stats["matched_token_count"] <= 1:
+        score -= 10
+    elif not preferred_domain and len(match_stats["matched_substantive_tokens"]) <= 1:
+        score -= 6
+    if (
+        not preferred_domain
+        and re.search(r"[A-Za-z]{3,}", query_text or "")
+        and re.search(r"[\u4e00-\u9fff]", title + snippet)
+    ):
+        score -= 6
+
+    if title:
+        title_lower = title.lower()
+        for token in _extract_fact_check_tokens(claim_text):
+            if token in title_lower:
+                if token.isdigit() and len(token) < 3:
+                    continue
+                score += 2
+
+    return score
+
+
+def _rerank_fact_check_hits(
+    items: list[dict],
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    preferred_domains: set[str] | None = None,
+    max_items: int = 3,
+) -> list[dict]:
+    ranked: list[tuple[int, int, dict]] = []
+    for idx, item in enumerate(items or []):
+        if _is_noise_fact_check_hit(item):
+            continue
+        score = _score_fact_check_hit(
+            item,
+            claim_text=claim_text,
+            query_text=query_text,
+            preferred_domains=preferred_domains,
+        )
+        enriched = dict(item)
+        enriched["match_score"] = score
+        ranked.append((score, idx, enriched))
+    ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+    return [item for _, _, item in ranked[:max_items]]
+
+
+def _is_preferred_fact_check_domain(domain: str, preferred_domains: set[str] | None = None) -> bool:
+    normalized_domain = str(domain or "").strip().lower()
+    preferred = {
+        str(item or "").strip().lower()
+        for item in (preferred_domains or set())
+        if str(item or "").strip()
+    }
+    if not normalized_domain:
+        return False
+    return (
+        normalized_domain in MAJOR_MEDIA_DOMAINS
+        or any(
+            normalized_domain == item or normalized_domain.endswith(f".{item}")
+            for item in preferred
+        )
+        or ".gov" in normalized_domain
+        or normalized_domain.startswith("gov.")
+        or normalized_domain.endswith(".gov")
+    )
+
+
+def _extract_fact_check_article_match_signals(
+    url: str,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    proxy_url: str = None,
+) -> dict:
+    normalized_url = _normalize_fact_check_source_url(url)
+    match_basis = clean_document_text(" ".join([claim_text, query_text]))[:300].lower()
+    default_result = {"article_match_score": 0, "article_match_tokens": []}
+    if not normalized_url or not match_basis:
+        return default_result
+    cache_key = (normalized_url, match_basis)
+    if cache_key in _FACT_CHECK_ARTICLE_MATCH_CACHE:
+        return dict(_FACT_CHECK_ARTICLE_MATCH_CACHE[cache_key])
+    try:
+        article = extract_web_article_text(url, proxy_url=proxy_url)
+        article_text = clean_document_text(
+            str(article.get("clean_text") or article.get("raw_text") or "")
+        )[:8000].lower()
+        if not article_text:
+            _FACT_CHECK_ARTICLE_MATCH_CACHE[cache_key] = dict(default_result)
+            return dict(default_result)
+        matched_tokens: list[str] = []
+        score = 0
+        for token in _extract_fact_check_tokens(" ".join([claim_text, query_text]))[:12]:
+            if token.isdigit() and len(token) < 3:
+                continue
+            if token not in article_text:
+                continue
+            matched_tokens.append(token)
+            if re.search(r"\d", token):
+                score += 6
+            elif re.search(r"[\u4e00-\u9fff]", token) and len(token) >= 4:
+                score += 4
+            elif len(token) >= 6:
+                score += 4
+            else:
+                score += 2
+        if len(matched_tokens) >= 3:
+            score += 4
+        if len(matched_tokens) >= 5:
+            score += 4
+        result = {
+            "article_match_score": score,
+            "article_match_tokens": matched_tokens[:5],
+        }
+    except Exception:
+        result = dict(default_result)
+    _FACT_CHECK_ARTICLE_MATCH_CACHE[cache_key] = dict(result)
+    return dict(result)
+
+
+def _refine_fact_check_hits_with_article_text(
+    items: list[dict],
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    proxy_url: str = None,
+    article_fetch_limit: int = 2,
+) -> list[dict]:
+    if not items or not str(claim_text or query_text).strip():
+        return items
+    ranked_items = [dict(item) for item in (items or [])]
+    fetch_budget = max(0, min(len(ranked_items), int(article_fetch_limit or 0)))
+    for idx in range(fetch_budget):
+        item = ranked_items[idx]
+        signals = _extract_fact_check_article_match_signals(
+            str(item.get("url") or ""),
+            claim_text=claim_text,
+            query_text=query_text,
+            proxy_url=proxy_url,
+        )
+        if not signals:
+            continue
+        item.update(signals)
+        item["match_score"] = int(item.get("match_score") or 0) + int(
+            signals.get("article_match_score") or 0
+        )
+    ranked_items.sort(
+        key=lambda item: (-int(item.get("match_score") or 0), -int(item.get("article_match_score") or 0))
+    )
+    return ranked_items
+
+
+def _prune_fact_check_hits(
+    items: list[dict],
+    *,
+    preferred_domains: set[str] | None = None,
+    max_items: int = 3,
+) -> list[dict]:
+    if not items:
+        return []
+    ranked_items = [dict(item) for item in items]
+    top_score = int(ranked_items[0].get("match_score") or 0)
+    kept: list[dict] = []
+    for idx, item in enumerate(ranked_items):
+        if len(kept) >= max_items:
+            break
+        if idx == 0:
+            kept.append(item)
+            continue
+        score = int(item.get("match_score") or 0)
+        domain = _get_fact_check_hit_domain(item)
+        if score >= max(10, top_score - 10):
+            kept.append(item)
+            continue
+        if _is_preferred_fact_check_domain(domain, preferred_domains) and score >= max(8, top_score - 14):
+            kept.append(item)
+    return kept
+
+
+def _dedupe_fact_check_source_links(source_links: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    deduped: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, url in source_links:
+        raw_url = str(url or "").strip()
+        normalized = _normalize_fact_check_source_url(raw_url)
+        if not raw_url or not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append((str(label or "").strip() or raw_url, raw_url))
+    return deduped
+
+
+def _strip_html_tags(text: str) -> str:
+    value = re.sub(r"<[^>]+>", " ", str(text or ""))
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _unwrap_bing_news_redirect(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if "bing.com" not in (parsed.netloc or "").lower():
+            return raw
+        target = parse_qs(parsed.query or "").get("url", [""])[0].strip()
+        return target or raw
+    except Exception:
+        return raw
+
+
+GOOGLE_NEWS_AGGREGATOR_DOMAINS = {
+    "news.google.com",
+    "www.news.google.com",
+}
+
+
+def _get_fact_check_hit_domain(item: dict) -> str:
+    url = str(item.get("url") or "").strip()
+    source_url = str(item.get("source_url") or "").strip()
+    url_domain = (urlparse(url).netloc or "").lower()
+    source_domain = (urlparse(source_url).netloc or "").lower()
+    if url_domain in GOOGLE_NEWS_AGGREGATOR_DOMAINS and source_domain:
+        return source_domain
+    return url_domain or source_domain
+
+
+def _extract_fact_check_site_query_domains(query: str) -> list[str]:
+    domains: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"(?<!\S)site:([^\s/]+)", str(query or ""), flags=re.I):
+        domain = str(match or "").strip().strip("()\"'").lower()
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        domains.append(domain)
+    return domains
+
+
+def _fact_check_hit_matches_domain(item: dict, domain: str) -> bool:
+    normalized_domain = str(domain or "").strip().lower()
+    if not normalized_domain:
+        return False
+    candidates = {
+        (urlparse(str(item.get("url") or "").strip()).netloc or "").lower(),
+        (urlparse(str(item.get("source_url") or "").strip()).netloc or "").lower(),
+        _get_fact_check_hit_domain(item),
+    }
+    return any(
+        candidate and (candidate == normalized_domain or candidate.endswith(f".{normalized_domain}"))
+        for candidate in candidates
+    )
+
+
+def _extract_google_news_article_id(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if "news.google.com" not in (parsed.netloc or "").lower():
+            return ""
+        path_parts = [part for part in (parsed.path or "").split("/") if part]
+        for idx, part in enumerate(path_parts[:-1]):
+            if part in {"articles", "read"}:
+                return path_parts[idx + 1]
+    except Exception:
+        return ""
+    return ""
+
+
+def _get_response_set_cookie_headers(response) -> list[str]:
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    if raw_headers is not None and hasattr(raw_headers, "get_all"):
+        try:
+            values = raw_headers.get_all("Set-Cookie") or []
+            if values:
+                return [str(value or "").strip() for value in values if str(value or "").strip()]
+        except Exception:
+            pass
+    header_value = str(getattr(response, "headers", {}).get("Set-Cookie") or "").strip()
+    return [header_value] if header_value else []
+
+
+def _merge_cookie_header(cookie_header: str, set_cookie_headers: list[str]) -> str:
+    cookies: dict[str, str] = {}
+    for chunk in str(cookie_header or "").split(";"):
+        name, sep, value = chunk.strip().partition("=")
+        if sep and name:
+            cookies[name] = value
+    for header in set_cookie_headers or []:
+        name, sep, value = str(header or "").split(";", 1)[0].strip().partition("=")
+        if sep and name:
+            cookies[name] = value
+    return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+
+def _extract_google_news_decode_params(article_id: str, proxy_url: str = None) -> tuple[str, str, str]:
+    if not article_id:
+        return "", "", ""
+    cookie_header = "CONSENT=PENDING+987"
+    candidate_urls = [
+        f"https://news.google.com/articles/{article_id}",
+        f"https://news.google.com/rss/articles/{article_id}?oc=5",
+    ]
+    page_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+    }
+    for candidate_url in candidate_urls:
+        try:
+            response = requests.get(
+                candidate_url,
+                headers={**page_headers, "Cookie": cookie_header},
+                allow_redirects=False,
+                **_build_requests_kwargs(proxy_url, timeout_seconds=8.0),
+            )
+        except Exception:
+            continue
+        cookie_header = _merge_cookie_header(cookie_header, _get_response_set_cookie_headers(response))
+        response_text = str(response.text or "")
+        if "consent.google.com" in str(response.headers.get("Location") or "").lower():
+            continue
+        signature_match = re.search(r'data-n-a-sg="([^"]+)"', response_text)
+        timestamp_match = re.search(r'data-n-a-ts="([^"]+)"', response_text)
+        if signature_match and timestamp_match:
+            return (
+                signature_match.group(1).strip(),
+                timestamp_match.group(1).strip(),
+                cookie_header,
+            )
+    return "", "", cookie_header
+
+
+def _parse_google_batchexecute_response(response_text: str) -> str:
+    payload = str(response_text or "")
+    if not payload:
+        return ""
+    try:
+        if payload.startswith(")]}'"):
+            payload = payload.split("\n\n", 1)[1]
+        parsed = json.loads(payload)
+        inner_payload = parsed[0][2]
+        if isinstance(inner_payload, str):
+            inner = json.loads(inner_payload)
+            decoded_url = str(inner[1] or "").strip()
+            if decoded_url.startswith(("http://", "https://")):
+                return decoded_url
+    except Exception:
+        pass
+    match = re.search(r'\[\\"garturlres\\",\\"(.*?)\\",', payload)
+    if not match:
+        match = re.search(r'\["garturlres","(.*?)",', payload)
+    if not match:
+        return ""
+    try:
+        decoded_url = bytes(match.group(1), "utf-8").decode("unicode_escape")
+    except Exception:
+        decoded_url = match.group(1)
+    return decoded_url if decoded_url.startswith(("http://", "https://")) else ""
+
+
+def _decode_google_news_url_via_signature(article_id: str, proxy_url: str = None) -> str:
+    signature, timestamp, cookie_header = _extract_google_news_decode_params(article_id, proxy_url=proxy_url)
+    if not signature or not timestamp:
+        return ""
+    inner_payload = json.dumps(
+        [
+            "garturlreq",
+            [
+                ["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+                "X",
+                "X",
+                1,
+                [1, 1, 1],
+                1,
+                1,
+                None,
+                0,
+                0,
+                None,
+                0,
+            ],
+            article_id,
+            int(timestamp),
+            signature,
+        ],
+        separators=(",", ":"),
+    )
+    payload = json.dumps([[["Fbv4je", inner_payload]]], separators=(",", ":"))
+    try:
+        response = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            params={"rpcids": "Fbv4je"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "Origin": "https://news.google.com",
+                "Referer": "https://news.google.com/",
+                "x-same-domain": "1",
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Cookie": cookie_header,
+            },
+            data={"f.req": payload},
+            **_build_requests_kwargs(proxy_url, timeout_seconds=10.0),
+        )
+        response.raise_for_status()
+    except Exception:
+        return ""
+    return _parse_google_batchexecute_response(str(response.text or ""))
+
+
+def _decode_google_news_url(url: str, proxy_url: str = None) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if "news.google.com" not in (parsed.netloc or "").lower():
+            return raw
+        article_id = _extract_google_news_article_id(raw)
+        if not article_id:
+            return raw
+
+        padded = article_id + ("=" * (-len(article_id) % 4))
+        decoded_bytes = base64.urlsafe_b64decode(padded)
+        if decoded_bytes.startswith(b"\x08\x13\x22"):
+            decoded_bytes = decoded_bytes[3:]
+        if decoded_bytes.endswith(b"\xd2\x01\x00"):
+            decoded_bytes = decoded_bytes[:-3]
+        if not decoded_bytes:
+            return raw
+
+        first_len = decoded_bytes[0]
+        if first_len >= 0x80 and len(decoded_bytes) >= 2:
+            candidate = decoded_bytes[2:first_len + 2].decode("latin1", errors="ignore")
+        else:
+            candidate = decoded_bytes[1:first_len + 1].decode("latin1", errors="ignore")
+        if candidate.startswith(("http://", "https://")):
+            return candidate
+        if not candidate.startswith("AU_yqL"):
+            return raw
+
+        decoded_url = _decode_google_news_url_via_signature(article_id, proxy_url=proxy_url)
+        if decoded_url:
+            return decoded_url
+
+        payload = (
+            '[[["Fbv4je","[\\"garturlreq\\",[[\\"en-US\\",\\"US\\",'
+            '[\\"FINANCE_TOP_INDICES\\",\\"WEB_TEST_1_0_0\\"],null,null,1,1,\\"US:en\\",null,180,'
+            'null,null,null,null,null,0,null,null,[1608992183,723341000]],\\"en-US\\",\\"US\\",1,'
+            '[2,3,4,8],1,0,\\"655000234\\",0,0,null,0],\\"'
+            + article_id
+            + '\\"]",null,"generic"]]]'
+        )
+        response = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je",
+            headers={
+                **_build_article_headers("https://news.google.com/"),
+                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+                "Referer": "https://news.google.com/",
+            },
+            data=f"f.req={quote(payload, safe='')}",
+            **_build_requests_kwargs(proxy_url, timeout_seconds=10.0),
+        )
+        response.raise_for_status()
+        decoded_url = _parse_google_batchexecute_response(str(response.text or ""))
+        return decoded_url or raw
+    except Exception:
+        return raw
+
+
+def _fetch_bing_news_results(query: str, proxy_url: str = None, max_items: int = 4) -> list[dict]:
+    query_text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query_text or max_items <= 0:
+        return []
+
+    feed_url = f"https://www.bing.com/news/search?format=rss&q={quote(query_text)}"
+    required_domains = _extract_fact_check_site_query_domains(query_text)
+    try:
+        import xml.etree.ElementTree as ET
+
+        response = requests.get(
+            feed_url,
+            headers=_build_article_headers(feed_url),
+            **_build_requests_kwargs(proxy_url, timeout_seconds=6.0),
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    except Exception:
+        return []
+
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+    for item in root.findall(".//item"):
+        title = _strip_html_tags(item.findtext("title", default=""))
+        link = _unwrap_bing_news_redirect(str(item.findtext("link", default="") or "").strip())
+        description = _strip_html_tags(item.findtext("description", default=""))
+        pub_date = _strip_html_tags(item.findtext("pubDate", default=""))
+        source_name = ""
+
+        source_node = item.find("source")
+        if source_node is not None:
+            source_name = _strip_html_tags(source_node.text or "")
+
+        if not source_name:
+            for child in list(item):
+                tag_name = str(child.tag or "")
+                if tag_name.lower().endswith("source"):
+                    source_name = _strip_html_tags(child.text or "")
+                    if source_name:
+                        break
+
+        normalized_link = _normalize_fact_check_source_url(link)
+        if not title or not link or not normalized_link or normalized_link in seen_urls:
+            continue
+        candidate = {
+            "title": title,
+            "url": link,
+            "source": source_name,
+            "snippet": description,
+            "published_at": pub_date,
+        }
+        if required_domains and not any(
+            _fact_check_hit_matches_domain(candidate, domain) for domain in required_domains
+        ):
+            continue
+        seen_urls.add(normalized_link)
+        items.append(candidate)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _fetch_google_news_results(query: str, proxy_url: str = None, max_items: int = 4) -> list[dict]:
+    query_text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query_text or max_items <= 0:
+        return []
+
+    feed_url = f"https://news.google.com/rss/search?q={quote(query_text)}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        import xml.etree.ElementTree as ET
+
+        response = requests.get(
+            feed_url,
+            headers=_build_article_headers(feed_url),
+            **_build_requests_kwargs(proxy_url, timeout_seconds=6.0),
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    except Exception:
+        return []
+
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+    for item in root.findall(".//item"):
+        title = _strip_html_tags(item.findtext("title", default=""))
+        link = _decode_google_news_url(str(item.findtext("link", default="") or "").strip(), proxy_url=proxy_url)
+        description = _strip_html_tags(item.findtext("description", default=""))
+        pub_date = _strip_html_tags(item.findtext("pubDate", default=""))
+        source_name = ""
+
+        source_node = item.find("source")
+        if source_node is not None:
+            source_name = _strip_html_tags(source_node.text or "")
+            source_url = str(source_node.get("url") or "").strip()
+        else:
+            source_url = ""
+
+        normalized_link = _normalize_fact_check_source_url(link)
+        if not title or not link or not normalized_link or normalized_link in seen_urls:
+            continue
+        seen_urls.add(normalized_link)
+        items.append(
+            {
+                "title": title,
+                "url": link,
+                "source": source_name,
+                "source_url": source_url,
+                "snippet": description,
+                "published_at": pub_date,
+            }
+        )
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _fetch_bing_web_results(query: str, proxy_url: str = None, max_items: int = 4) -> list[dict]:
+    query_text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query_text or max_items <= 0:
+        return []
+
+    search_url = f"https://www.bing.com/search?q={quote(query_text)}"
+    required_domains = _extract_fact_check_site_query_domains(query_text)
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    try:
+        response = requests.get(
+            search_url,
+            headers=_build_article_headers(search_url),
+            **_build_requests_kwargs(proxy_url, timeout_seconds=8.0),
+        )
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    html = str(response.text or "")
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+    for node in soup.select("li.b_algo"):
+        anchor = node.select_one("h2 a") or node.select_one("a")
+        if anchor is None:
+            continue
+        title = _strip_html_tags(anchor.get_text(" ", strip=True))
+        url = str(anchor.get("href") or "").strip()
+        normalized_url = _normalize_fact_check_source_url(url)
+        if not title or not url or not normalized_url or normalized_url in seen_urls:
+            continue
+
+        snippet_node = node.select_one(".b_caption p") or node.select_one("p")
+        snippet = _strip_html_tags(snippet_node.get_text(" ", strip=True) if snippet_node else "")
+        cite_node = node.select_one("cite")
+        source_name = _strip_html_tags(cite_node.get_text(" ", strip=True) if cite_node else "")
+        candidate = {
+            "title": title,
+            "url": url,
+            "source": source_name,
+            "snippet": snippet,
+            "published_at": "",
+        }
+        if required_domains and not any(
+            _fact_check_hit_matches_domain(candidate, domain) for domain in required_domains
+        ):
+            continue
+
+        seen_urls.add(normalized_url)
+        items.append(candidate)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _guess_fact_check_primary_source_domain(source_name: str) -> str:
+    source_text = re.sub(r"\s+", " ", str(source_name or "")).strip().lower()
+    if not source_text:
+        return ""
+    matched_sources = _find_authoritative_sources(source_text)
+    if matched_sources:
+        return (urlparse(str(matched_sources[0].get("url") or "")).netloc or "").lower()
+    for needle, domain in PRIMARY_SOURCE_DOMAIN_HINTS:
+        if needle in source_text:
+            return domain
+    return ""
+
+
+def _guess_fact_check_item_primary_source_domain(item: dict) -> str:
+    source_url = str(item.get("source_url") or "").strip()
+    source_domain = (urlparse(source_url).netloc or "").lower()
+    if source_domain:
+        return source_domain
+    combined = " ".join(
+        [
+            str(item.get("source") or ""),
+            str(item.get("title") or ""),
+            str(item.get("snippet") or ""),
+        ]
+    ).strip()
+    matched_sources = _find_authoritative_sources(combined)
+    if matched_sources:
+        return (urlparse(str(matched_sources[0].get("url") or "")).netloc or "").lower()
+    source_domain = _guess_fact_check_primary_source_domain(str(item.get("source") or ""))
+    if source_domain:
+        return source_domain
+    lowered = combined.lower()
+    for pattern, domain in WIRE_SERVICE_DOMAIN_HINTS:
+        if re.search(pattern, lowered, re.I):
+            return domain
+    return ""
+
+
+def _slugify_fact_check_title(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    value = re.sub(
+        r"\s*[-|]\s*(reuters|associated press|ap|bloomberg)\s*$",
+        "",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r"\b(?:[A-Za-z]\.){2,}",
+        lambda match: match.group(0).replace(".", ""),
+        value,
+    )
+    value = value.lower().replace("&", " and ")
+    value = re.sub(r"[’']", "", value)
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+    return value
+
+
+def _build_reuters_title_variants(
+    title: str,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    snippet: str = "",
+) -> list[str]:
+    base_title = re.sub(r"\s+", " ", str(title or "")).strip(" -|")
+    if not base_title:
+        return []
+    combined_text = clean_document_text(" ".join([claim_text, query_text, snippet])).lower()
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        candidate = re.sub(r"\s+", " ", str(value or "")).strip(" -|,;:")
+        lowered = candidate.lower()
+        if not candidate or lowered in seen:
+            return
+        if len(_slugify_fact_check_title(candidate)) < 16:
+            return
+        seen.add(lowered)
+        variants.append(candidate)
+
+    add(base_title)
+    without_parenthetical = re.sub(r"\s+\([^)]*\)\s*$", "", base_title).strip(" -|")
+    add(without_parenthetical)
+    for separator in (":", ";", ","):
+        prefix = base_title.split(separator, 1)[0].strip(" -|")
+        if len(_extract_fact_check_tokens(prefix)) >= 4:
+            add(prefix)
+
+    if (
+        "no progress" in combined_text
+        and "if no progress" not in base_title.lower()
+        and re.search(r"\bstop mediating\b", base_title, re.I)
+    ):
+        add(f"{base_title} if no progress")
+    if (
+        "as early as next week" in combined_text
+        and "as early as next week" not in base_title.lower()
+        and re.search(r"\bvisit\b", base_title, re.I)
+    ):
+        add(f"{base_title} as early as next week")
+    if "yonhap reports" in combined_text and "yonhap reports" not in base_title.lower():
+        add(f"{base_title}, Yonhap reports")
+    return variants[:6]
+
+
+def _get_fact_check_candidate_dates(published_at: str) -> list[str]:
+    published_text = re.sub(r"\s+", " ", str(published_at or "")).strip()
+    if not published_text:
+        return []
+    try:
+        parsed = parsedate_to_datetime(published_text)
+    except Exception:
+        return []
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    dates: list[str] = []
+    seen: set[str] = set()
+    for delta_days in (0, -1, 1):
+        candidate = (parsed + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        dates.append(candidate)
+    return dates
+
+
+def _guess_reuters_section_candidates(
+    title: str,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    snippet: str = "",
+) -> list[str]:
+    haystack = " ".join([title, claim_text, query_text, snippet]).lower()
+    sections: list[str] = []
+    seen: set[str] = set()
+
+    def add(section: str) -> None:
+        value = str(section or "").strip().strip("/")
+        if not value or value in seen:
+            return
+        seen.add(value)
+        sections.append(value)
+
+    if re.search(r"\b(korea|north korea|south korea|china|xi|pyongyang|beijing|yonhap|asia)\b", haystack):
+        add("world/asia-pacific")
+        add("world/china")
+    if re.search(r"\b(ukraine|russia|kyiv|moscow|europe|rubio|nato)\b", haystack):
+        add("world/europe")
+    if re.search(r"\b(iran|israel|gaza|hormuz|tehran|middle east|netanyahu)\b", haystack):
+        add("world/middle-east")
+        add("world")
+        add("business/energy")
+    if re.search(r"\b(catl|ipo|listing|hkex|hong kong|jpmorgan|bank of america|market|stocks)\b", haystack):
+        add("business")
+        add("markets")
+        add("world/china")
+    add("world")
+    add("business")
+    add("markets")
+    return sections
+
+
+def _is_probable_reuters_article_url(url: str) -> bool:
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    domain = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if domain and "reuters.com" not in domain:
+        return False
+    if not path or path in {"", "/"}:
+        return False
+    if any(
+        token in path
+        for token in (
+            "/live-updates/",
+            "/graphics/",
+            "/video/",
+            "/videos/",
+            "/podcast/",
+            "/podcasts/",
+            "/pictures/",
+            "/fact-check/",
+            "/breakingviews/",
+            "/plus/",
+        )
+    ):
+        return False
+    last_segment = [segment for segment in path.split("/") if segment]
+    slug = last_segment[-1] if last_segment else ""
+    if any(
+        slug.startswith(prefix)
+        for prefix in (
+            "analysis-",
+            "commentary-",
+            "explainer-",
+            "factbox-",
+            "live-",
+            "liveblog-",
+            "picture-",
+            "podcast-",
+            "timeline-",
+            "video-",
+        )
+    ):
+        return False
+    return True
+
+
+def _fetch_fact_check_page_metadata(url: str, proxy_url: str = None) -> dict:
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return {}
+
+    try:
+        response = requests.get(
+            url,
+            headers=_build_article_headers(url),
+            **_build_requests_kwargs(proxy_url, timeout_seconds=20.0),
+        )
+        response.raise_for_status()
+    except Exception:
+        return {}
+
+    html = str(response.text or "")
+    if not html:
+        return {}
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return {}
+
+    title = ""
+    for selector in (
+        'meta[property="og:title"]',
+        'meta[name="twitter:title"]',
+        'meta[name="title"]',
+    ):
+        node = soup.select_one(selector)
+        content = str(node.get("content") or "").strip() if node else ""
+        if content:
+            title = content
+            break
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    canonical_url = ""
+    canonical_node = soup.select_one('link[rel="canonical"]')
+    if canonical_node:
+        canonical_url = str(canonical_node.get("href") or "").strip()
+    if not canonical_url:
+        og_url = soup.select_one('meta[property="og:url"]')
+        canonical_url = str(og_url.get("content") or "").strip() if og_url else ""
+
+    published_meta = ""
+    for selector in (
+        'meta[property="article:published_time"]',
+        'meta[name="article:published_time"]',
+        'meta[name="pubdate"]',
+        'meta[name="date"]',
+    ):
+        node = soup.select_one(selector)
+        content = str(node.get("content") or "").strip() if node else ""
+        if content:
+            published_meta = content
+            break
+
+    return {
+        "title": title,
+        "canonical_url": canonical_url,
+        "published_at": published_meta,
+    }
+
+
+def _recover_reuters_direct_article_hit(
+    *,
+    title: str,
+    published_at: str = "",
+    claim_text: str = "",
+    query_text: str = "",
+    snippet: str = "",
+    proxy_url: str = None,
+) -> dict | None:
+    clean_title = re.sub(r"\s+", " ", str(title or "")).strip(" -|")
+    title_variants = _build_reuters_title_variants(
+        clean_title,
+        claim_text=claim_text,
+        query_text=query_text,
+        snippet=snippet,
+    )
+    if not title_variants:
+        return None
+
+    dates = _get_fact_check_candidate_dates(published_at)
+    sections = _guess_reuters_section_candidates(
+        title_variants[0],
+        claim_text=claim_text,
+        query_text=query_text,
+        snippet=snippet,
+    )
+    candidate_records: list[dict] = []
+    seen_urls: set[str] = set()
+    candidate_slugs: list[str] = []
+    seen_slugs: set[str] = set()
+    for variant in title_variants[:4]:
+        slug = _slugify_fact_check_title(variant)
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        candidate_slugs.append(slug)
+    for section in sections[:6]:
+        for candidate_date in dates[:3]:
+            for slug in candidate_slugs:
+                url = f"https://www.reuters.com/{section}/{slug}-{candidate_date}/"
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                candidate_records.append(
+                    {
+                        "url": url,
+                        "title_variant": slug,
+                    }
+                )
+
+    title_tokens: list[str] = []
+    seen_title_tokens: set[str] = set()
+    for variant in title_variants[:4]:
+        for token in _extract_fact_check_tokens(variant):
+            if len(token) < 4 and not re.search(r"\d", token):
+                continue
+            if token in seen_title_tokens:
+                continue
+            seen_title_tokens.add(token)
+            title_tokens.append(token)
+    for candidate_record in candidate_records[:10]:
+        candidate_url = str(candidate_record.get("url") or "").strip()
+        matched_tokens: list[str] = []
+        try:
+            article = extract_web_article_text(candidate_url, proxy_url=proxy_url)
+            article_text = clean_document_text(
+                str(article.get("clean_text") or article.get("raw_text") or "")
+            ).lower()
+        except Exception:
+            article_text = ""
+
+        if article_text:
+            matched_tokens = [token for token in title_tokens[:12] if token in article_text]
+        if len(matched_tokens) >= max(3, min(5, len(title_tokens[:12]))):
+            return {
+                "title": clean_title,
+                "url": candidate_url,
+                "source": "Reuters",
+                "source_url": "https://www.reuters.com/",
+                "snippet": snippet,
+                "published_at": published_at,
+                "article_match_tokens": matched_tokens[:5],
+                "article_match_score": 12 + (2 * len(matched_tokens[:5])),
+                "match_score": 38 + (2 * len(matched_tokens[:5])),
+            }
+
+        metadata = _fetch_fact_check_page_metadata(candidate_url, proxy_url=proxy_url)
+        metadata_text = clean_document_text(
+            " ".join(
+                [
+                    str(metadata.get("title") or ""),
+                    str(metadata.get("canonical_url") or ""),
+                    str(metadata.get("published_at") or ""),
+                ]
+            )
+        ).lower()
+        canonical_url = str(metadata.get("canonical_url") or "").strip() or candidate_url
+        canonical_domain = (urlparse(canonical_url).netloc or "").lower()
+        if not metadata_text or "reuters" not in metadata_text:
+            continue
+        if canonical_domain and "reuters.com" not in canonical_domain:
+            continue
+        if not _is_probable_reuters_article_url(canonical_url):
+            continue
+        matched_tokens = [token for token in title_tokens[:12] if token in metadata_text]
+        if len(matched_tokens) < max(4, min(6, len(title_tokens[:12]))):
+            continue
+        return {
+            "title": clean_title,
+            "url": canonical_url,
+            "source": "Reuters",
+            "source_url": "https://www.reuters.com/",
+            "snippet": snippet,
+            "published_at": published_at,
+            "article_match_tokens": matched_tokens[:5],
+            "article_match_score": 8 + (2 * len(matched_tokens[:5])),
+            "match_score": 32 + (2 * len(matched_tokens[:5])),
+        }
+
+    evidence_text = clean_document_text(" ".join([clean_title, claim_text, query_text, snippet])).lower()
+    if re.search(r"\breuters\b", " ".join([clean_title, query_text, snippet]), re.I):
+        best_guess: tuple[int, dict, list[str]] | None = None
+        for candidate_record in candidate_records[:8]:
+            candidate_url = str(candidate_record.get("url") or "").strip()
+            if not _is_probable_reuters_article_url(candidate_url):
+                continue
+            candidate_slug = (urlparse(candidate_url).path or "").strip("/").split("/")[-1]
+            candidate_slug = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", candidate_slug)
+            variant_tokens = [
+                token
+                for token in _extract_fact_check_tokens(candidate_slug.replace("-", " "))
+                if len(token) >= 4 or re.search(r"\d", token)
+            ]
+            if len(variant_tokens) < 5:
+                continue
+            matched_tokens = [token for token in variant_tokens[:10] if token in evidence_text]
+            if len(matched_tokens) < max(5, min(7, len(variant_tokens[:10]))):
+                continue
+            score = len(matched_tokens)
+            if not best_guess or score > best_guess[0]:
+                best_guess = (score, candidate_record, matched_tokens[:5])
+        if best_guess:
+            _, candidate_record, matched_tokens = best_guess
+            return {
+                "title": clean_title,
+                "url": str(candidate_record.get("url") or "").strip(),
+                "source": "Reuters",
+                "source_url": "https://www.reuters.com/",
+                "snippet": snippet,
+                "published_at": published_at,
+                "article_match_tokens": matched_tokens,
+                "article_match_score": 0,
+                "match_score": 24 + (2 * len(matched_tokens)),
+                "recovery_method": "slug_guess",
+            }
+    return None
+
+
+def _recover_syndicated_fact_check_hit(
+    item: dict,
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    proxy_url: str = None,
+) -> dict | None:
+    url = str(item.get("url") or "").strip()
+    source_name = str(item.get("source") or "").strip()
+    title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip(" -|")
+    snippet = str(item.get("snippet") or "").strip()
+    published_at = str(item.get("published_at") or "").strip()
+    domain = (urlparse(url).netloc or "").lower()
+    if not title:
+        return None
+
+    primary_domain = _guess_fact_check_item_primary_source_domain(item)
+    if not primary_domain:
+        return None
+
+    actual_url_domain = (urlparse(url).netloc or "").lower()
+    if actual_url_domain and (
+        actual_url_domain == primary_domain or actual_url_domain.endswith(f".{primary_domain}")
+    ):
+        return None
+
+    if (
+        domain not in SYNDICATED_FACT_CHECK_DOMAINS
+        and not re.search(r"\breuters\b|\bassociated press\b|\bbloomberg\b", " ".join([source_name, snippet]), re.I)
+    ):
+        return None
+
+    query_candidates: list[str] = []
+    seen_queries: set[str] = set()
+
+    def add_query(value: str) -> None:
+        query = re.sub(r"\s+", " ", str(value or "")).strip()
+        lowered = query.lower()
+        if not query or lowered in seen_queries:
+            return
+        seen_queries.add(lowered)
+        query_candidates.append(query)
+
+    add_query(f'site:{primary_domain} "{title}"')
+    add_query(f"site:{primary_domain} {title}")
+    title_tokens = [token for token in _extract_fact_check_tokens(title) if len(token) >= 4 or re.search(r"\d", token)]
+    if title_tokens:
+        add_query(f"site:{primary_domain} {' '.join(title_tokens[:10])}")
+
+    def recover_from_google_hits(google_hits: list[dict]) -> dict | None:
+        exact_queries: list[str] = []
+        seen_exact_queries: set[str] = set()
+
+        def add_exact_query(value: str) -> None:
+            normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+            lowered = normalized.lower()
+            if not normalized or lowered in seen_exact_queries:
+                return
+            seen_exact_queries.add(lowered)
+            exact_queries.append(normalized)
+
+        for google_hit in google_hits[:2]:
+            google_title = re.sub(r"\s+", " ", str(google_hit.get("title") or "")).strip(" -|")
+            google_source_name = str(google_hit.get("source") or "").strip()
+            if google_source_name:
+                google_title = re.sub(
+                    rf"\s*[-|]\s*{re.escape(google_source_name)}\s*$",
+                    "",
+                    google_title,
+                    flags=re.I,
+                ).strip(" -|")
+            if not google_title:
+                continue
+            if primary_domain in {"www.reuters.com", "reuters.com"}:
+                recovered_direct = _recover_reuters_direct_article_hit(
+                    title=google_title,
+                    published_at=str(google_hit.get("published_at") or ""),
+                    claim_text=claim_text,
+                    query_text=f"{query_text} {title}",
+                    snippet=str(google_hit.get("snippet") or ""),
+                    proxy_url=proxy_url,
+                )
+                if recovered_direct:
+                    return recovered_direct
+            add_exact_query(f'site:{primary_domain} "{google_title}"')
+            exact_title_tokens = [
+                token
+                for token in _extract_fact_check_tokens(google_title)
+                if len(token) >= 4 or re.search(r"\d", token)
+            ]
+            if exact_title_tokens:
+                add_exact_query(f"site:{primary_domain} {' '.join(exact_title_tokens[:12])}")
+
+        for exact_query in exact_queries[:4]:
+            direct_hits = _fetch_bing_web_results(exact_query, proxy_url=proxy_url, max_items=5)
+            direct_hits = [hit for hit in direct_hits if _fact_check_hit_matches_domain(hit, primary_domain)]
+            if not direct_hits:
+                continue
+            direct_hits = _rerank_fact_check_hits(
+                direct_hits,
+                claim_text=claim_text,
+                query_text=f"{query_text} {title}",
+                preferred_domains={primary_domain},
+                max_items=3,
+            )
+            direct_hits = _refine_fact_check_hits_with_article_text(
+                direct_hits,
+                claim_text=claim_text,
+                query_text=f"{query_text} {title}",
+                proxy_url=proxy_url,
+                article_fetch_limit=1,
+            )
+            direct_hits = _prune_fact_check_hits(
+                direct_hits,
+                preferred_domains={primary_domain},
+                max_items=1,
+            )
+            if direct_hits:
+                return dict(direct_hits[0])
+        return None
+
+    if primary_domain in {"www.reuters.com", "reuters.com"}:
+        recovered_direct = _recover_reuters_direct_article_hit(
+            title=title,
+            published_at=published_at,
+            claim_text=claim_text,
+            query_text=query_text,
+            snippet=snippet,
+            proxy_url=proxy_url,
+        )
+        if recovered_direct:
+            recovered_direct["recovered_from_source"] = source_name
+            recovered_direct["recovered_from_url"] = url
+            return recovered_direct
+
+    for recovery_query in query_candidates[:2]:
+        site_hits = _fetch_bing_web_results(recovery_query, proxy_url=proxy_url, max_items=5)
+        site_hits = [hit for hit in site_hits if _fact_check_hit_matches_domain(hit, primary_domain)]
+        if not site_hits:
+            google_hits = _fetch_google_news_results(recovery_query, proxy_url=proxy_url, max_items=5)
+            google_hits = [hit for hit in google_hits if _fact_check_hit_matches_domain(hit, primary_domain)]
+            if not google_hits:
+                continue
+            recovered_from_google = recover_from_google_hits(google_hits)
+            if not recovered_from_google:
+                continue
+            site_hits = [recovered_from_google]
+        site_hits = _rerank_fact_check_hits(
+            site_hits,
+            claim_text=claim_text,
+            query_text=f"{query_text} {title}",
+            preferred_domains={primary_domain},
+            max_items=3,
+        )
+        site_hits = _refine_fact_check_hits_with_article_text(
+            site_hits,
+            claim_text=claim_text,
+            query_text=f"{query_text} {title}",
+            proxy_url=proxy_url,
+            article_fetch_limit=1,
+        )
+        site_hits = _prune_fact_check_hits(
+            site_hits,
+            preferred_domains={primary_domain},
+            max_items=1,
+        )
+        if not site_hits:
+            continue
+        recovered = dict(site_hits[0])
+        recovered["recovered_from_source"] = source_name
+        recovered["recovered_from_url"] = url
+        return recovered
+    return None
+
+
+def _recover_syndicated_fact_check_hits(
+    items: list[dict],
+    *,
+    claim_text: str = "",
+    query_text: str = "",
+    proxy_url: str = None,
+    recovery_limit: int = 2,
+) -> list[dict]:
+    if not items:
+        return []
+    recovered_items: list[dict] = []
+    seen_urls: set[str] = set()
+    recovery_budget = max(0, int(recovery_limit or 0))
+    for item in items:
+        chosen = dict(item)
+        if recovery_budget > 0:
+            recovered = _recover_syndicated_fact_check_hit(
+                item,
+                claim_text=claim_text,
+                query_text=query_text,
+                proxy_url=proxy_url,
+            )
+            if recovered:
+                chosen = recovered
+                recovery_budget -= 1
+        normalized_url = _normalize_fact_check_source_url(str(chosen.get("url") or ""))
+        if not normalized_url or normalized_url in seen_urls:
+            continue
+        seen_urls.add(normalized_url)
+        recovered_items.append(chosen)
+    return recovered_items
 
 
 def _find_authoritative_sources(text: str) -> list[dict]:
@@ -3083,13 +5083,257 @@ def _extract_year_tokens(text: str) -> list[str]:
     return deduped
 
 
+FACT_CHECK_ENGLISH_QUERY_REPLACEMENTS = [
+    (r"川普|特朗普", "Trump"),
+    (r"卢比奥", "Rubio"),
+    (r"习近平", "Xi Jinping"),
+    (r"朝鲜", "North Korea"),
+    (r"乌克兰", "Ukraine"),
+    (r"基辅", "Kyiv"),
+    (r"伊朗", "Iran"),
+    (r"霍尔木兹海峡", "Strait of Hormuz"),
+    (r"核协议", "nuclear deal"),
+    (r"谈判", "talks"),
+    (r"美国国务卿", "U.S. Secretary of State"),
+    (r"退出.*?调解", "stop mediating"),
+    (r"无成果", "no progress"),
+    (r"可能访问", "may visit"),
+    (r"访问", "visit"),
+    (r"宁德时代", "CATL"),
+    (r"香港IPO|香港上市", "Hong Kong IPO"),
+    (r"摩根大通", "JPMorgan"),
+    (r"美国银行", "Bank of America"),
+    (r"格雷厄姆", "Graham"),
+    (r"内塔尼亚胡", "Netanyahu"),
+    (r"重新开放", "reopen"),
+    (r"清除水雷", "clear mines"),
+    (r"解除封锁", "lift blockade"),
+    (r"恢复.*?石油出口", "restore oil exports"),
+]
+
+
+FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
+    (
+        re.compile(r"(雅虎财经|yahoo finance|沃尔玛|walmart|realty income|philip morris|blue chip|蓝筹股)", re.I),
+        ["finance.yahoo.com", "www.reuters.com", "www.bloomberg.com", "www.wsj.com"],
+    ),
+    (
+        re.compile(r"(朝鲜|north korea|访问|visit|pyongyang)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.nytimes.com", "www.wsj.com"],
+    ),
+    (
+        re.compile(r"(伊朗|iran|hormuz|霍尔木兹|核协议|nuclear deal|谈判|sanctions)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(乌克兰|ukraine|基辅|kyiv|无人机|drone|导弹|missile|rubio)", re.I),
+        ["www.reuters.com", "www.nytimes.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(ipo|上市|香港ipo|香港上市|宁德时代|catl|jpmorgan|bank of america)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(mlf|中国央行|人民银行|pboc|people's bank of china|净利差|银行资金成本)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(跨境证券|老虎|富途|长桥|futu|tiger brokers|longbridge|资本外流|资金外流)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(deepseek|阿里巴巴|alibaba|护照|passport|出国需.*批准|exit control|ai人才|ai talent|manus)", re.I),
+        ["www.bloomberg.com", "www.reuters.com", "www.wsj.com", "www.ft.com"],
+    ),
+]
+
+
+def _suggest_fact_check_major_media_domains(text: str) -> list[str]:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return []
+    domains: list[str] = []
+    seen: set[str] = set()
+    for pattern, candidates in FACT_CHECK_MAJOR_MEDIA_SITE_RULES:
+        if not pattern.search(value):
+            continue
+        for domain in candidates:
+            normalized = str(domain or "").strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            domains.append(normalized)
+    return domains
+
+
+FACT_CHECK_CONTEXT_PREFIXES = [
+    "主要内容",
+    "财经头条",
+    "视频观点",
+    "中国经济",
+    "AI人才边控",
+    "伊朗战争",
+    "乌克兰战争",
+    "跨境证券整治",
+]
+
+
+def _strip_fact_check_context_prefixes(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return ""
+    for _ in range(3):
+        updated = value
+        for prefix in FACT_CHECK_CONTEXT_PREFIXES:
+            updated = re.sub(rf"^{re.escape(prefix)}\s*[：:]\s*", "", updated, flags=re.I).strip()
+        if updated == value:
+            break
+        value = updated
+    return value
+
+
+def _is_generic_media_query(query: str) -> bool:
+    value = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not value:
+        return False
+    value = re.sub(r"^site:[^\s]+\s+", "", value, flags=re.I).strip()
+    return bool(
+        re.fullmatch(
+            r"(?:Bloomberg|Reuters|New York Times|Wall Street Journal|Financial Times)(?:\s+(?:world|markets|business|politics))+",
+            value,
+            flags=re.I,
+        )
+    )
+
+
+def _generate_fact_check_english_queries(claim: str) -> list[str]:
+    text = _strip_fact_check_context_prefixes(claim)
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        query = re.sub(r"\s+", " ", str(value or "")).strip(" ,，。；;：:")
+        lowered = query.lower()
+        if not query or lowered in seen:
+            return
+        seen.add(lowered)
+        candidates.append(query)
+
+    normalized = text
+    for pattern, replacement in FACT_CHECK_ENGLISH_QUERY_REPLACEMENTS:
+        normalized = re.sub(pattern, f" {replacement} ", normalized, flags=re.I)
+    normalized = re.sub(r"[\u4e00-\u9fff]+", " ", normalized)
+    normalized = re.sub(r"[，。、“”‘’（）()：:；;、]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    topic_haystack = f"{text} {normalized}".strip()
+
+    if re.search(r"(伊朗|Iran|核协议|nuclear deal|霍尔木兹|Strait of Hormuz|亚伯拉罕协议|Abraham Accords)", topic_haystack, re.I):
+        add("Trump Iran nuclear deal talks sanctions progress")
+        add("Iran Strait of Hormuz reopen clear mines draft agreement")
+        add("Iran oil exports 60-day nuclear talks Reuters")
+        if re.search(r"(亚伯拉罕协议|Abraham Accords|停火|ceasefire|沙特|Saudi|海湾|Gulf)", topic_haystack, re.I):
+            add("Trump Abraham Accords ceasefire Saudi Arabia Iran Reuters")
+    if re.search(r"(卢比奥|\bRubio\b)", topic_haystack, re.I):
+        add("Rubio says U.S. will stop mediating Ukraine peace talks")
+        add("Rubio Ukraine talks no progress Reuters")
+        add("Rubio Ukraine mediation Kyiv Independent")
+    elif re.search(r"(乌克兰|Ukraine|基辅|Kyiv|俄罗斯|Russia)", topic_haystack, re.I):
+        add("Russia threatens strikes on Kyiv defence sites Reuters")
+        add("Russia urges foreigners to leave Kyiv Reuters")
+        add("Kyiv air defence Patriot supply Reuters")
+    if re.search(r"(习近平|Xi Jinping|朝鲜|North Korea)", topic_haystack, re.I):
+        add("Xi Jinping may visit North Korea Reuters")
+        add("Xi visit Pyongyang next week Reuters")
+        add("North Korea visit capital markets Reuters")
+    if re.search(r"(宁德时代|CATL|香港IPO|Hong Kong IPO|摩根大通|JPMorgan|美国银行|Bank of America)", topic_haystack, re.I):
+        add("CATL Hong Kong IPO JPMorgan Bank of America Reuters")
+        add("House CCP committee CATL Hong Kong IPO")
+        add("HKEX CATL Hong Kong listing filing")
+    if re.search(r"(MLF|中期借贷便利|中国央行|人民银行|PBOC|People's Bank of China)", topic_haystack, re.I):
+        add("PBOC cuts one-year MLF rate to 1.45% Reuters")
+        add("People's Bank of China one-year MLF 1.45% Bloomberg")
+        add("PBOC MLF operation banking net interest margin")
+    if re.search(r"(富途|老虎|长桥|跨境证券|资金外流|资本外流|Futu|Tiger Brokers|Longbridge|capital outflow|cross-border brokerage)", topic_haystack, re.I):
+        add("China Futu Tiger Brokers Longbridge crackdown Reuters")
+        add("China cross-border brokerage crackdown Bloomberg")
+        add("China capital outflow 2025 Reuters")
+    if re.search(r"(DeepSeek|Alibaba|阿里巴巴|护照|passport|AI人才|AI talent|边控|exit control|Manus)", topic_haystack, re.I):
+        add("China expands exit controls to AI talent Bloomberg")
+        add("China AI talent passport controls Alibaba DeepSeek Reuters")
+        add("Bloomberg China AI talent exit controls")
+    if re.search(r"(雅虎财经|Yahoo Finance|沃尔玛|Walmart|Realty Income|菲利普莫里斯|Philip Morris)", topic_haystack, re.I):
+        add("Yahoo Finance three blue-chip stocks Walmart Realty Income Philip Morris")
+        add("Walmart Realty Income Philip Morris defensive stocks Yahoo Finance")
+    if re.search(r"[A-Za-z]{3,}", normalized):
+        add(normalized)
+    return candidates[:8]
+
+
+def _score_fact_check_query(query: str) -> int:
+    value = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not value:
+        return -999
+    lowered = value.lower()
+    score = 0
+    if lowered.startswith("site:"):
+        score += 20
+    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|hormuz|kyiv|north korea|strait of hormuz|trump|iran|axios|state department|xi|jpmorgan)\b", lowered, re.I):
+        score += 10
+    if re.search(r"[A-Za-z]{3,}", value):
+        score += 4
+    if re.search(r"\b(?:19|20)\d{2}\b", value):
+        score += 3
+    if len(value) <= 90:
+        score += 2
+    if _is_generic_media_query(value):
+        score -= 12
+    if any(
+        domain in lowered
+        for domain in [
+            "finance.yahoo.com",
+            "pbc.gov.cn",
+            "safe.gov.cn",
+            "csrc.gov.cn",
+        ]
+    ):
+        score += 7
+    if re.search(
+        r"\b(?:reuters|associated press|bloomberg|axios|ap|new york times|nyt|wall street journal|wsj|financial times)\b",
+        lowered,
+        re.I,
+    ):
+        score += 5
+    if "kyivindependent.com" in lowered or re.search(r"\bkyiv independent\b", lowered, re.I):
+        score += 6
+    if re.search(r"\brubio\b", lowered, re.I) and re.search(r"\bukraine\b", lowered, re.I):
+        score += 4
+    if re.search(r"\bxi\b", lowered, re.I) and re.search(r"\bnorth korea\b", lowered, re.I):
+        score += 4
+    if re.search(r"\bsays\b", lowered, re.I):
+        score += 2
+    if re.search(r"\brubio\b", lowered, re.I) and re.search(r"\b(?:mediating|mediation|talks|peace)\b", lowered, re.I):
+        if not re.search(r"\bukraine\b", lowered, re.I):
+            score -= 8
+    if re.search(r"\bxi\b", lowered, re.I) and re.search(r"\b(?:visit|visits|visiting)\b", lowered, re.I):
+        if not re.search(r"\bnorth korea\b|\bpyongyang\b", lowered, re.I):
+            score -= 8
+    if re.search(r"\btrump\b", lowered, re.I) and re.search(r"\b(?:nuclear|sanctions|talks|deal)\b", lowered, re.I):
+        if not re.search(r"\biran\b|\bhormuz\b", lowered, re.I):
+            score -= 8
+    return score
+
+
 def _prepare_fact_check_queries(claim: str, queries: list[str] | None) -> list[str]:
     """为事实核查生成更精确的检索词，补充时间与站点限定。"""
     candidates: list[str] = []
     seen: set[str] = set()
 
     def add_query(value: str) -> None:
-        query = re.sub(r"\s+", " ", str(value or "")).strip()
+        query = _strip_fact_check_context_prefixes(value)
+        query = re.sub(r"\s+", " ", str(query or "")).strip()
         if not query:
             return
         lowered = query.lower()
@@ -3098,13 +5342,36 @@ def _prepare_fact_check_queries(claim: str, queries: list[str] | None) -> list[s
         seen.add(lowered)
         candidates.append(query)
 
-    claim_text = str(claim or "").strip()
+    claim_text = _strip_fact_check_context_prefixes(claim)
     add_query(claim_text)
     for item in queries or []:
         add_query(item)
 
+    relaxed_query_seeds = [claim_text, *(str(item).strip() for item in (queries or []))]
+    for raw_query in relaxed_query_seeds:
+        if not raw_query:
+            continue
+        relaxed = raw_query
+        relaxed = re.sub(r"\b(?:19|20)\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}日?(?:前后)?\b", " ", relaxed)
+        relaxed = re.sub(r"\b(?:19|20)\d{2}年\d{1,2}月(?:\d{1,2}日)?(?:前后)?\b", " ", relaxed)
+        relaxed = re.sub(r"\b\d{1,2}月\d{1,2}日(?:前后)?\b", " ", relaxed)
+        relaxed = re.sub(r"(前后|上述|相关|有关|消息称|报道称|据称|被指|这番|言论|表态)", " ", relaxed)
+        relaxed = re.sub(r"\s+", " ", relaxed).strip(" ,，。；;：:")
+        if relaxed and relaxed != raw_query:
+            add_query(relaxed)
+
     years = _extract_year_tokens(" ".join(candidates))
-    authoritative_sources = _find_authoritative_sources(" ".join(candidates))
+    english_queries = _generate_fact_check_english_queries(claim_text)
+    for english_query in english_queries:
+        add_query(english_query)
+    authoritative_sources = _find_authoritative_sources(" ".join([*candidates, *english_queries]))
+
+    for source in authoritative_sources[:5]:
+        for query_term in source.get("query_terms", []) or []:
+            add_query(str(query_term or "").strip())
+            for year in years[:2]:
+                if year and year not in str(query_term):
+                    add_query(f"{query_term} {year}")
 
     for base_query in list(candidates):
         if re.search(r"(大选|选举|election)", base_query, re.I):
@@ -3115,21 +5382,123 @@ def _prepare_fact_check_queries(claim: str, queries: list[str] | None) -> list[s
             add_query(f"{base_query} official statement")
         if re.search(r"(国防部|外交部|政府|minister|ministry|government)", base_query, re.I):
             add_query(f"{base_query} 官网")
+        if re.search(r"(央行|利率|加息|降息|inflation|cpi|通胀)", base_query, re.I):
+            add_query(f"{base_query} rate decision")
+            add_query(f"{base_query} inflation")
+        if re.search(r"(gdp|国内生产总值|耐用品订单|工业生产|工业利润|pmi)", base_query, re.I):
+            add_query(f"{base_query} official data")
+        if re.search(r"(朝鲜|north korea|访问|visit)", base_query, re.I):
+            add_query(f"{base_query} Reuters")
+            add_query(f"{base_query} AP")
+        if re.search(r"(伊朗|hormuz|霍尔木兹|核协议|谈判)", base_query, re.I):
+            add_query(f"{base_query} Reuters")
+            add_query(f"{base_query} Axios")
+            add_query(f"{base_query} State Department")
+        if re.search(r"(乌克兰|基辅|无人机|导弹|ukraine|kyiv|missile|drone)", base_query, re.I):
+            add_query(f"{base_query} Reuters")
+            add_query(f"{base_query} Kyiv Independent")
+        if re.search(r"(香港ipo|香港上市|ipo|宁德时代|catl)", base_query, re.I):
+            add_query(f"{base_query} HKEX filing")
+            add_query(f"{base_query} Reuters")
+
+        if not str(base_query).lower().startswith("site:"):
+            for domain in _suggest_fact_check_major_media_domains(base_query):
+                add_query(f"site:{domain} {base_query}")
 
         for year in years[:2]:
             if year not in base_query:
                 add_query(f"{base_query} {year}")
 
-        for source in authoritative_sources[:3]:
+        for source in authoritative_sources[:4]:
             source_url = str(source.get("url") or "").strip()
             domain = urlparse(source_url).netloc
             if domain:
-                add_query(f"site:{domain} {base_query}")
+                if not str(base_query).lower().startswith("site:"):
+                    add_query(f"site:{domain} {base_query}")
+                for query_term in source.get("query_terms", []) or []:
+                    query_term = str(query_term or "").strip()
+                    if query_term:
+                        add_query(f"site:{domain} {query_term}")
 
-    return candidates[:8]
+    if len(candidates) <= 12:
+        return candidates
+
+    general_queries = [item for item in candidates if not item.lower().startswith("site:")]
+    site_queries = [item for item in candidates if item.lower().startswith("site:")]
+    general_queries.sort(key=lambda item: (-_score_fact_check_query(item), candidates.index(item)))
+    site_queries.sort(key=lambda item: (-_score_fact_check_query(item), candidates.index(item)))
+
+    selected: list[str] = []
+    reserved_site_slots = min(4, len(site_queries))
+    selected.extend(general_queries[: max(0, 12 - reserved_site_slots)])
+    selected.extend(site_queries[:reserved_site_slots])
+    for item in candidates:
+        if len(selected) >= 12:
+            break
+        if item in selected:
+            continue
+        selected.append(item)
+    return selected[:12]
 
 
-def perform_web_search(queries: list[str], proxy: str = None) -> str:
+def _select_fact_check_queries(queries: list[str], max_queries: int = 4) -> list[str]:
+    """优先保留少量高价值检索词，避免串行搜索过慢且来源重复。"""
+    if max_queries <= 0:
+        return []
+
+    normalized_queries: list[str] = []
+    seen: set[str] = set()
+    for query in queries or []:
+        value = re.sub(r"\s+", " ", str(query or "")).strip()
+        lowered = value.lower()
+        if not value or lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized_queries.append(value)
+
+    if len(normalized_queries) <= max_queries:
+        return normalized_queries
+
+    general_queries = [item for item in normalized_queries if not item.lower().startswith("site:")]
+    site_queries = [item for item in normalized_queries if item.lower().startswith("site:")]
+    general_queries.sort(key=lambda item: (-_score_fact_check_query(item), normalized_queries.index(item)))
+    site_queries.sort(key=lambda item: (-_score_fact_check_query(item), normalized_queries.index(item)))
+    selected: list[str] = []
+
+    preferred_site_limit = min(3 if max_queries >= 4 else 1, len(site_queries))
+    preferred_general_limit = min(len(general_queries), max_queries - preferred_site_limit)
+    selected.extend(general_queries[:preferred_general_limit])
+    for site_query in site_queries[:preferred_site_limit]:
+        if len(selected) >= max_queries:
+            break
+        if site_query not in selected:
+            selected.append(site_query)
+
+    for item in normalized_queries:
+        if len(selected) >= max_queries:
+            break
+        if item in selected:
+            continue
+        selected.append(item)
+    return selected[:max_queries]
+
+
+def _search_single_claim_source(item: dict, proxy_url: str = None) -> dict:
+    claim = str(item.get("claim") or "").strip()
+    queries = item.get("queries") or []
+    if not queries:
+        queries = [claim]
+    prepared_queries = _prepare_fact_check_queries(claim, queries[:3])
+    selected_queries = _select_fact_check_queries(prepared_queries, max_queries=4)
+    search_markdown = perform_web_search(selected_queries, proxy=proxy_url, claim_text=claim)
+    return {
+        "claim": claim,
+        "queries": selected_queries,
+        "search_markdown": search_markdown,
+    }
+
+
+def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = "") -> str:
     if not queries:
         return ""
 
@@ -3137,38 +5506,233 @@ def perform_web_search(queries: list[str], proxy: str = None) -> str:
     global_source_links: list[str] = []
     seen_source_urls: set[str] = set()
 
+    def render_candidate_hits(items: list[dict], heading: str) -> None:
+        if not items:
+            return
+        results_text.append(heading)
+        for item in items:
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if not title or not url:
+                continue
+            results_text.append(f"  - [{title}]({url})")
+            detail_parts = []
+            source_name = str(item.get("source") or "").strip()
+            published_at = str(item.get("published_at") or "").strip()
+            snippet = str(item.get("snippet") or "").strip()
+            match_tokens = [
+                str(token or "").strip()
+                for token in (item.get("article_match_tokens") or [])
+                if str(token or "").strip()
+            ]
+            if source_name:
+                detail_parts.append(f"来源：{source_name}")
+            recovered_from_source = str(item.get("recovered_from_source") or "").strip()
+            if recovered_from_source:
+                detail_parts.append(f"追源：由 {recovered_from_source} 聚合页恢复")
+            if str(item.get("recovery_method") or "").strip() == "slug_guess":
+                detail_parts.append("方式：Reuters 直链推测")
+            if published_at:
+                detail_parts.append(f"时间：{published_at}")
+            if snippet:
+                detail_parts.append(f"摘要：{snippet[:180]}")
+            if match_tokens:
+                detail_parts.append(f"正文匹配：{'、'.join(match_tokens[:4])}")
+            if detail_parts:
+                results_text.append(f"    - {'；'.join(detail_parts)}")
+            normalized_url = _normalize_fact_check_source_url(url)
+            if normalized_url and normalized_url not in seen_source_urls:
+                seen_source_urls.add(normalized_url)
+                label = source_name or title
+                global_source_links.append(f"- [{label}]({url})")
+
     # 事实核查统一收敛为可人工复核的 Google/Bing 新闻检索入口，
     # 同时附上已识别到的官网/权威媒体站点，避免模型只输出模糊机构名。
-    def add_search_links(q_term: str) -> None:
+    def add_search_links(q_term: str) -> bool:
         try:
+            matched_sources = _find_authoritative_sources(" ".join([claim_text, q_term]))
+            preferred_domains = {
+                (urlparse(str(source.get("url") or "").strip()).netloc or "").lower()
+                for source in matched_sources
+                if str(source.get("url") or "").strip()
+            }
             results_text.append(f"### 搜索关键字: {q_term}")
             results_text.append(f"- [Google 新闻核查]({_build_search_url(q_term, engine='google', news=True)})")
             results_text.append(f"- [Google 网页核查]({_build_search_url(q_term, engine='google', news=False)})")
             results_text.append(f"- [Bing 新闻核查]({_build_search_url(q_term, engine='bing', news=True)})")
             results_text.append(f"- [Bing 网页核查]({_build_search_url(q_term, engine='bing', news=False)})")
 
-            matched_sources = _find_authoritative_sources(q_term)
+            news_hits = _fetch_bing_news_results(q_term, proxy_url=proxy, max_items=2)
+            should_merge_authoritative_google_hits = bool(preferred_domains) or bool(
+                re.search(r"\breuters\b|\bassociated press\b|\bap\b|\bbloomberg\b", q_term, re.I)
+            )
+            if len(news_hits) < 1 or should_merge_authoritative_google_hits:
+                google_hits = _fetch_google_news_results(
+                    q_term,
+                    proxy_url=proxy,
+                    max_items=3 if should_merge_authoritative_google_hits else 2,
+                )
+                if preferred_domains:
+                    google_hits = [
+                        hit
+                        for hit in google_hits
+                        if any(_fact_check_hit_matches_domain(hit, domain) for domain in preferred_domains)
+                    ]
+                for news in google_hits:
+                    normalized_url = _normalize_fact_check_source_url(str(news.get("url") or ""))
+                    if not normalized_url:
+                        continue
+                    if any(
+                        _normalize_fact_check_source_url(str(existing.get("url") or "")) == normalized_url
+                        for existing in news_hits
+                    ):
+                        continue
+                    news_hits.append(news)
+                    if len(news_hits) >= (4 if should_merge_authoritative_google_hits else 3):
+                        break
+            news_hits = _rerank_fact_check_hits(
+                news_hits,
+                claim_text=claim_text,
+                query_text=q_term,
+                preferred_domains=preferred_domains,
+                max_items=3,
+            )
+            news_hits = _recover_syndicated_fact_check_hits(
+                news_hits,
+                claim_text=claim_text,
+                query_text=q_term,
+                proxy_url=proxy,
+                recovery_limit=2,
+            )
+            news_hits = _prune_fact_check_hits(
+                news_hits,
+                preferred_domains=preferred_domains or set(MAJOR_MEDIA_DOMAINS),
+                max_items=3,
+            )
+            if news_hits:
+                render_candidate_hits(news_hits, "- 命中的候选报道：")
+
+            web_hits = _fetch_bing_web_results(q_term, proxy_url=proxy, max_items=6)
+            if news_hits:
+                existing_urls = {
+                    _normalize_fact_check_source_url(str(item.get("url") or ""))
+                    for item in news_hits
+                }
+                web_hits = [
+                    item for item in web_hits
+                    if _normalize_fact_check_source_url(str(item.get("url") or "")) not in existing_urls
+                ]
+            web_hits = _rerank_fact_check_hits(
+                web_hits,
+                claim_text=claim_text,
+                query_text=q_term,
+                preferred_domains=preferred_domains or set(MAJOR_MEDIA_DOMAINS),
+                max_items=4,
+            )
+            web_hits = [
+                item
+                for item in web_hits
+                if _is_relevant_fact_check_hit(item, claim_text=claim_text, query_text=q_term)
+            ]
+            web_hits = _recover_syndicated_fact_check_hits(
+                web_hits,
+                claim_text=claim_text,
+                query_text=q_term,
+                proxy_url=proxy,
+                recovery_limit=1,
+            )
+            web_hits = _refine_fact_check_hits_with_article_text(
+                web_hits,
+                claim_text=claim_text,
+                query_text=q_term,
+                proxy_url=proxy,
+                article_fetch_limit=2,
+            )
+            web_hits = _prune_fact_check_hits(
+                web_hits,
+                preferred_domains=preferred_domains or set(MAJOR_MEDIA_DOMAINS),
+                max_items=3,
+            )
+            if web_hits:
+                render_candidate_hits(web_hits[:3], "- 命中的候选网页：")
+
+            if not news_hits and not web_hits:
+                results_text.append("- 自动检索结果：当前未抓到可直接引用的候选网页或报道。")
+                results_text.append("  - 注意：这不等于“全网不存在相关内容”，只表示本轮自动检索暂未命中，后续应继续放宽搜索词，或改用英文/原文机构名继续核对。")
+
             if matched_sources:
                 results_text.append("- 权威站点参考：")
-                for source in matched_sources[:4]:
+                for source_idx, source in enumerate(matched_sources[:4]):
                     label = str(source.get("label") or "").strip()
                     url = str(source.get("url") or "").strip()
                     if not label or not url:
                         continue
                     results_text.append(f"  - [{label}]({url})")
-                    if url not in seen_source_urls:
-                        seen_source_urls.add(url)
+                    normalized_url = _normalize_fact_check_source_url(url)
+                    if normalized_url and normalized_url not in seen_source_urls:
+                        seen_source_urls.add(normalized_url)
                         global_source_links.append(f"- [{label}]({url})")
                     domain = urlparse(url).netloc
                     if domain:
-                        site_query = f"site:{domain} {q_term}"
+                        site_query_base = re.sub(r"^\s*site:[^\s]+\s+", "", q_term, flags=re.I).strip()
+                        site_query = f"site:{domain} {site_query_base}".strip()
                         results_text.append(f"  - [{label} 定向搜索]({_build_search_url(site_query, engine='google', news=True)})")
+                        if source_idx < 2:
+                            site_hits = _fetch_bing_web_results(site_query, proxy_url=proxy, max_items=4)
+                            site_hits = [
+                                item for item in site_hits
+                                if _normalize_fact_check_source_url(str(item.get("url") or "")) not in seen_source_urls
+                            ]
+                            if not site_hits:
+                                google_site_hits = _fetch_google_news_results(site_query, proxy_url=proxy, max_items=4)
+                                google_site_hits = [
+                                    item for item in google_site_hits
+                                    if _fact_check_hit_matches_domain(item, domain)
+                                    and _normalize_fact_check_source_url(str(item.get("url") or "")) not in seen_source_urls
+                                ]
+                                site_hits = _recover_syndicated_fact_check_hits(
+                                    google_site_hits,
+                                    claim_text=claim_text,
+                                    query_text=site_query,
+                                    proxy_url=proxy,
+                                    recovery_limit=2,
+                                )
+                            site_hits = _rerank_fact_check_hits(
+                                site_hits,
+                                claim_text=claim_text,
+                                query_text=site_query,
+                                preferred_domains={domain},
+                                max_items=3,
+                            )
+                            site_hits = [
+                                item
+                                for item in site_hits
+                                if _is_relevant_fact_check_hit(item, claim_text=claim_text, query_text=site_query)
+                            ]
+                            site_hits = _refine_fact_check_hits_with_article_text(
+                                site_hits,
+                                claim_text=claim_text,
+                                query_text=site_query,
+                                proxy_url=proxy,
+                                article_fetch_limit=1,
+                            )
+                            site_hits = _prune_fact_check_hits(
+                                site_hits,
+                                preferred_domains={domain},
+                                max_items=2,
+                            )
+                            if site_hits:
+                                render_candidate_hits(site_hits[:2], f"- {label} 定向命中的候选页面：")
             results_text.append("")
+            if len(seen_source_urls) >= 4:
+                return True
         except Exception:
-            pass
+            return False
+        return False
 
     for q in queries:
-        add_search_links(q)
+        if add_search_links(q):
+            break
 
     if global_source_links:
         results_text.append("### 已识别的权威站点")
@@ -3236,7 +5800,199 @@ def _parse_summary_payload(raw_text: str):
     return None
 
 
-def _normalize_summary_payload(payload: dict | None) -> dict | None:
+def _normalize_output_locale(raw_locale: str | None) -> str:
+    normalized = str(raw_locale or "").strip().lower().replace("_", "-")
+    if normalized.startswith("en"):
+        return "en"
+    return "zh"
+
+
+def _is_english_output_locale(raw_locale: str | None) -> bool:
+    return _normalize_output_locale(raw_locale) == "en"
+
+
+def _build_fact_check_placeholder(ui_locale: str | None = None) -> str:
+    if _is_english_output_locale(ui_locale):
+        return "- Structured fact-check output was not generated successfully. Please try again."
+    return "- 暂未成功生成结构化事实核查结果，请重新尝试生成。"
+
+
+FACT_CHECK_SECTION_SPLIT_PATTERN = (
+    r"(?=^(?:###\s*(?:条目|Item)\s*\d+|\d+\.\s*"
+    r"(?:新闻/声明|关键声明|声明|新闻|Claim|Statement|News Claim|News)[:：]))"
+)
+FACT_CHECK_STRUCTURED_ITEM_PATTERN = (
+    r"^(?:###\s*(?:条目|Item)\s*\d+|\d+\.\s*"
+    r"(?:新闻/声明|关键声明|声明|新闻|Claim|Statement|News Claim|News)[:：])"
+)
+
+
+def _fact_check_text(ui_locale: str | None, key: str) -> str:
+    locale = _normalize_output_locale(ui_locale)
+    messages = {
+        "zh": {
+            "item": "条目",
+            "candidate_claim": "候选声明",
+            "claim_label": "新闻/声明",
+            "conclusion_label": "来源定位",
+            "rationale_label": "来源线索说明",
+            "pending_label": "建议继续查看",
+            "sources_label": "来源出处",
+            "source_links_label": "来源链接",
+            "search_terms_label": "搜索词",
+            "search_results_label": "搜索结果",
+            "fallback_claim_intro": "系统已先整理出本条可核查说法，并附上可直接复核的候选来源线索。",
+            "fallback_conclusion": "已整理候选来源，建议继续人工查看",
+            "fallback_rationale": "本条先展示系统已汇总的搜索入口和候选来源，方便你直接点开原文自行判断，不代替用户下真假结论。",
+            "fallback_pending": "建议优先核对原始报道时间、数字口径、机构原文、社媒原帖和二次转载是否存在偏差。",
+            "fallback_no_links": "当前未提取到可点击来源链接。",
+            "fallback_no_queries": "未生成搜索词",
+            "fallback_detail_rationale": "系统已先保留候选搜索词 `{search_text}` 与可人工复核来源，便于你继续点开原文核对；本条内容不直接作为最终定论。",
+            "fallback_detail_pending": "建议继续核对原始报道、官方披露、社媒原帖、统计口径与发布时间是否一致。",
+            "progress_extract_claims": "正在抽取关键声明...",
+            "progress_search_sources": "正在检索外部来源...",
+            "progress_generate_fact_check": "正在整理逐条来源结果...",
+            "progress_fact_check_done": "关键声明来源分析完成。",
+            "system_prompt": "你是一个严谨的新闻来源导航助手。你的任务是整理出处、报道页、官网页和社媒原帖，不替用户判断真假。",
+            "retry_system_prompt": "你是一个严谨且避免模板化的新闻来源导航助手。请基于现有候选来源更明确地指出哪些页面值得用户自行查看。",
+            "insufficient_evidence": "缺乏证据",
+            "dubious": "存疑",
+            "soften_rationale": "本轮已检索到与该说法相关的公开网页线索，至少可以确认存在可继续核对的对应页面；当前更适合先说明已命中的网页来源，再补充仍待核对的正文细节、发布时间与原始出处。",
+        },
+        "en": {
+            "item": "Item",
+            "candidate_claim": "Candidate Claim",
+            "claim_label": "Claim",
+            "conclusion_label": "Source Status",
+            "rationale_label": "Source Notes",
+            "pending_label": "Suggested Follow-ups",
+            "sources_label": "Source Links",
+            "source_links_label": "Source Links",
+            "search_terms_label": "Search Queries",
+            "search_results_label": "Search Results",
+            "fallback_claim_intro": "The system has already extracted a checkable claim and preserved candidate sources for quick review.",
+            "fallback_conclusion": "Candidate sources collected for manual review",
+            "fallback_rationale": "This draft surfaces current search leads and candidate sources so the user can open the original pages directly instead of relying on an automatic truth verdict.",
+            "fallback_pending": "Prioritize checking the original report date, exact figures, issuing institution, original social post, and whether secondary reposts introduced distortions.",
+            "fallback_no_links": "No clickable source links were extracted this time.",
+            "fallback_no_queries": "No search queries were generated",
+            "fallback_detail_rationale": "The system preserved candidate search queries `{search_text}` and manually reviewable sources so you can open the original pages directly; this draft is not a final verdict.",
+            "fallback_detail_pending": "Continue checking the original report, official disclosures, original social post, statistical methodology, and publication time for consistency.",
+            "progress_extract_claims": "Extracting key claims...",
+            "progress_search_sources": "Searching external sources...",
+            "progress_generate_fact_check": "Organizing itemized source results...",
+            "progress_fact_check_done": "Key-claim source analysis completed.",
+            "system_prompt": "You are a rigorous source-discovery assistant. Focus on locating source pages, reports, official pages, and social posts instead of issuing truth verdicts.",
+            "retry_system_prompt": "You are a rigorous source-discovery assistant who avoids generic wording. Point to the most useful pages for manual review based on the available candidate sources.",
+            "insufficient_evidence": "Insufficient Evidence",
+            "dubious": "Uncertain",
+            "soften_rationale": "This round already captured public web pages related to the claim, so the output should first explain which matching pages were found and then note which publication details, article body, or original source still need follow-up verification.",
+        },
+    }
+    return messages[locale][key]
+
+
+def _build_video_summary_system_prompt(ui_locale: str | None = None) -> str:
+    if _is_english_output_locale(ui_locale):
+        return (
+            "You are a professional video summarization assistant. "
+            "Always return valid JSON. The summary must be clear, concise, and written in English."
+        )
+    return "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"
+
+
+def _build_video_summary_prompt(content: str, current_date: str, ui_locale: str | None = None) -> str:
+    if _is_english_output_locale(ui_locale):
+        return (
+            f"You are a professional video summarization assistant. Today's real date is: {current_date}.\n"
+            "Please summarize the following video transcript.\n"
+            "[Output format requirements]\n"
+            "Return JSON only and include exactly two fields: `summary_markdown` and `fact_check_markdown`.\n"
+            "1. `summary_markdown` requirements:\n"
+            "   - Must be Markdown.\n"
+            "   - Must use concise bullet points rather than long paragraphs.\n"
+            "   - Use this fixed structure:\n"
+            "     ## Core Topic\n"
+            "     - Summarize the video's main idea in 1 sentence.\n"
+            "     ## Main Points\n"
+            "     - List 6-12 key points.\n"
+            "     - Each bullet should cover exactly one fact, view, or judgment.\n"
+            "     - If a point is speculative or opinion-based, explicitly mark it as `Video Opinion` or `Speculation`.\n"
+            "     ## Key Details\n"
+            "     - List important numbers, dates, people, institutions, policy names, and similar details.\n"
+            "     ## Conclusion (Optional)\n"
+            "     - Only include this section if the video clearly presents a conclusion.\n"
+            "     - Do not force a conclusion when the video does not provide one.\n"
+            "2. `fact_check_markdown` requirements:\n"
+            "   - Must return an empty string `\"\"`.\n"
+            "   - Do not generate any fact-check items.\n\n"
+            "**Transcript input:**\n"
+            f"{content}"
+        )
+    return (
+        f"你是一个专业的视频内容总结助手。当前真实日期是：{current_date}。\n"
+        "请总结以下视频字幕。\n"
+        "【输出格式要求】\n"
+        "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n"
+        "1. `summary_markdown` 的要求：\n"
+        "   - 必须是 Markdown。\n"
+        "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
+        "   - 固定结构如下：\n"
+        "     ## 核心主题\n"
+        "     - 1 句话概括视频主旨。\n"
+        "     ## 主要内容\n"
+        "     - 逐条列出 6-12 条要点。\n"
+        "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
+        "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
+        "     ## 关键信息\n"
+        "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
+        "     ## 结论（可选）\n"
+        "     - 只有当视频确实提出了明确结论时才输出本节。\n"
+        "     - 如果视频没有清晰结论，就不要硬写结论。\n"
+        "2. `fact_check_markdown` 的要求：\n"
+        "   - 必须返回空字符串 `\"\"`。\n"
+        "   - 不要生成任何事实核查条目。\n\n"
+        "**字幕内容输入：**\n"
+        f"{content}"
+    )
+
+
+def _build_video_summary_repair_prompt(content_str: str, ui_locale: str | None = None) -> str:
+    if _is_english_output_locale(ui_locale):
+        return (
+            "Repair the content below into valid JSON with exactly two fields: "
+            "`summary_markdown` and `fact_check_markdown`.\n"
+            "- `summary_markdown` must preserve the existing summary information and format it as clean Markdown.\n"
+            "- `fact_check_markdown` must be an empty string.\n"
+            "- Return JSON only, with no explanation.\n\n"
+            f"Original content:\n{content_str}"
+        )
+    return (
+        "请将下面内容修复为合法 JSON，并且只能包含两个字段："
+        "`summary_markdown` 和 `fact_check_markdown`。\n"
+        "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
+        "- `fact_check_markdown` 必须返回空字符串，不要补任何事实核查内容。\n"
+        "- 只返回 JSON，不要解释。\n\n"
+        f"原始内容：\n{content_str}"
+    )
+
+
+def _build_document_summary_system_prompt(ui_locale: str | None = None) -> str:
+    if _is_english_output_locale(ui_locale):
+        return (
+            "You are a professional document summarization assistant. "
+            "Always return valid JSON with only the field `summary_markdown`. "
+            "Use Markdown and follow this fixed structure: `## Core Topic`, `## Main Points`, `## Key Details`, and `## Conclusion (Optional)`. "
+            "Prefer concise bullet points instead of long paragraphs."
+        )
+    return (
+        "你是一个专业的文档总结助手。请始终返回合法 JSON，且只能包含字段 `summary_markdown`。"
+        "输出必须使用 Markdown，结构固定为：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。"
+        "所有内容尽量分条列出，不要写成长篇大段落。"
+    )
+
+
+def _normalize_summary_payload(payload: dict | None, ui_locale: str | None = None) -> dict | None:
     if not isinstance(payload, dict):
         return None
     summary_text = (
@@ -3257,7 +6013,7 @@ def _normalize_summary_payload(payload: dict | None) -> dict | None:
     if not summary_text:
         return None
     if not fact_check_text:
-        fact_check_text = "- 暂未成功生成结构化事实核查结果，请重新尝试生成。"
+        fact_check_text = _build_fact_check_placeholder(ui_locale)
     return {
         "summary_markdown": summary_text,
         "fact_check_markdown": fact_check_text,
@@ -3274,6 +6030,10 @@ def _is_placeholder_fact_check(text: str) -> bool:
         "未成功拆出结构化事实核查结果",
         "AI 未能稳定输出结构化事实核查结果",
         "模型未返回事实核查结果",
+        "Structured fact-check output was not generated successfully",
+        "Could not extract structured fact-check output",
+        "AI failed to produce stable structured fact-check output",
+        "The model did not return fact-check output",
     ]
     return any(marker in value for marker in placeholder_markers)
 
@@ -3292,6 +6052,118 @@ def _extract_markdown_links(markdown_text: str) -> list[tuple[str, str]]:
         seen.add(clean_url)
         pairs.append((clean_label or clean_url, clean_url))
     return pairs
+
+
+def _extract_fact_check_source_links(markdown_text: str) -> list[tuple[str, str]]:
+    """仅保留实际可核查的外部来源，过滤搜索引擎结果页链接。"""
+    filtered: list[tuple[str, str]] = []
+    for label, url in _extract_markdown_links(markdown_text):
+        domain = str(urlparse(url).netloc or "").lower()
+        if not domain:
+            continue
+        if any(token in domain for token in ("google.", "bing.")):
+            continue
+        filtered.append((label, url))
+    return _dedupe_fact_check_source_links(filtered)
+
+
+def _extract_fact_check_hit_context(
+    search_markdown: str,
+    extra_links: list[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    """从搜索结果与已注入来源里提炼“找到了哪些类型的网页”。"""
+    search_text = str(search_markdown or "")
+    candidate_links = _extract_fact_check_source_links(search_text)
+    if extra_links:
+        candidate_links = _dedupe_fact_check_source_links(candidate_links + list(extra_links))
+
+    has_candidate_news_hits = "命中的候选报道" in search_text
+    has_candidate_web_hits = "命中的候选网页" in search_text
+    has_site_hits = "定向命中的候选页面" in search_text
+    has_authoritative_link = any(
+        any(token in (url or "").lower() for token in [
+            ".gov",
+            "state.gov",
+            "gov.",
+            "mod.gov",
+            "reuters.com",
+            "apnews.com",
+            "bloomberg.com",
+            "nytimes.com",
+            "washingtonpost.com",
+        ])
+        for _, url in candidate_links
+    )
+    preview_labels: list[str] = []
+    seen_preview_tokens: set[str] = set()
+    for label, url in candidate_links:
+        parsed = urlparse(url)
+        preview = str(label or "").strip() or str(parsed.netloc or "").lower()
+        preview = re.sub(r"\s+", " ", preview).strip(" -")
+        if not preview:
+            continue
+        preview_key = preview.lower()
+        if preview_key in seen_preview_tokens:
+            continue
+        seen_preview_tokens.add(preview_key)
+        preview_labels.append(preview)
+        if len(preview_labels) >= 3:
+            break
+    return {
+        "candidate_links": candidate_links,
+        "candidate_link_count": len(candidate_links),
+        "has_candidate_news_hits": has_candidate_news_hits,
+        "has_candidate_web_hits": has_candidate_web_hits,
+        "has_site_hits": has_site_hits,
+        "has_authoritative_link": has_authoritative_link,
+        "preview_labels": preview_labels,
+    }
+
+
+def _build_fact_check_hit_rationale(
+    *,
+    search_markdown: str,
+    section_text: str = "",
+    ui_locale: str = "zh",
+) -> str:
+    """根据命中的网页类型生成更贴题的判断依据，而不是复用固定模板。"""
+    section_links = _extract_fact_check_source_links(section_text)
+    hit_context = _extract_fact_check_hit_context(search_markdown, extra_links=section_links)
+    candidate_link_count = int(hit_context.get("candidate_link_count") or 0)
+    if candidate_link_count <= 0:
+        return _fact_check_text(ui_locale, "soften_rationale")
+
+    preview_labels = [str(item).strip() for item in hit_context.get("preview_labels") or [] if str(item).strip()]
+    if ui_locale == "en":
+        source_kinds: list[str] = []
+        if hit_context.get("has_candidate_news_hits"):
+            source_kinds.append("news reports")
+        if hit_context.get("has_candidate_web_hits"):
+            source_kinds.append("general web pages")
+        if hit_context.get("has_site_hits") or hit_context.get("has_authoritative_link"):
+            source_kinds.append("official or outlet pages")
+        source_kind_text = ", ".join(source_kinds) if source_kinds else "public web pages"
+        preview_text = ", ".join(preview_labels)
+        preview_clause = f" including {preview_text}" if preview_text else ""
+        return (
+            f"This round already found {candidate_link_count} matching {source_kind_text}{preview_clause}. "
+            "At minimum, there are public pages corresponding to the claim; the next step is to verify whether the body text, publication time, figures, and original sourcing fully match the video's wording."
+        )
+
+    source_kinds: list[str] = []
+    if hit_context.get("has_candidate_news_hits"):
+        source_kinds.append("新闻报道")
+    if hit_context.get("has_candidate_web_hits"):
+        source_kinds.append("普通网页")
+    if hit_context.get("has_site_hits") or hit_context.get("has_authoritative_link"):
+        source_kinds.append("官网/机构页面")
+    source_kind_text = "、".join(source_kinds) if source_kinds else "公开网页"
+    preview_text = "、".join(preview_labels)
+    preview_clause = f"，例如 {preview_text}" if preview_text else ""
+    return (
+        f"本轮已检索到 {candidate_link_count} 个与该说法对应的{source_kind_text}{preview_clause}，"
+        "至少可以确认网上存在可继续核对的相关页面；下一步应继续比对正文细节、发布时间、数字口径与原始出处是否完全一致。"
+    )
 
 
 def _soften_fact_check_wording(text: str) -> str:
@@ -3365,7 +6237,7 @@ def _enrich_fact_check_markdown_with_links(fact_md: str, search_results_md: str)
     fact_text = str(fact_md or "").strip()
     if not fact_text:
         return fact_text
-    search_links = _extract_markdown_links(search_results_md)
+    search_links = _extract_fact_check_source_links(search_results_md)
     if not search_links:
         return _soften_fact_check_wording(fact_text)
     return _enrich_fact_check_items_with_claim_sources(
@@ -3385,7 +6257,7 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
     # 1. `### 条目1` 这种结构化块
     # 2. `1. 新闻/声明：...` 这种编号列表
     sections = re.split(
-        r"(?=^(?:###\s*条目\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻)[:：]))",
+        FACT_CHECK_SECTION_SPLIT_PATTERN,
         _soften_fact_check_wording(fact_text),
         flags=re.M,
     )
@@ -3397,7 +6269,7 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
         if not stripped:
             continue
         is_structured_item = bool(
-            re.match(r"^(?:###\s*条目\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻)[:：])", stripped)
+            re.match(FACT_CHECK_STRUCTURED_ITEM_PATTERN, stripped)
         )
         if not is_structured_item:
             updated_sections.append(stripped)
@@ -3408,7 +6280,7 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
         else:
             current_sources = claim_sources[claim_idx] if claim_idx < len(claim_sources) else {}
             claim_idx += 1
-        source_links = _extract_markdown_links(str(current_sources.get("search_markdown") or ""))
+        source_links = _extract_fact_check_source_links(str(current_sources.get("search_markdown") or ""))
         if not source_links:
             updated_sections.append(stripped)
             continue
@@ -3419,17 +6291,169 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
 
         source_text = "；".join(f"[{label}]({url})" for label, url in source_links[:3])
         stripped = _soften_absolute_negative_fact_check_with_sources(stripped, source_links)
+        source_label = _fact_check_text(
+            "en" if re.search(r"(?:^###\s*Item\s*\d+|(?:^|\n)-\s*Sources?[:：])", stripped, re.I) else "zh",
+            "sources_label",
+        )
+        source_links_label = _fact_check_text(
+            "en" if source_label in {"Sources", "Source Links"} else "zh",
+            "source_links_label",
+        )
 
-        # 如果模型已经输出了“来源/出处”但没有链接，保留原有文字说明并额外补一行可点击链接。
-        if re.search(r"来源/出处[:：]", stripped):
+        # 如果模型已经输出了来源字段但没有链接，保留原有文字说明并额外补一行可点击链接。
+        if re.search(r"(?:来源/出处|来源出处|Sources?|Source Links?)[:：]", stripped, re.I):
             stripped = re.sub(
-                r"(来源/出处[:：][^\n]*)",
-                lambda m: f"{m.group(1)}\n- 来源链接： {source_text}",
+                r"((?:来源/出处|来源出处|Sources?|Source Links?)[:：][^\n]*)",
+                lambda m: f"{m.group(1)}\n- {source_links_label}: {source_text}",
                 stripped,
                 count=1,
+                flags=re.I,
             )
         else:
-            stripped = stripped.rstrip() + f"\n- 来源/出处： {source_text}"
+            stripped = stripped.rstrip() + f"\n- {source_label}: {source_text}"
+        updated_sections.append(stripped)
+
+    return "\n\n".join(updated_sections)
+
+
+def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: list[dict] | None) -> str:
+    """有候选网页时，避免把“已找到对应页面”的场景误写成统一的空泛结论。
+
+    这里不把条目强行改为“属实”，只把更合适的场景收敛为“存疑”：
+    - 搜索上下文里已出现候选报道、候选网页或定向站点页面；
+    - 但模型仍输出“缺乏证据”；
+    - 说明更接近“已找到对应网页，仍需继续核对细节”。
+    """
+    fact_text = str(fact_md or "").strip()
+    if not fact_text or not claim_sources:
+        return fact_text
+
+    sections = re.split(
+        FACT_CHECK_SECTION_SPLIT_PATTERN,
+        fact_text,
+        flags=re.M,
+    )
+    updated_sections: list[str] = []
+    claim_idx = 0
+
+    for section in sections:
+        stripped = section.strip()
+        if not stripped:
+            continue
+        is_structured_item = bool(
+            re.match(FACT_CHECK_STRUCTURED_ITEM_PATTERN, stripped)
+        )
+        if not is_structured_item:
+            updated_sections.append(stripped)
+            continue
+
+        if len(claim_sources) == 1:
+            current_sources = claim_sources[0]
+        else:
+            current_sources = claim_sources[claim_idx] if claim_idx < len(claim_sources) else {}
+            claim_idx += 1
+
+        search_markdown = str(current_sources.get("search_markdown") or "")
+        section_source_links = _extract_fact_check_source_links(stripped)
+        hit_context = _extract_fact_check_hit_context(search_markdown, extra_links=section_source_links)
+        candidate_link_count = int(hit_context.get("candidate_link_count") or 0)
+        has_candidate_news_hits = bool(hit_context.get("has_candidate_news_hits")) and candidate_link_count >= 1
+        has_candidate_web_hits = (
+            bool(hit_context.get("has_candidate_web_hits"))
+            or bool(hit_context.get("has_site_hits"))
+        ) and candidate_link_count >= 1
+        has_source_links = bool(re.search(r"\[[^\]]+\]\(https?://", stripped))
+        has_authoritative_link = bool(hit_context.get("has_authoritative_link"))
+        has_dynamic_fact_markers = bool(
+            re.search(
+                r"(市值|油价|股市|汇率|利率|GDP|CPI|失业率|销量|排名|第[一二三四五六七八九十\d]+|达到|升至|超越|\b\d+(?:\.\d+)?(?:万亿|亿|%|美元|元|桶)\b)",
+                stripped,
+                re.I,
+            )
+        )
+        has_partial_support_rationale = any(
+            marker in stripped
+            for marker in [
+                "需以",
+                "需要来自",
+                "官方数据",
+                "实时数据",
+                "权威金融数据机构",
+                "动态变化",
+                "未提供可验证的具体数据来源",
+                "未能找到",
+                "直接证实",
+            ]
+        )
+        should_soften_to_dubious = (
+            has_candidate_news_hits
+            or has_candidate_web_hits
+            or candidate_link_count >= 2
+            or has_authoritative_link
+            or (has_source_links and has_dynamic_fact_markers and has_partial_support_rationale)
+        )
+        if re.search(r"^\s*###\s*Item\s*\d+", stripped, re.I) or re.search(r"(?:Conclusion|Source Status):", stripped):
+            conclusion_label = "Source Status" if "Source Status:" in stripped else "Conclusion"
+            insufficient_value = "No Direct Source Yet" if conclusion_label == "Source Status" else "Insufficient Evidence"
+            dubious_value = "Related Coverage Located" if conclusion_label == "Source Status" else "Uncertain"
+        else:
+            conclusion_label = "来源定位" if "来源定位" in stripped else "核查结论"
+            insufficient_value = "暂未定位到直接来源" if conclusion_label == "来源定位" else "缺乏证据"
+            dubious_value = "已找到相关来源" if conclusion_label == "来源定位" else "存疑"
+        rationale_insert = _build_fact_check_hit_rationale(
+            search_markdown=search_markdown,
+            section_text=stripped,
+            ui_locale="en" if conclusion_label == "Conclusion" else "zh",
+        )
+        rationale_line_pattern = r"(^-\s*(?:判断依据|依据|来源线索说明|Rationale|Source Notes)[:：]\s*)([^\n]*)"
+        if not should_soften_to_dubious or f"{conclusion_label}：" + insufficient_value not in stripped and f"{conclusion_label}: {insufficient_value}" not in stripped:
+            updated_sections.append(stripped)
+            continue
+
+        stripped = re.sub(
+            rf"({re.escape(conclusion_label)}[:：]\s*){re.escape(insufficient_value)}",
+            rf"\1{dubious_value}",
+            stripped,
+            count=1,
+            flags=re.I,
+        )
+        generic_rationale_tokens = [
+            "交易所公告",
+            "原始统计口径",
+            "一手权威来源",
+            "更适合判为“存疑”",
+            "indirect support",
+            "exchange filing",
+            "original statistical methodology",
+            "primary authoritative source",
+        ]
+        if rationale_insert:
+            if re.search(rationale_line_pattern, stripped, re.I | re.M):
+                replace_existing_rationale = any(token in stripped for token in generic_rationale_tokens)
+                if replace_existing_rationale:
+                    stripped = re.sub(
+                        rationale_line_pattern,
+                        lambda m: f"{m.group(1)}{rationale_insert}",
+                        stripped,
+                        count=1,
+                        flags=re.I | re.M,
+                    )
+                elif rationale_insert not in stripped:
+                    stripped = re.sub(
+                        rationale_line_pattern,
+                        lambda m: (
+                            f"{m.group(1)}{rationale_insert}；{m.group(2).strip()}"
+                            if str(m.group(2) or "").strip()
+                            else f"{m.group(1)}{rationale_insert}"
+                        ),
+                        stripped,
+                        count=1,
+                        flags=re.I | re.M,
+                    )
+            elif rationale_insert not in stripped:
+                stripped = stripped.rstrip() + (
+                    f"\n- {'Source Notes' if conclusion_label == 'Conclusion' else '来源线索说明'}: {rationale_insert}"
+                )
         updated_sections.append(stripped)
 
     return "\n\n".join(updated_sections)
@@ -3439,47 +6463,121 @@ def _build_fact_check_fallback_markdown(
     *,
     claim_sources: list[dict] | None = None,
     search_results_md: str = "",
+    ui_locale: str | None = None,
 ) -> str:
     """在模型未稳定输出时，基于候选来源生成最小可用的事实核查稿。"""
+    item_label = _fact_check_text(ui_locale, "item")
+    claim_label = _fact_check_text(ui_locale, "claim_label")
+    conclusion_label = _fact_check_text(ui_locale, "conclusion_label")
+    rationale_label = _fact_check_text(ui_locale, "rationale_label")
+    pending_label = _fact_check_text(ui_locale, "pending_label")
+    sources_label = _fact_check_text(ui_locale, "sources_label")
+    candidate_claim_label = _fact_check_text(ui_locale, "candidate_claim")
+    search_terms_label = _fact_check_text(ui_locale, "search_terms_label")
     sections = [
-        "### 条目1",
-        "- 新闻/声明：系统已先整理出本条可核查说法，并附上可直接复核的候选来源线索。",
-        "- 核查结论：当前证据仍需继续补充",
-        "- 依据：本条先展示系统已汇总的搜索入口和权威站点，方便快速继续核对，不作为最终定论。",
-        "- 待补充核查点：建议优先核对原始报道时间、数字口径、机构原文和二次转载是否存在偏差。",
+        f"### {item_label}1",
+        f"- {claim_label}: {_fact_check_text(ui_locale, 'fallback_claim_intro')}",
+        f"- {conclusion_label}: {_fact_check_text(ui_locale, 'fallback_conclusion')}",
+        f"- {rationale_label}: {_fact_check_text(ui_locale, 'fallback_rationale')}",
+        f"- {pending_label}: {_fact_check_text(ui_locale, 'fallback_pending')}",
     ]
 
     if claim_sources:
-        rendered_sections: list[str] = []
-        for idx, item in enumerate(claim_sources, start=1):
-            claim = str(item.get("claim") or f"候选声明{idx}").strip()
-            query_list = item.get("queries") or []
-            search_md = str(item.get("search_markdown") or "")
-            links = _extract_markdown_links(search_md)
-            source_text = "；".join(f"[{label}]({url})" for label, url in links[:5]) if links else "当前未提取到可点击来源链接。"
-            search_text = " | ".join(str(query).strip() for query in query_list if str(query).strip()) or "未生成搜索词"
-            rendered_sections.append(
-                "\n".join(
-                    [
-                        f"### 条目{idx}",
-                        f"- 新闻/声明：{claim}",
-                        "- 核查结论：当前证据仍需继续补充",
-                        f"- 依据：系统已先保留候选搜索词 `{search_text}` 与可人工复核来源，便于继续核对；本条内容不直接作为最终定论。",
-                        "- 待补充核查点：建议继续核对原始报道、官方披露、统计口径与发布时间是否一致。",
-                        f"- 来源/出处： {source_text}",
-                    ]
-                )
-            )
+        rendered_sections = _render_fact_check_claim_sections(
+            claim_sources,
+            start_index=1,
+            ui_locale=ui_locale,
+        )
         if rendered_sections:
             return "\n\n".join(rendered_sections)
 
-    search_links = _extract_markdown_links(search_results_md)
+    search_links = _extract_fact_check_source_links(search_results_md)
     if search_links:
         source_text = "；".join(f"[{label}]({url})" for label, url in search_links[:8])
-        sections.append(f"- 来源/出处： {source_text}")
+        sections.append(f"- {sources_label}: {source_text}")
     else:
-        sections.append("- 来源/出处：当前未提取到可点击来源链接。")
+        sections.append(f"- {sources_label}: {_fact_check_text(ui_locale, 'fallback_no_links')}")
     return "\n".join(sections)
+
+
+def _render_fact_check_claim_sections(
+    claim_sources: list[dict] | None,
+    *,
+    start_index: int = 1,
+    ui_locale: str | None = None,
+) -> list[str]:
+    if not claim_sources:
+        return []
+
+    item_label = _fact_check_text(ui_locale, "item")
+    claim_label = _fact_check_text(ui_locale, "claim_label")
+    conclusion_label = _fact_check_text(ui_locale, "conclusion_label")
+    rationale_label = _fact_check_text(ui_locale, "rationale_label")
+    pending_label = _fact_check_text(ui_locale, "pending_label")
+    sources_label = _fact_check_text(ui_locale, "sources_label")
+    candidate_claim_label = _fact_check_text(ui_locale, "candidate_claim")
+    rendered_sections: list[str] = []
+
+    for offset, item in enumerate(claim_sources):
+        item_index = start_index + offset
+        claim = str(item.get("claim") or f"{candidate_claim_label}{item_index}").strip()
+        query_list = item.get("queries") or []
+        search_md = str(item.get("search_markdown") or "")
+        links = _extract_fact_check_source_links(search_md)
+        source_text = "；".join(f"[{label}]({url})" for label, url in links[:5]) if links else _fact_check_text(ui_locale, "fallback_no_links")
+        search_text = " | ".join(str(query).strip() for query in query_list if str(query).strip()) or _fact_check_text(ui_locale, "fallback_no_queries")
+        rendered_sections.append(
+            "\n".join(
+                [
+                    f"### {item_label}{item_index}",
+                    f"- {claim_label}: {claim}",
+                    f"- {conclusion_label}: {_fact_check_text(ui_locale, 'fallback_conclusion')}",
+                    f"- {rationale_label}: {_fact_check_text(ui_locale, 'fallback_detail_rationale').format(search_text=search_text)}",
+                    f"- {pending_label}: {_fact_check_text(ui_locale, 'fallback_detail_pending')}",
+                    f"- {sources_label}: {source_text}",
+                ]
+            )
+        )
+    return rendered_sections
+
+
+def _count_structured_fact_check_items(fact_md: str) -> int:
+    sections = re.split(FACT_CHECK_SECTION_SPLIT_PATTERN, str(fact_md or "").strip(), flags=re.M)
+    return sum(
+        1
+        for section in sections
+        if section.strip() and re.match(FACT_CHECK_STRUCTURED_ITEM_PATTERN, section.strip())
+    )
+
+
+def _ensure_fact_check_item_coverage(
+    fact_md: str,
+    claim_sources: list[dict] | None,
+    *,
+    ui_locale: str | None = None,
+) -> str:
+    fact_text = str(fact_md or "").strip()
+    if not fact_text or not claim_sources:
+        return fact_text
+
+    expected_items = len([item for item in claim_sources if str(item.get("claim") or "").strip()])
+    if expected_items <= 0:
+        return fact_text
+
+    actual_items = _count_structured_fact_check_items(fact_text)
+    if actual_items <= 0:
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources, ui_locale=ui_locale)
+    if actual_items >= expected_items:
+        return fact_text
+
+    missing_sections = _render_fact_check_claim_sections(
+        claim_sources[actual_items:expected_items],
+        start_index=actual_items + 1,
+        ui_locale=ui_locale,
+    )
+    if not missing_sections:
+        return fact_text
+    return fact_text.rstrip() + "\n\n" + "\n\n".join(missing_sections)
 
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown", ".pptx"}
@@ -4036,6 +7134,7 @@ def summarize_document_text(
     model: str,
     proxy_url: str = None,
     progress_callback=None,
+    ui_locale: str | None = None,
 ) -> dict:
     cleaned_text = clean_document_text(text)
     if not cleaned_text:
@@ -4043,23 +7142,36 @@ def summarize_document_text(
 
     client = _build_openai_client(api_key, base_url, proxy_url)
     content_len = len(cleaned_text)
-    direct_system_prompt = (
-        "你是一个专业的文档总结助手。请始终返回合法 JSON，且只能包含字段 `summary_markdown`。"
-        "输出必须使用 Markdown，结构固定为：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`。"
-        "所有内容尽量分条列出，不要写成长篇大段落。"
-    )
+    direct_system_prompt = _build_document_summary_system_prompt(ui_locale)
 
     if content_len <= DEFAULT_DOCUMENT_DIRECT_SUMMARY_CHARS:
         if callable(progress_callback):
-            progress_callback(35, "文档较短，正在直接生成总结...")
+            progress_callback(
+                35,
+                "Generating direct summary for the short document..."
+                if _is_english_output_locale(ui_locale)
+                else "文档较短，正在直接生成总结...",
+            )
         prompt = (
-            "请总结以下文档内容。\n"
-            "要求：\n"
-            "- 只返回 JSON\n"
-            "- 仅包含字段 `summary_markdown`\n"
-            "- `## 主要内容` 中输出 6-10 条要点\n"
-            "- `## 结论（可选）` 只有在文档确实有明确结论时才输出\n\n"
-            f"文档正文：\n{cleaned_text}"
+            (
+                "Please summarize the following document.\n"
+                "Requirements:\n"
+                "- Return JSON only\n"
+                "- Include only the field `summary_markdown`\n"
+                "- Output 6-10 bullets in `## Main Points`\n"
+                "- Include `## Conclusion (Optional)` only when the document clearly presents a conclusion\n\n"
+                f"Document body:\n{cleaned_text}"
+            )
+            if _is_english_output_locale(ui_locale)
+            else (
+                "请总结以下文档内容。\n"
+                "要求：\n"
+                "- 只返回 JSON\n"
+                "- 仅包含字段 `summary_markdown`\n"
+                "- `## 主要内容` 中输出 6-10 条要点\n"
+                "- `## 结论（可选）` 只有在文档确实有明确结论时才输出\n\n"
+                f"文档正文：\n{cleaned_text}"
+            )
         )
         summary_markdown = _summarize_document_passage(
             client,
@@ -4069,7 +7181,7 @@ def summarize_document_text(
             max_tokens=2200,
         )
         if callable(progress_callback):
-            progress_callback(100, "文档总结完成。")
+            progress_callback(100, "Document summary completed." if _is_english_output_locale(ui_locale) else "文档总结完成。")
         return {
             "summary_markdown": summary_markdown,
             "strategy": "direct",
@@ -4085,38 +7197,86 @@ def summarize_document_text(
     total_chunks = len(chunks)
     for idx, chunk in enumerate(chunks, start=1):
         if callable(progress_callback):
-            progress_callback(20 + int(50 * idx / max(1, total_chunks)), f"正在总结第 {idx}/{total_chunks} 块...")
+            progress_callback(
+                20 + int(50 * idx / max(1, total_chunks)),
+                (
+                    f"Summarizing chunk {idx}/{total_chunks}..."
+                    if _is_english_output_locale(ui_locale)
+                    else f"正在总结第 {idx}/{total_chunks} 块..."
+                ),
+            )
         chunk_prompt = (
-            f"请总结下面这段文档片段（第 {idx}/{total_chunks} 块）。\n"
-            "要求：\n"
-            "- 只返回 JSON\n"
-            "- 仅包含字段 `summary_markdown`\n"
-            "- 输出结构：`### 本块要点`、`### 本块关键信息`\n"
-            "- 使用分条要点，不要长段落\n\n"
-            f"文档片段：\n{chunk['text']}"
+            (
+                f"Please summarize the document excerpt below (chunk {idx}/{total_chunks}).\n"
+                "Requirements:\n"
+                "- Return JSON only\n"
+                "- Include only the field `summary_markdown`\n"
+                "- Use the structure `### Chunk Highlights` and `### Chunk Key Details`\n"
+                "- Prefer bullet points instead of long paragraphs\n\n"
+                f"Document excerpt:\n{chunk['text']}"
+            )
+            if _is_english_output_locale(ui_locale)
+            else (
+                f"请总结下面这段文档片段（第 {idx}/{total_chunks} 块）。\n"
+                "要求：\n"
+                "- 只返回 JSON\n"
+                "- 仅包含字段 `summary_markdown`\n"
+                "- 输出结构：`### 本块要点`、`### 本块关键信息`\n"
+                "- 使用分条要点，不要长段落\n\n"
+                f"文档片段：\n{chunk['text']}"
+            )
         )
         chunk_summary = _summarize_document_passage(
             client,
             model,
-            "你是一个文档片段总结助手。请始终返回合法 JSON，且只能包含 `summary_markdown`。",
+            (
+                "You are a document passage summarization assistant. Always return valid JSON containing only `summary_markdown`."
+                if _is_english_output_locale(ui_locale)
+                else "你是一个文档片段总结助手。请始终返回合法 JSON，且只能包含 `summary_markdown`。"
+            ),
             chunk_prompt,
             max_tokens=1000,
         )
-        chunk_summaries.append(f"## 第{idx}块摘要\n{chunk_summary}")
+        chunk_summaries.append(
+            (
+                f"## Chunk {idx} Summary\n{chunk_summary}"
+                if _is_english_output_locale(ui_locale)
+                else f"## 第{idx}块摘要\n{chunk_summary}"
+            )
+        )
 
     if callable(progress_callback):
-        progress_callback(80, "正在汇总整份文档摘要...")
+        progress_callback(
+            80,
+            "Merging chunk summaries into the final document summary..."
+            if _is_english_output_locale(ui_locale)
+            else "正在汇总整份文档摘要...",
+        )
     merged_chunk_text = "\n\n".join(chunk_summaries)
     merge_prompt = (
-        "下面是同一份长文档的分块摘要，请基于这些分块摘要生成最终总结。\n"
-        "要求：\n"
-        "- 只返回 JSON\n"
-        "- 仅包含字段 `summary_markdown`\n"
-        "- 使用 Markdown\n"
-        "- 固定结构：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`\n"
-        "- `## 主要内容` 输出 8-12 条，按条列出\n"
-        "- 不要重复每一块的相同意思\n\n"
-        f"分块摘要：\n{merged_chunk_text}"
+        (
+            "Below are chunk summaries from the same long document. Generate the final summary from them.\n"
+            "Requirements:\n"
+            "- Return JSON only\n"
+            "- Include only the field `summary_markdown`\n"
+            "- Use Markdown\n"
+            "- Use the fixed structure: `## Core Topic`, `## Main Points`, `## Key Details`, `## Conclusion (Optional)`\n"
+            "- Output 8-12 bullets in `## Main Points`\n"
+            "- Avoid repeating the same meaning across chunks\n\n"
+            f"Chunk summaries:\n{merged_chunk_text}"
+        )
+        if _is_english_output_locale(ui_locale)
+        else (
+            "下面是同一份长文档的分块摘要，请基于这些分块摘要生成最终总结。\n"
+            "要求：\n"
+            "- 只返回 JSON\n"
+            "- 仅包含字段 `summary_markdown`\n"
+            "- 使用 Markdown\n"
+            "- 固定结构：`## 核心主题`、`## 主要内容`、`## 关键信息`、`## 结论（可选）`\n"
+            "- `## 主要内容` 输出 8-12 条，按条列出\n"
+            "- 不要重复每一块的相同意思\n\n"
+            f"分块摘要：\n{merged_chunk_text}"
+        )
     )
     summary_markdown = _summarize_document_passage(
         client,
@@ -4126,7 +7286,7 @@ def summarize_document_text(
         max_tokens=2500,
     )
     if callable(progress_callback):
-        progress_callback(100, "长文档总结完成。")
+        progress_callback(100, "Long document summary completed." if _is_english_output_locale(ui_locale) else "长文档总结完成。")
     return {
         "summary_markdown": summary_markdown,
         "strategy": "chunked",
@@ -4178,6 +7338,7 @@ def _normalize_fact_check_claim(claim: str) -> str:
 
     text = re.sub(r"^[\-*•\d\.\)\(（）：:、\s]+", "", text).strip()
     text = re.sub(r"[：:]\s*$", "", text).strip()
+    text = _strip_fact_check_context_prefixes(text)
 
     trailing_phrases = [
         "其中，", "其中,", "但是，", "但是,", "不过，", "不过,", "并且，", "并且,",
@@ -4207,6 +7368,41 @@ def _normalize_fact_check_claim(claim: str) -> str:
     return merged
 
 
+FACT_CHECK_COMMENTARY_PREFIX_PATTERN = re.compile(r"^(?:视频观点|观点|评论|分析|解读)\s*[：:]", re.I)
+FACT_CHECK_OPINION_MARKERS = [
+    "意在",
+    "实质是",
+    "终极盾牌",
+    "被动局面",
+    "救银行",
+    "刺激经济",
+    "逆向筛选",
+    "难以接受",
+    "谈判周期不匹配",
+    "关键是",
+]
+
+
+def _is_likely_commentary_claim(raw_text: str) -> bool:
+    value = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+    if not value:
+        return False
+    has_commentary_prefix = bool(FACT_CHECK_COMMENTARY_PREFIX_PATTERN.match(value))
+    has_opinion_markers = any(marker in value for marker in FACT_CHECK_OPINION_MARKERS)
+    has_hard_fact = bool(
+        re.search(r"\b20\d{2}\b", value)
+        or re.search(r"\d+(?:\.\d+)?\s*%", value)
+        or re.search(r"\d+(?:,\d{3})+", value)
+        or re.search(r"\d+(?:\.\d+)?\s*(?:亿|万亿|万人|亿美元|港元|导弹)\b", value)
+        or re.search(r"(宣布|通报|处罚|要求|表示|报道称|报道|官方|央行|政府|reuters|bloomberg|wsj|ft)", value, re.I)
+    )
+    if has_commentary_prefix and not has_hard_fact:
+        return True
+    if has_commentary_prefix and has_opinion_markers and not re.search(r"(报道|官方|宣布|处罚|要求|央行|政府)", value, re.I):
+        return True
+    return has_opinion_markers and not has_hard_fact
+
+
 def _extract_claims_from_summary_heuristic(summary_markdown: str, max_claims: int) -> list[dict]:
     summary_text = clean_document_text(summary_markdown or "")
     if not summary_text or max_claims <= 0:
@@ -4218,8 +7414,14 @@ def _extract_claims_from_summary_heuristic(summary_markdown: str, max_claims: in
     news_markers = [
         "表示", "称", "宣布", "通报", "回应", "指出", "发布", "发生", "遇袭", "逮捕",
         "选举", "关税", "制裁", "协议", "政策", "政府", "官方", "记者", "报道",
+        "访问", "调解", "谈判", "整治", "承揽", "上市", "边控", "员工", "蓝筹股",
+        "涉及", "针对", "进行", "开展", "部署", "要求", "呼吁", "强调", "指出",
     ]
     for raw_line in lines:
+        raw_compact = re.sub(r"^#+\s*", "", raw_line).strip()
+        raw_compact = re.sub(r"^[-*•]\s*", "", raw_compact).strip()
+        if _is_likely_commentary_claim(raw_compact):
+            continue
         cleaned_line = re.sub(r"^#+\s*", "", raw_line).strip()
         cleaned_line = re.sub(r"^[-*•]\s*", "", cleaned_line).strip()
         cleaned_line = _normalize_fact_check_claim(cleaned_line)
@@ -4256,9 +7458,14 @@ def _extract_claims_from_text_heuristic(text: str, max_claims: int) -> list[dict
         return []
 
     fragments = re.split(r"[。！？\n]+", cleaned)
-    keywords = ["表示", "称", "宣布", "通报", "回应", "政府", "官方", "记者", "报道", "数据显示", "according to", "official"]
+    keywords = [
+        "表示", "称", "宣布", "通报", "回应", "政府", "官方", "记者", "报道", "数据显示",
+        "according to", "official", "访问", "调解", "谈判", "整治", "承揽", "上市", "边控", "涉及",
+    ]
     scored: list[tuple[int, str]] = []
     for fragment in fragments:
+        if _is_likely_commentary_claim(fragment):
+            continue
         claim = _normalize_fact_check_claim(fragment)
         if not claim or len(claim) < 16 or len(claim) > 150:
             continue
@@ -4300,6 +7507,33 @@ def _build_heuristic_claim_items(text: str, summary_markdown: str, max_claims: i
         if len(claims) >= max_claims:
             break
     return claims[:max_claims]
+
+
+def _supplement_claim_items(
+    primary_claims: list[dict] | None,
+    supplemental_claims: list[dict] | None,
+    *,
+    max_claims: int,
+) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for bucket in (primary_claims or [], supplemental_claims or []):
+        for item in bucket:
+            claim = _normalize_fact_check_claim(str(item.get("claim") or ""))
+            if not claim:
+                continue
+            lowered = claim.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            queries = item.get("queries") or []
+            if isinstance(queries, str):
+                queries = [queries]
+            normalized_queries = [str(query).strip() for query in queries if str(query).strip()]
+            merged.append({"claim": claim, "queries": normalized_queries[:2]})
+            if len(merged) >= max_claims:
+                return merged
+    return merged
 
 
 def _looks_like_siliconflow_base_url(base_url_value: str) -> bool:
@@ -4348,13 +7582,16 @@ def extract_key_claims(
         "- 每条 claim 必须是完整、自洽、可独立理解的一句话，不要只截半句。\n"
         "- 不要让 claim 以“其中、但是、并且、而且、例如、比如、随后、然后、同时”等承接词结尾。\n"
         "- 如果原文句子过长，请改写成完整但更短的独立陈述，保留主体、动作和关键数字/时间。\n"
+        "- 每条 queries 最多给 2 个：1 个尽量精确，1 个尽量放宽。\n"
+        "- 如果声明涉及外国人物、政府部门、城市、组织或国际事件，至少有 1 个 query 使用英文或原文名称，不要只给中文译名。\n"
+        "- 如果声明里有日期，queries 不要都死扣完整日期；至少保留 1 个去掉具体日期的宽松版本，避免搜不到。\n"
         "- 只返回 JSON，对象格式如下：\n"
         "{\n"
         '  "claims": [\n'
         '    {"claim": "声明内容", "queries": ["搜索词1", "搜索词2"]}\n'
         "  ]\n"
         "}\n"
-        "- 每条 queries 最多给 2 个，搜索词中尽量包含主体、时间、地点、数字、机构。\n\n"
+        "- 搜索词中尽量包含主体、时间、地点、数字、机构。\n\n"
         f"文档总结：\n{summary_excerpt}\n\n"
         f"文档正文节选：\n{excerpt}"
     )
@@ -4373,8 +7610,7 @@ def extract_key_claims(
         claims = _extract_claim_items(content, max_claims=max_claims)
     except Exception:
         claims = []
-    if not claims:
-        claims = heuristic_claims
+    claims = _supplement_claim_items(claims, heuristic_claims, max_claims=max_claims)
     if not claims:
         raise RuntimeError("未能从文档中提取到可核查的关键声明。")
     return claims
@@ -4404,7 +7640,7 @@ def classify_document_for_fact_check(
         "}\n"
         "- 如果文档明显属于新闻、研究、时评、政策解读、行业分析，should_fact_check 设为 true。\n"
         "- 否则设为 false。\n"
-        "- recommended_claim_count 只能取 3、5、8 之一。\n\n"
+        "- recommended_claim_count 请根据文档信息密度给出 3-12 之间的整数。\n\n"
         f"文档总结：\n{summary_markdown[:3500]}\n\n"
         f"文档正文节选：\n{excerpt}"
     )
@@ -4430,7 +7666,7 @@ def classify_document_for_fact_check(
     should_fact_check = bool(payload.get("should_fact_check", False))
     reason = str(payload.get("reason") or "").strip()
     recommended_claim_count = int(payload.get("recommended_claim_count") or 5)
-    if recommended_claim_count not in {3, 5, 8}:
+    if not (3 <= recommended_claim_count <= 12):
         recommended_claim_count = 5
 
     if not reason:
@@ -4493,6 +7729,19 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
         "停火", "制裁", "投票", "选举", "协议", "关税", "经济数据", "失业率",
         "cpi", "gdp", "policy", "tariff", "sanction", "election",
     ]
+    public_entity_markers = [
+        "政府", "官方", "机构", "部门", "企业", "公司", "法院", "警方", "医院",
+        "学校", "大学", "央行", "外交部", "商务部", "联合国", "白宫", "总统",
+        "agency", "department", "ministry", "company", "corporation", "court",
+        "police", "hospital", "university", "central bank", "white house",
+        "president", "u.n.", "united nations",
+    ]
+    statement_markers = [
+        "表示", "称", "指出", "披露", "证实", "否认", "承认", "公开表态", "时间线",
+        "数据", "数字", "口径", "统计", "说法", "声明", "facts", "figures",
+        "timeline", "statement", "claim", "claims", "said", "stated", "announced",
+        "released", "confirmed", "denied",
+    ]
     hard_fact_patterns = [
         r"\b20\d{2}\b",
         r"\b\d+(?:\.\d+)?\s*%",
@@ -4502,6 +7751,8 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
     negative_hits = sum(1 for marker in negative_markers if marker in combined)
     news_hits = sum(1 for marker in news_markers if marker in combined)
     event_hits = sum(1 for marker in event_markers if marker in combined)
+    public_entity_hits = sum(1 for marker in public_entity_markers if marker in combined)
+    statement_hits = sum(1 for marker in statement_markers if marker in combined)
     hard_fact_hits = sum(1 for pattern in hard_fact_patterns if re.search(pattern, combined))
     content_len = len(content)
     summary_len = len(summary)
@@ -4520,30 +7771,69 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
             "recommended_claim_count": 0,
         }
 
-    should_fact_check = (
-        (news_hits >= 1 and event_hits >= 1)
-        or (event_hits >= 2 and hard_fact_hits >= 1)
-        or (news_hits >= 2 and hard_fact_hits >= 1)
-        or (content_len >= 3500 and hard_fact_hits >= 1)
-        or content_len >= 7000
-    )
+    if negative_hits >= 2 and news_hits == 0 and event_hits == 0:
+        return {
+            "should_fact_check": False,
+            "reason": "当前视频更像观点表达、教程或日常内容，已跳过自动新闻核查。",
+            "recommended_claim_count": 0,
+        }
 
-    # 真实视频默认跑基础核查，避免新闻/事件词命中不足时被误跳过。
-    if not should_fact_check and (content_len >= 800 or summary_len >= 120):
-        should_fact_check = True
+    clear_news_signal = news_hits >= 1 and event_hits >= 1
+    clear_event_signal = event_hits >= 2 and hard_fact_hits >= 1
+    clear_report_signal = news_hits >= 2 and hard_fact_hits >= 1
+    clear_data_signal = news_hits >= 1 and hard_fact_hits >= 2 and content_len >= 1200
+    clear_public_claim_signal = (
+        content_len >= 900
+        and hard_fact_hits >= 1
+        and public_entity_hits >= 1
+        and statement_hits >= 1
+    )
+    concise_public_claim_signal = (
+        content_len >= 80
+        and summary_len >= 100
+        and hard_fact_hits >= 1
+        and public_entity_hits >= 1
+        and statement_hits >= 3
+        and negative_hits == 0
+    )
+    clear_timeline_signal = (
+        content_len >= 1400
+        and hard_fact_hits >= 1
+        and statement_hits >= 2
+        and negative_hits == 0
+    )
+    should_fact_check = (
+        clear_news_signal
+        or clear_event_signal
+        or clear_report_signal
+        or clear_data_signal
+        or clear_public_claim_signal
+        or concise_public_claim_signal
+        or clear_timeline_signal
+    )
 
     if not should_fact_check:
         return {
             "should_fact_check": False,
-            "reason": "当前视频不够像可核查内容，已默认跳过新闻核查。",
+            "reason": "当前视频未命中足够明确的新闻/事件信号，已跳过自动新闻核查。",
             "recommended_claim_count": 0,
         }
 
-    signal_score = news_hits + event_hits + hard_fact_hits
-    recommended_claim_count = 5 if content_len >= 9000 and signal_score >= 5 else 3
-    reason = "当前视频包含较明显的新闻/事件型声明，将只核查最关键的少量条目。"
-    if signal_score == 0:
-        reason = "当前视频未命中强新闻关键词，但已按真实视频默认补跑基础核查。"
+    signal_score = news_hits + event_hits + hard_fact_hits + public_entity_hits + statement_hits
+    if content_len >= 12000 and signal_score >= 9:
+        recommended_claim_count = 12
+    elif (
+        (content_len >= 8000 and signal_score >= 7)
+        or (content_len >= 5000 and signal_score >= 8)
+        or (content_len >= 3200 and clear_public_claim_signal and signal_score >= 7)
+    ):
+        recommended_claim_count = 8
+    elif content_len >= 2500 and signal_score >= 3:
+        recommended_claim_count = 5
+    else:
+        recommended_claim_count = 3
+
+    reason = f"当前视频命中明显新闻/事件信号（得分 {signal_score}），将核查主要内容中的约 {recommended_claim_count} 条可核查声明。"
     return {
         "should_fact_check": True,
         "reason": reason,
@@ -4552,20 +7842,17 @@ def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:
 
 
 def search_claim_sources(claim_items: list[dict], proxy_url: str = None) -> list[dict]:
-    results = []
-    for item in claim_items:
-        claim = str(item.get("claim") or "").strip()
-        queries = item.get("queries") or []
-        if not queries:
-            queries = [claim]
-        prepared_queries = _prepare_fact_check_queries(claim, queries[:3])
-        search_markdown = perform_web_search(prepared_queries, proxy=proxy_url)
-        results.append({
-            "claim": claim,
-            "queries": prepared_queries,
-            "search_markdown": search_markdown,
-        })
-    return results
+    items = [item for item in (claim_items or []) if str(item.get("claim") or "").strip()]
+    if not items:
+        return []
+    if len(items) == 1:
+        return [_search_single_claim_source(items[0], proxy_url=proxy_url)]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    max_workers = min(5, len(items))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(_search_single_claim_source, items, [proxy_url] * len(items)))
 
 
 def fact_check_document_claims(
@@ -4577,6 +7864,7 @@ def fact_check_document_claims(
     proxy_url: str = None,
     max_claims: int = 8,
     progress_callback=None,
+    ui_locale: str | None = None,
 ) -> str:
     if max_claims <= 0:
         return ""
@@ -4585,7 +7873,7 @@ def fact_check_document_claims(
     claims: list[dict] = []
     claim_sources: list[dict] = []
     if callable(progress_callback):
-        progress_callback(5, "正在抽取关键声明...")
+        progress_callback(5, _fact_check_text(ui_locale, "progress_extract_claims"))
     try:
         claims = extract_key_claims(
             text=text,
@@ -4608,10 +7896,10 @@ def fact_check_document_claims(
             claims = []
 
     if not claims:
-        return _build_fact_check_fallback_markdown()
+        return _build_fact_check_fallback_markdown(ui_locale=ui_locale)
 
     if callable(progress_callback):
-        progress_callback(35, "正在检索外部来源...")
+        progress_callback(35, _fact_check_text(ui_locale, "progress_search_sources"))
     try:
         claim_sources = search_claim_sources(claims, proxy_url=proxy_url)
     except Exception as exc:
@@ -4627,65 +7915,211 @@ def fact_check_document_claims(
         ]
 
     compiled_sections = []
+    candidate_claim_label = _fact_check_text(ui_locale, "candidate_claim")
+    claim_label = _fact_check_text(ui_locale, "claim_label")
+    search_terms_label = _fact_check_text(ui_locale, "search_terms_label")
+    search_results_label = _fact_check_text(ui_locale, "search_results_label")
     for idx, item in enumerate(claim_sources, start=1):
-        search_excerpt = str(item.get("search_markdown") or "").strip()[:1200]
+        search_excerpt = str(item.get("search_markdown") or "").strip()[:2200]
         compiled_sections.append(
-            f"### 候选声明{idx}\n"
-            f"- 声明：{item['claim']}\n"
-            f"- 搜索词：{' | '.join(item.get('queries') or [])}\n"
-            f"- 搜索结果：\n{search_excerpt}"
+            f"### {candidate_claim_label}{idx}\n"
+            f"- {claim_label}: {item['claim']}\n"
+            f"- {search_terms_label}: {' | '.join(item.get('queries') or [])}\n"
+            f"- {search_results_label}:\n{search_excerpt}"
         )
 
     if callable(progress_callback):
-        progress_callback(70, "正在生成逐条核查结果...")
+        progress_callback(70, _fact_check_text(ui_locale, "progress_generate_fact_check"))
 
     try:
         client = _build_openai_client(api_key, base_url, proxy_url)
         compiled_claim_text = "\n\n".join(compiled_sections)
+        # 适当调大 max_tokens 以支持更多条目 (3-12条)
+        if max_claims <= 1:
+            final_max_tokens = 1000
+        elif max_claims <= 3:
+            final_max_tokens = 1600
+        elif max_claims <= 6:
+            final_max_tokens = 2200
+        else:
+            final_max_tokens = 3200
         prompt = (
-            "请根据下面的关键声明与搜索结果，输出逐条事实核查 Markdown。\n"
-            "要求：\n"
-            "- 每条都使用下面结构：\n"
-            "### 条目1\n"
-            "- 关键声明：...\n"
-            "- 核查结论：属实 / 基本属实 / 存疑 / 缺乏证据 / 错误\n"
-            "- 判断依据：\n"
-            "  - 支持/对应的公开信息：...\n"
-            "  - 冲突点或证据不足之处：...\n"
-            "  - 当前判断原因：...\n"
-            "- 待补充核查点：...\n"
-            "- 来源/出处：给出 2-4 个外部来源链接，格式如 [新华社](https://...)\n"
-            "- 如果原文包含多条不同声明，请分别成条输出，不要把多个数字或多个事件揉成一条。\n"
-            "- 如果一条声明涉及数字、时间、机构、排名，请尽量分别说明这些要素是否匹配。\n"
-            "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
-            "- 禁止把文档本身当来源。\n"
-            "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
-            "- 避免使用“手动搜索未发现”“未搜索到”这类空泛表述，改为说明“现有公开候选来源不足以直接支撑该说法”，并保留候选链接。\n"
-            "- 只返回 Markdown，不要 JSON。\n\n"
-            f"文档总结：\n{summary_excerpt}\n\n"
-            f"候选声明与搜索结果：\n{compiled_claim_text}"
+            (
+                "Based on the key claims and search results below, generate itemized source-discovery results in Markdown.\n"
+                "Requirements:\n"
+                f"- Return exactly {len(claim_sources)} items, one item for each candidate claim below, and keep the same order.\n"
+                "- Use this structure for every item:\n"
+                "### Item 1\n"
+                "- Claim: ...\n"
+                "- Source Status: Direct Source Located / Related Coverage Located / No Direct Source Yet\n"
+                "- Source Notes:\n"
+                "  - Located source pages: ...\n"
+                "  - Why these pages are likely relevant to the claim: ...\n"
+                "  - What still needs manual follow-up, if any: ...\n"
+                "- Suggested Follow-ups: ...\n"
+                "- Source Links: provide 2-4 external links in Markdown, such as [Reuters](https://...)\n"
+                "- If the original text contains multiple distinct claims, split them into separate items instead of merging several numbers or events into one.\n"
+                "- If a claim involves figures, dates, institutions, or rankings, explain as specifically as possible whether each element matches.\n"
+                "- The task here is source discovery, not truth judgment. Focus on locating the most likely origin or report page for the claim.\n"
+                "- Prefer article pages from major media, official statements, press releases, and outlet pages over generic topic pages, search pages, or videos.\n"
+                "- Candidate web pages and site-specific official pages count as evidence candidates too; do not ignore them just because they are not from news RSS.\n"
+                "- Your first job is to identify which matching web pages were found for each claim; even if the truth still needs follow-up, explain the matched reports, web pages, or official pages before discussing remaining gaps.\n"
+                "- Start the rationale by summarizing the matched page types and source names instead of reusing a generic template across multiple items.\n"
+                "- Do not reuse one-size-fits-all language such as exchange filings or original statistical methodology unless the collected candidate pages are actually about finance, exchanges, or statistics.\n"
+                "- If the search context only says that no directly citable report was captured this round, phrase it as an automated retrieval miss rather than exaggerating it into `no mainstream or official coverage exists`.\n"
+                "- When citing institutions, government departments, media outlets, or official sites in the rationale, prefer linking to the official or outlet page rather than naming it without a link.\n"
+                "- Never treat the document itself as a source.\n"
+                "- Even if search results are limited, list the candidate sources you do have instead of leaving the section empty.\n"
+                "- Avoid truth-verdict language. If you found a likely source page, say so directly instead of judging whether the claim is true.\n"
+                "- Return Markdown only, not JSON.\n\n"
+                f"Document summary:\n{summary_excerpt}\n\n"
+                f"Candidate claims and search results:\n{compiled_claim_text}"
+            )
+            if _is_english_output_locale(ui_locale)
+            else (
+                "请根据下面的关键声明与搜索结果，输出逐条来源导航 Markdown。\n"
+                "要求：\n"
+                f"- 必须严格返回 {len(claim_sources)} 条，下面每个候选声明都要对应 1 条，且顺序保持一致。\n"
+                "- 每条都使用下面结构：\n"
+                "### 条目1\n"
+                "- 关键声明：...\n"
+                "- 来源定位：已找到直接来源 / 已找到相关来源 / 暂未定位到直接来源\n"
+                "- 来源线索说明：\n"
+                "  - 已命中的来源网页：...\n"
+                "  - 这些网页为什么像是这条新闻的出处或报道页：...\n"
+                "  - 如果还有待人工确认的点，再补充说明：...\n"
+                "- 建议继续查看：...\n"
+                "- 来源出处：给出 2-4 个外部来源链接，格式如 [新华社](https://...)\n"
+                "- 如果原文包含多条不同声明，请分别成条输出，不要把多个数字或多个事件揉成一条。\n"
+                "- 如果一条声明涉及数字、时间、机构、排名，请尽量分别说明这些要素是否匹配。\n"
+                "- 这一步的目标是定位来源网页，不是判断真伪。请优先回答“这条说法最像来自哪些网页”。\n"
+                "- 优先选择大媒体报道页、官网声明页、新闻稿页、采访原文页，不要优先给专题页、搜索页、视频页或泛列表页。\n"
+                "- 命中的候选网页、官网页面、定向站点页面同样属于证据候选，不要因为它们不是新闻 RSS 就忽略。\n"
+                "- 你的首要任务是为每条声明指出当前已找到的对应网页来源；即使暂时无法判断真伪，也要先说明命中了哪些报道、普通网页或官网/机构页面。\n"
+                "- `判断依据` 的第一句优先概括“已找到哪些网页类型与来源名”，不要把多条都写成同一套模板化理由。\n"
+                "- 除非候选结果本身就是金融市场、交易所或统计口径主题，否则不要机械写“交易所公告 / 原始统计口径 / 一手权威来源”这类不贴题措辞。\n"
+                "- 如果搜索上下文只写了“当前未抓到可直接引用的候选报道”，只能表述为“本轮自动检索暂未命中可直接引用来源”，不要夸大成“没有任何主流媒体或官方机构报道”。\n"
+                "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
+                "- 禁止把文档本身当来源。\n"
+                "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
+                "- 避免使用真假裁决式表述；只要找到了像出处的网页，就直接说明已找到哪些来源链接。\n"
+                "- 只返回 Markdown，不要 JSON。\n\n"
+                f"文档总结：\n{summary_excerpt}\n\n"
+                f"候选声明与搜索结果：\n{compiled_claim_text}"
+            )
         )
         response = client.chat.completions.create(
             model=model.strip() or "gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "你是一个严谨的事实核查助手。请基于外部来源逐条核查关键声明。"},
+                {"role": "system", "content": _fact_check_text(ui_locale, "system_prompt")},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=2200,
+            max_tokens=final_max_tokens,
             temperature=0.15,
         )
         content = _extract_completion_content(response).strip()
     except Exception as exc:
         print(f"Generate fact check markdown failed: {exc}", flush=True)
-        return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources, ui_locale=ui_locale)
+
+    has_any_candidate_pages = any(
+        _extract_fact_check_source_links(str(item.get("search_markdown") or ""))
+        for item in claim_sources
+    )
+    if (
+        content
+        and (
+            (
+                "Conclusion: Insufficient Evidence" in content
+                and content.count("Conclusion: Insufficient Evidence") == max(1, content.count("### Item"))
+            )
+            or (
+                "Source Status: No Direct Source Yet" in content
+                and content.count("Source Status: No Direct Source Yet") == max(1, content.count("### Item"))
+            )
+            or (
+                "核查结论：缺乏证据" in content
+                and content.count("核查结论：缺乏证据") == max(1, content.count("### 条目"))
+            )
+            or (
+                "来源定位：暂未定位到直接来源" in content
+                and content.count("来源定位：暂未定位到直接来源") == max(1, content.count("### 条目"))
+            )
+            or (
+                "Conclusion: Uncertain" in content
+                and content.count("Conclusion: Uncertain") == max(1, content.count("### Item"))
+                and any(token in content.lower() for token in [
+                    "exchange filing",
+                    "original statistical methodology",
+                    "primary authoritative source",
+                ])
+            )
+            or (
+                "核查结论：存疑" in content
+                and content.count("核查结论：存疑") == max(1, content.count("### 条目"))
+                and any(token in content for token in [
+                    "交易所公告",
+                    "原始统计口径",
+                    "一手权威来源",
+                    "更适合判为“存疑”",
+                ])
+            )
+            or (
+                "Conclusion: Source Not Found Yet" in content
+                and content.count("Conclusion: Source Not Found Yet") == max(1, content.count("### Item"))
+            )
+            or (
+                "核查结论：暂未找到来源" in content
+                and content.count("核查结论：暂未找到来源") == max(1, content.count("### 条目"))
+            )
+        )
+        and has_any_candidate_pages
+    ):
+        try:
+            retry_prompt = (
+                (
+                    "The previous draft was still too generic. Your first task is to identify which matching web pages were found for each claim before making any source-status summary.\n"
+                    "For each item, first summarize the matched reports, general web pages, or official pages already found, and only then explain what still needs verification.\n"
+                    "Do not reuse one-size-fits-all rationale such as exchange filings or original statistical methodology unless the collected pages are truly about that topic.\n"
+                    "If candidate source pages are already present, do not label every item as `No Direct Source Yet`.\n"
+                    "Keep the same Markdown structure and do not omit source links.\n\n"
+                    f"Document summary:\n{summary_excerpt}\n\n"
+                    f"Candidate claims and search results:\n{compiled_claim_text}"
+                )
+                if _is_english_output_locale(ui_locale)
+                else (
+                    "你上一版仍然过于模板化。你的首要任务不是先给终局判断，而是先为每条声明指出当前已找到的对应网页来源。\n"
+                    "请逐条先概括已命中的报道、普通网页或官网/机构页面，再说明还待核对的细节；不要把多条都套成同一套“交易所公告 / 原始统计口径 / 一手权威来源”理由，除非搜索结果本身就是这个主题。\n"
+                    "如果候选来源里已经有网页链接，不要把所有条目都写成“暂未定位到直接来源”。\n"
+                    "请继续按原结构输出 Markdown，不要省略来源链接。\n\n"
+                    f"文档总结：\n{summary_excerpt}\n\n"
+                    f"候选声明与搜索结果：\n{compiled_claim_text}"
+                )
+            )
+            retry_response = client.chat.completions.create(
+                model=model.strip() or "gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": _fact_check_text(ui_locale, "retry_system_prompt")},
+                    {"role": "user", "content": retry_prompt},
+                ],
+                max_tokens=final_max_tokens,
+                temperature=0.1,
+            )
+            retry_content = _extract_completion_content(retry_response).strip()
+            if retry_content:
+                content = retry_content
+        except Exception as retry_exc:
+            print(f"Retry fact check markdown failed: {retry_exc}", flush=True)
 
     if callable(progress_callback):
-        progress_callback(100, "关键声明事实核查完成。")
+        progress_callback(100, _fact_check_text(ui_locale, "progress_fact_check_done"))
     if not content:
-        return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources, ui_locale=ui_locale)
     final_markdown = _enrich_fact_check_items_with_claim_sources(content, claim_sources)
+    final_markdown = _normalize_fact_check_conclusions_with_sources(final_markdown, claim_sources)
+    final_markdown = _ensure_fact_check_item_coverage(final_markdown, claim_sources, ui_locale=ui_locale)
     if _is_placeholder_fact_check(final_markdown):
-        return _build_fact_check_fallback_markdown(claim_sources=claim_sources)
+        return _build_fact_check_fallback_markdown(claim_sources=claim_sources, ui_locale=ui_locale)
     return final_markdown
 
 
@@ -4713,14 +8147,51 @@ def _should_skip_fact_check_for_video_text(text: str) -> tuple[bool, str]:
 
     paired_markers = [
         (("模拟", "测试"), "simulated_test_pair"),
-        (("内部", "测试"), "internal_test_pair"),
         (("回归", "验证"), "regression_validation_pair"),
         (("技术", "链路"), "technical_pipeline_pair"),
-        (("产品", "验证"), "product_validation_pair"),
     ]
     for keywords, reason in paired_markers:
         if all(keyword in content for keyword in keywords):
             return True, reason
+
+    if "产品" in content and "验证" in content:
+        product_validation_context_markers = [
+            "主路径",
+            "流程",
+            "链路",
+            "调试",
+            "插件",
+            "扩展",
+            "bridge",
+            "payload",
+            "transcript",
+            "api key",
+            "render",
+            "主站",
+            "自动总结",
+        ]
+        context_hits = sum(1 for marker in product_validation_context_markers if marker in lowered or marker in content)
+        if context_hits >= 2:
+            return True, "product_validation_pair"
+
+    # “内部”“测试”在新闻、采访、爆料类视频里也很常见，不能单独作为跳过核查的依据。
+    internal_test_context_markers = [
+        "bridge",
+        "payload",
+        "transcript",
+        "api key",
+        "插件",
+        "扩展",
+        "链路",
+        "调试",
+        "回归",
+        "render",
+        "主站",
+    ]
+    if "内部" in content and "测试" in content:
+        context_hits = sum(1 for marker in internal_test_context_markers if marker in lowered or marker in content)
+        if context_hits >= 2:
+            return True, "internal_test_pair"
 
     if re.search(r"(这是一次|这是一段|本次|用于).{0,24}(模拟|测试|验证|调试|演示)", content):
         return True, "intro_test_pattern"
@@ -4754,6 +8225,7 @@ def summarize_text(
     stream: bool = False,
     fact_check_model: str | None = None,
     enable_fact_check: bool = True,
+    ui_locale: str | None = None,
 ):
     if not text or not text.strip():
         return "没有可总结的内容（文本为空）。"
@@ -4786,32 +8258,7 @@ def summarize_text(
         else:
             print("SummarizeText: fact check disabled by caller", flush=True)
 
-        prompt = (
-            f"你是一个专业的视频内容总结助手。当前真实日期是：{current_date}。\n"
-            "请总结以下视频字幕。\n"
-            "【输出格式要求】\n"
-            "请严格输出为 JSON 格式，且只能包含以下两个字段：`summary_markdown`、`fact_check_markdown`。\n"
-            "1. `summary_markdown` 的要求：\n"
-            "   - 必须是 Markdown。\n"
-            "   - 必须按“逐条列点”的形式输出，不要写成长篇大段落。\n"
-            "   - 固定结构如下：\n"
-            "     ## 核心主题\n"
-            "     - 1 句话概括视频主旨。\n"
-            "     ## 主要内容\n"
-            "     - 逐条列出 6-12 条要点。\n"
-            "     - 每条只讲一个事实、观点或判断，语言清晰直接。\n"
-            "     - 若某条是推测、判断、观点，请明确标注“视频观点”或“推测”。\n"
-            "     ## 关键信息\n"
-            "     - 列出数字、时间、人物、机构、政策名称等关键信息。\n"
-            "     ## 结论（可选）\n"
-            "     - 只有当视频确实提出了明确结论时才输出本节。\n"
-            "     - 如果视频没有清晰结论，就不要硬写结论。\n"
-            "2. `fact_check_markdown` 的要求：\n"
-            "   - 必须返回空字符串 `\"\"`。\n"
-            "   - 不要生成任何事实核查条目。\n\n"
-            "**字幕内容输入：**\n"
-            f"{content}"
-        )
+        prompt = _build_video_summary_prompt(content, current_date, ui_locale=ui_locale)
         max_tokens = 2600 if content_len < 12000 else 3000
         print(
             "SummarizeText: "
@@ -4831,7 +8278,7 @@ def summarize_text(
                 response = client.chat.completions.create(
                     model=candidate_model,
                     messages=[
-                        {"role": "system", "content": "你是一个专业的视频内容总结助手。请始终返回合法 JSON。总结必须分条清晰。"},
+                        {"role": "system", "content": _build_video_summary_system_prompt(ui_locale)},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.2,
@@ -4862,21 +8309,21 @@ def summarize_text(
         if not content_str:
             return f"总结失败：无法解析响应内容。\n原始响应: {str(response)[:500]}"
 
-        normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str))
+        normalized_payload = _normalize_summary_payload(_parse_summary_payload(content_str), ui_locale=ui_locale)
         if not normalized_payload:
             try:
-                repair_prompt = (
-                    "请将下面内容修复为合法 JSON，并且只能包含两个字段："
-                    "`summary_markdown` 和 `fact_check_markdown`。\n"
-                    "- `summary_markdown` 必须保留现有总结信息，并整理为清晰 Markdown。\n"
-                    "- `fact_check_markdown` 必须返回空字符串，不要补任何事实核查内容。\n"
-                    "- 只返回 JSON，不要解释。\n\n"
-                    f"原始内容：\n{content_str}"
-                )
+                repair_prompt = _build_video_summary_repair_prompt(content_str, ui_locale=ui_locale)
                 repair_resp = client.chat.completions.create(
                     model=active_summary_model,
                     messages=[
-                        {"role": "system", "content": "你是一个 JSON 修复助手，只返回合法 JSON。"},
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a JSON repair assistant. Return valid JSON only."
+                                if _is_english_output_locale(ui_locale)
+                                else "你是一个 JSON 修复助手，只返回合法 JSON。"
+                            ),
+                        },
                         {"role": "user", "content": repair_prompt},
                     ],
                     response_format={"type": "json_object"},
@@ -4884,7 +8331,7 @@ def summarize_text(
                     temperature=0.1,
                 )
                 repair_content = _extract_completion_content(repair_resp)
-                normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content))
+                normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content), ui_locale=ui_locale)
             except Exception as repair_exc:
                 print(f"Repair summary JSON failed: {repair_exc}", flush=True)
 
@@ -4907,10 +8354,11 @@ def summarize_text(
                     model=fact_model,
                     proxy_url=proxy_url,
                     max_claims=max_claims,
+                    ui_locale=ui_locale,
                 )
             except Exception as fact_exc:
                 print(f"Video fact check pipeline failed: {fact_exc}", flush=True)
-                fact_check_markdown = _build_fact_check_fallback_markdown()
+                fact_check_markdown = _build_fact_check_fallback_markdown(ui_locale=ui_locale)
 
         normalized_payload["summary_markdown"] = summary_markdown
         normalized_payload["fact_check_markdown"] = fact_check_markdown if fact_check_enabled else ""
@@ -4932,122 +8380,16 @@ def get_video_transcript(
     languages: list[str] | None = None,
 ) -> str:
     asr_force_cpu = bool(getattr(api, "_asr_force_cpu", False))
-    # 1. 检查是否为 Bilibili 视频
-    # 如果是 Bilibili，直接使用 yt-dlp 或 whisper，跳过 YouTubeTranscriptApi
-    if "bilibili.com" in video_url or re.match(r"^BV[a-zA-Z0-9]{10}$", video_id):
-        video_url = normalize_video_url(video_url or video_id)
-        proxy_url = str(getattr(api, "_effective_proxy", "") or "")
-        timeout_seconds = float(getattr(api, "_timeout_seconds", 60.0) or 60.0)
-        retries = int(getattr(api, "_retries", 2) or 2)
-        status_cb = getattr(api, "_status_callback", None)
-        local_fetch_node_mode = bool(str(os.environ.get("LOCAL_FETCH_NODE_MODE", "") or "").strip())
-        remote_worker_mode = str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip().lower()
-        remote_worker_enabled = str(
-            os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "0") or "0"
-        ).strip().lower() in {"1", "true", "yes"}
-        prefer_remote_first = remote_worker_enabled and remote_worker_mode in {"prefer_remote", "remote_first", "force_remote"}
-        remote_worker_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
-        remote_worker_summary = "disabled"
-        running_on_render = bool(str(os.environ.get("RENDER_SERVICE_ID", "") or "").strip())
-        disable_render_asr_fallback = running_on_render and str(
-            os.environ.get("REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK", "0") or "0"
-        ).strip().lower() not in {"0", "false", "no"}
-        cookies_from_browser = str(getattr(api, "_cookies_from_browser", "") or "")
-        cookie_resolve_error = ""
-        try:
-            cookies_file = resolve_cookie_file(
-                cookies_file=str(getattr(api, "_cookies_file", "") or ""),
-                cookies_content=str(getattr(api, "_cookies_content", "") or ""),
-                cookies_content_b64=str(getattr(api, "_cookies_content_b64", "") or ""),
-            )
-        except Exception as e:
-            cookie_resolve_error = f"{type(e).__name__}:{e}"
-            cookies_file = ""
-        cookie_debug_summary = build_cookie_runtime_diagnostics(
-            api,
-            cookies_file=str(getattr(api, "_cookies_file", "") or ""),
-            cookies_from_browser=cookies_from_browser,
-            resolved_cookie_file=cookies_file,
-            resolve_error=cookie_resolve_error,
-        )
+    
+    # 1. YouTube 逻辑
+    langs = expand_languages(languages or ["en"])
+    disable_audio_transcribe_override = getattr(api, "_disable_audio_transcribe_override", None)
+    if disable_audio_transcribe_override is None:
         disable_audio_transcribe = str(
             os.environ.get("DISABLE_AUDIO_TRANSCRIBE", "1") or "1"
         ).strip().lower() not in {"0", "false", "no"}
-        asr_enabled = bool(getattr(api, "_asr_enabled", False)) and not disable_audio_transcribe
-        asr_model = str(getattr(api, "_asr_model", "") or "")
-        asr_language = str(getattr(api, "_asr_language", "") or "")
-        asr_fast_mode = bool(getattr(api, "_asr_fast_mode", False))
-        langs = expand_languages(languages or ["zh-Hans", "zh", "en"]) # B站默认中文优先
-
-        if prefer_remote_first and remote_worker_url and not local_fetch_node_mode:
-            try:
-                if callable(status_cb):
-                    status_cb("优先调用本地抓取节点处理 Bilibili 视频")
-                remote_text = try_fetch_transcript_via_remote_worker(
-                    video_id=video_id,
-                    video_url=video_url,
-                    languages=langs,
-                    api=api,
-                )
-                if remote_text and not is_html_like_text(remote_text):
-                    return remote_text
-            except Exception as remote_exc:
-                remote_worker_summary = f"{type(remote_exc).__name__}: {remote_exc}"
-                if callable(status_cb):
-                    status_cb(f"本地抓取节点处理 Bilibili 失败，回退 Render：{type(remote_exc).__name__}")
-
-        # 尝试 yt-dlp 获取字幕 (B站可能有 CC 字幕)
-        try:
-            label, text = fetch_subtitles_with_ytdlp(
-                video_url,
-                preferred_langs=langs,
-                proxy_url=proxy_url,
-                timeout_seconds=timeout_seconds,
-                retries=retries,
-                cookies_file=cookies_file,
-                cookies_from_browser=cookies_from_browser,
-            )
-            if text and text.strip() and not is_html_like_text(text):
-                header = f"[bilibili-cc | {label}]"
-                return header + "\n\n" + text
-        except Exception:
-            pass
-        
-        # 尝试 Whisper 转写 (B站最常用)
-        if asr_enabled:
-            if prefer_remote_first and remote_worker_url and not local_fetch_node_mode and disable_render_asr_fallback:
-                raise RuntimeError(
-                    "Bilibili 视频未拿到字幕，且 Render 已启用低内存保护：已禁止在 Render 本机执行音频下载与 Whisper 转写。"
-                    " 请确认本地抓取节点在线，并让任务优先在本地节点完成；如确实需要允许 Render 兜底，可将 "
-                    "`REMOTE_TRANSCRIBE_DISABLE_RENDER_ASR_FALLBACK=0`。"
-                    f"\n远程抓取诊断: {remote_worker_summary}"
-                )
-            try:
-                status_cb = getattr(api, "_status_callback", None)
-                label, text = transcribe_video_audio_with_ytdlp(
-                    video_url=video_url,
-                    proxy_url=proxy_url,
-                    timeout_seconds=timeout_seconds,
-                    retries=retries,
-                    cookies_file=cookies_file,
-                    cookies_from_browser=cookies_from_browser,
-                    model_name=asr_model,
-                    language=asr_language,
-                    status_callback=status_cb,
-                    fast_mode=asr_fast_mode,
-                    cookie_debug_summary=cookie_debug_summary,
-                )
-                return f"[bilibili-whisper | {label}]\n\n{text}"
-            except Exception as e:
-                raise RuntimeError(f"Bilibili 视频转写失败: {e}\nCookies 运行时诊断: {cookie_debug_summary}")
-        
-        raise RuntimeError("Bilibili 视频未找到可用字幕，且当前已禁用音频转写兜底。")
-
-    # 2. YouTube 逻辑保持不变
-    langs = expand_languages(languages or ["en"])
-    disable_audio_transcribe = str(
-        os.environ.get("DISABLE_AUDIO_TRANSCRIBE", "1") or "1"
-    ).strip().lower() not in {"0", "false", "no"}
+    else:
+        disable_audio_transcribe = bool(disable_audio_transcribe_override)
     asr_enabled = bool(getattr(api, "_asr_enabled", False)) and not disable_audio_transcribe
     asr_model = str(getattr(api, "_asr_model", "") or "")
     asr_language = str(getattr(api, "_asr_language", "") or "")
@@ -5281,15 +8623,11 @@ def search_channels(
     timeout_seconds: float = 10.0
 ) -> dict:
     """
-    搜索 YouTube 和 Bilibili 频道
+    搜索 YouTube 频道
     返回:
     {
         "youtube": [
             {"id": "...", "name": "...", "url": "...", "avatar": "...", "desc": "...", "platform": "youtube"},
-            ...
-        ],
-        "bilibili": [
-            {"id": "...", "name": "...", "url": "...", "avatar": "...", "desc": "...", "platform": "bilibili"},
             ...
         ]
     }
@@ -5297,55 +8635,8 @@ def search_channels(
     import requests
     from concurrent.futures import ThreadPoolExecutor
     
-    results = {"youtube": [], "bilibili": []}
+    results = {"youtube": []}
     
-    def _search_bilibili():
-        try:
-            # Bilibili User Search API
-            api_url = "https://api.bilibili.com/x/web-interface/search/type"
-            params = {
-                "search_type": "bili_user",
-                "keyword": keyword,
-            }
-            # Encode keyword for referer
-            import urllib.parse
-            encoded_kw = urllib.parse.quote(keyword)
-            
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": f"https://search.bilibili.com/upuser?keyword={encoded_kw}",
-                "Cookie": "buvid3=infoc;" # 简单的伪造 cookie 可能有助于绕过 412
-            }
-            
-            # 使用 Session
-            s = requests.Session()
-            resp = s.get(api_url, params=params, headers=headers, timeout=timeout_seconds)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            if data.get("code") == 0:
-                items = data.get("data", {}).get("result")
-                if not items: return
-                
-                for item in items[:limit]:
-                    # Bilibili user item: mid, uname, upic, usign
-                    mid = str(item.get("mid"))
-                    avatar = item.get("upic", "")
-                    if avatar.startswith("//"):
-                        avatar = "https:" + avatar
-                        
-                    results["bilibili"].append({
-                        "id": mid,
-                        "name": item.get("uname"),
-                        "url": f"https://space.bilibili.com/{mid}",
-                        "avatar": avatar,
-                        "desc": item.get("usign", "")[:50] + "..." if item.get("usign") else "",
-                        "platform": "bilibili"
-                    })
-        except Exception as e:
-            print(f"Bilibili search failed: {e}")
-            pass
-
     def _search_youtube():
         try:
             # YouTube Search via yt-dlp
@@ -5411,10 +8702,7 @@ def search_channels(
             pass
 
     # 并发执行
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        executor.submit(_search_bilibili)
-        executor.submit(_search_youtube)
-        
+    _search_youtube()
     return results
 
 
@@ -5425,19 +8713,15 @@ def get_channel_info(
     retries: int = 2,
     cookies_file: str = "",
     cookies_from_browser: str = "",
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, str]:
     """
     获取频道信息
-    返回: (channel_id, channel_name, canonical_url, avatar_url)
+    返回: (channel_id, channel_name, canonical_url, avatar_url, platform)
     """
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError:
-        raise RuntimeError("未安装 yt-dlp")
+    from yt_dlp import YoutubeDL
+    import re
 
     last_err: Exception | None = None
-    
-    # 尝试标准化 URL
     original_input = channel_url.strip()
     url_candidates = []
 
@@ -5445,88 +8729,12 @@ def get_channel_info(
         url_candidates.append(original_input)
     elif original_input.startswith("@"):
         url_candidates.append(f"https://www.youtube.com/{original_input}")
-    elif re.match(r"^BV[a-zA-Z0-9]{10}$", original_input):
-        # Bilibili BV ID
-        pass
-    elif re.match(r"^\d+$", original_input):
-        # 纯数字可能是 Bilibili UID
-        url_candidates.append(f"https://space.bilibili.com/{original_input}")
     else:
         # 1. 假设是 channel ID
         if re.fullmatch(r"UC[a-zA-Z0-9_-]{22}", original_input):
             url_candidates.append(f"https://www.youtube.com/channel/{original_input}")
         # 2. 尝试 ytsearch
         url_candidates.append(f"ytsearch1:{original_input}")
-
-    # Bilibili API fallback
-    # 如果 URL 是 B站空间链接，直接解析 mid 并调用 API
-    # 避免 yt-dlp 412 错误
-    bili_mid = None
-    if "bilibili.com" in original_input:
-        import re
-        # 匹配 space.bilibili.com/123456
-        m = re.search(r"space\.bilibili\.com/(\d+)", original_input)
-        if m:
-            bili_mid = m.group(1)
-        
-    if bili_mid:
-        try:
-            import requests
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": f"https://space.bilibili.com/{bili_mid}",
-            }
-            api_url = f"https://api.bilibili.com/x/space/acc/info?mid={bili_mid}"
-            resp = requests.get(api_url, headers=headers, timeout=timeout_seconds)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 0:
-                    info_data = data.get("data", {})
-                    c_id = str(info_data.get("mid"))
-                    c_name = info_data.get("name")
-                    c_avatar = info_data.get("face", "")
-                    if c_avatar.startswith("//"):
-                        c_avatar = "https:" + c_avatar
-                    # 强制 B站图片使用 https
-                    if "hdslb.com" in c_avatar and c_avatar.startswith("http://"):
-                        c_avatar = c_avatar.replace("http://", "https://")
-                        
-                    c_url = f"https://space.bilibili.com/{c_id}"
-                    
-                    return str(c_id), str(c_name), str(c_url), str(c_avatar), "bilibili"
-        except Exception:
-            pass # Fallback to yt-dlp if API fails
-    
-    # 强制 B站 API 请求带上 Cookie
-    # 如果上面简单的 requests 失败了 (可能因为没有 cookie)，
-    # 这里我们不需要做什么，因为下面会进入 yt-dlp 流程。
-    # 但 yt-dlp 也会失败 (412)。
-    # 所以我们需要确保上面的 API 请求能成功。
-    if bili_mid:
-         try:
-             import requests
-             # 使用 Session 并伪造更完整的 Header
-             s = requests.Session()
-             headers = {
-                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                 "Referer": f"https://space.bilibili.com/{bili_mid}",
-                 "Cookie": "buvid3=infoc;" # 尝试添加 cookie
-             }
-             api_url = f"https://api.bilibili.com/x/space/acc/info?mid={bili_mid}"
-             resp = s.get(api_url, headers=headers, timeout=timeout_seconds)
-             if resp.status_code == 200:
-                 data = resp.json()
-                 if data.get("code") == 0:
-                     info_data = data.get("data", {})
-                     c_id = str(info_data.get("mid"))
-                     c_name = info_data.get("name")
-                     c_avatar = info_data.get("face", "")
-                     if c_avatar.startswith("//"):
-                         c_avatar = "https:" + c_avatar
-                     c_url = f"https://space.bilibili.com/{c_id}"
-                     return str(c_id), str(c_name), str(c_url), str(c_avatar), "bilibili"
-         except Exception:
-             pass
 
     for attempt in range(max(1, int(retries))):
         for candidate_url in url_candidates:
@@ -5535,10 +8743,10 @@ def get_channel_info(
                     "quiet": True,
                     "no_warnings": True,
                     "extract_flat": True,
-                    "playlistend": 1, # 我们只需要频道元数据
+                    "playlistend": 1, 
                     "socket_timeout": float(timeout_seconds),
                     "nocheckcertificate": True,
-                    "ignoreerrors": True, # 忽略错误，以便尝试下一个候选
+                    "ignoreerrors": True, 
                 }
                 if proxy_url:
                     opts["proxy"] = proxy_url
@@ -5553,93 +8761,46 @@ def get_channel_info(
                         if not info:
                             continue
                         
-                        # 如果是搜索结果，info['entries'] 会包含视频列表
                         if "entries" in info:
                             entries = info.get("entries", [])
                             if not entries:
                                 continue
-                            # 取第一个视频的信息
                             info = entries[0]
                         
-                        # 尝试提取信息
                         c_id = info.get("channel_id") or info.get("uploader_id")
                         c_name = info.get("channel") or info.get("uploader") or info.get("title")
                         c_url = info.get("channel_url") or info.get("uploader_url")
                         
-                        # 尝试提取头像
                         c_avatar = ""
-
-                        # 确定平台
                         platform = "youtube"
-                        if "bilibili.com" in candidate_url or "space.bilibili.com" in str(c_url):
-                            platform = "bilibili"
                         
-                        # 优先从 thumbnails 提取
                         thumbnails = info.get("thumbnails")
                         if thumbnails:
-                            # 1. 尝试找 B站特有的 face 字段 (yt-dlp 可能会映射到 thumbnail 列表)
-                            # 或者找 id 为 avatar_uncropped
                             for t in thumbnails:
                                 if t.get("id") == "avatar_uncropped":
                                     c_avatar = t.get("url")
                                     break
 
-                            # 2. 如果是 YouTube，优先找 ggpht.com 的图片 (这是频道头像)，避开 ytimg.com (这是视频封面)
-                            if not c_avatar and platform == "youtube":
+                            if not c_avatar:
                                 for t in thumbnails:
                                     u = t.get("url", "")
                                     if "ggpht.com" in u:
                                         c_avatar = u
                                         break
                             
-                            # 3. 如果是 Bilibili，尝试从 entries[0] 获取 uploader_id 
-                            # 然后构造 API 请求或从视频 info 中找头像 (yt-dlp 对 B站频道页解析的 thumbnails 往往是视频封面而非头像)
-                            if not c_avatar and ("bilibili.com" in candidate_url or "space.bilibili.com" in str(c_url)):
-                                # B站频道解析时，thumbnails 往往是视频封面，而不是头像
-                                # 尝试从 entries 中获取第一个视频的 uploader 信息，有时候会有头像
-                                if "entries" in info:
-                                    entries = info.get("entries", [])
-                                    if entries:
-                                        first_entry = entries[0]
-                                        # 尝试直接请求 API 获取头像 (需要 uploader_id)
-                                        # 但这里为了简单，我们先看 first_entry 是否有 owner_thumbnail
-                                        # yt-dlp 对 B站视频通常不返回 owner_thumbnail
-                                        pass
-                                
-                                # B站兜底：如果实在找不到，尝试用 requests 请求 B站 API
-                                # https://api.bilibili.com/x/space/acc/info?mid={mid}
-                                # 需要 mid
-                                if not c_avatar and c_id and c_id.isdigit():
-                                    try:
-                                        import requests
-                                        # 简单的 API 请求，不带 cookie 可能会失败，但值得一试
-                                        headers = {"User-Agent": "Mozilla/5.0"}
-                                        r = requests.get(f"https://api.bilibili.com/x/space/acc/info?mid={c_id}", headers=headers, timeout=5)
-                                        if r.status_code == 200:
-                                            j = r.json()
-                                            if j.get("code") == 0:
-                                                c_avatar = j.get("data", {}).get("face", "")
-                                    except:
-                                        pass
-
-                            # 4. 常规逻辑：找正方形图片
                             if not c_avatar:
                                 for t in thumbnails:
                                     w = t.get("width")
                                     h = t.get("height")
                                     if w and h and w == h:
-                                        # 再次检查：如果是 YouTube，排除 ytimg
-                                        if platform == "youtube" and "ytimg.com" in t.get("url", ""):
+                                        if "ytimg.com" in t.get("url", ""):
                                             continue
                                         c_avatar = t.get("url")
                                         break
                             
-                            # 5. 兜底：取最后一个 (通常是最大的)
                             if not c_avatar and len(thumbnails) > 0:
-                                # 如果是 YouTube，尽量不要取 ytimg
                                 candidate = thumbnails[-1].get("url")
-                                if platform == "youtube" and "ytimg.com" in candidate:
-                                    # 尝试往前找一个不是 ytimg 的
+                                if "ytimg.com" in candidate:
                                     for t in reversed(thumbnails):
                                         if "ytimg.com" not in t.get("url", ""):
                                             c_avatar = t.get("url")
@@ -5648,23 +8809,14 @@ def get_channel_info(
                                     c_avatar = candidate
 
                         if c_id and c_name:
-                            # 规范化 channel url (优先用 handle url 或 channel id url)
                             if not c_url:
-                                if "youtube.com" in candidate_url:
-                                    c_url = f"https://www.youtube.com/channel/{c_id}"
-                                elif "bilibili.com" in candidate_url:
-                                    c_url = f"https://space.bilibili.com/{c_id}"
-                                else:
-                                    c_url = candidate_url # Fallback
+                                c_url = f"https://www.youtube.com/channel/{c_id}"
                             
                             return str(c_id), str(c_name), str(c_url), str(c_avatar or ""), platform
                             
                     except Exception as e:
                         last_err = e
                         continue
-            
-            # 如果当前 candidate 成功返回了，上面就 return 了
-            # 如果失败了，继续下一个 candidate (例如先试 channel id 失败，再试搜索)
     
     if last_err:
         raise RuntimeError(strip_ansi(str(last_err)))
@@ -5734,24 +8886,19 @@ def get_channel_recent_videos(
         )
 
     base_url = channel_url.strip().rstrip("/")
-    # 构造待扫描的 tab 列表
-    # 如果是 Bilibili，直接扫描主页 (yt-dlp 会自动处理)
-    if "bilibili.com" in base_url:
-        targets = [base_url]
+    # YouTube 逻辑
+    # 初始化 targets 列表
+    targets = []
+    
+    if only_streams:
+        # 强制仅扫描直播回放页面
+        targets.append(base_url + "/streams")
+    # 如果明确指定了 tab，就只扫那个；否则扫 videos 和 streams
+    elif any(x in base_url for x in ["/videos", "/shorts", "/streams", "/live", "/featured"]):
+        targets.append(base_url)
     else:
-        # YouTube 逻辑
-        # 初始化 targets 列表
-        targets = []
-        
-        if only_streams:
-            # 强制仅扫描直播回放页面
-            targets.append(base_url + "/streams")
-        # 如果明确指定了 tab，就只扫那个；否则扫 videos 和 streams
-        elif any(x in base_url for x in ["/videos", "/shorts", "/streams", "/live", "/featured"]):
-            targets.append(base_url)
-        else:
-            targets.append(base_url + "/videos")
-            targets.append(base_url + "/streams")
+        targets.append(base_url + "/videos")
+        targets.append(base_url + "/streams")
 
     candidates_map = {}  # id -> item
 

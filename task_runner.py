@@ -3,6 +3,7 @@ import time
 import logging
 import uuid
 import os
+import inspect
 
 # 修改导入，不从 app 依赖未抽离的 internal 函数，而是直接调 core_logic
 from core_logic import get_transcript_from_input, get_video_transcript, is_html_like_text, summarize_text, build_api, get_effective_proxy
@@ -14,7 +15,16 @@ logger = logging.getLogger(__name__)
 # 格式: { "task_id": {"status": "queued|running|success|failed", "url": "...", "result": "...", "error": ""} }
 TASK_STATUS_DB = {}
 
-def _background_worker(video_url, task_id, summary_model_selected, fact_check_model_selected, proxy_input, use_system_proxy, api_key, base_url):
+
+def _call_with_optional_kwargs(func, /, *args, **kwargs):
+    try:
+        supported = set(inspect.signature(func).parameters.keys())
+    except Exception:
+        supported = set()
+    filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+    return func(*args, **filtered_kwargs)
+
+def _background_worker(video_url, task_id, summary_model_selected, fact_check_model_selected, proxy_input, use_system_proxy, api_key, base_url, ui_locale="zh"):
     """
     这是后台真正干活的函数，执行耗时任务
     """
@@ -54,13 +64,15 @@ def _background_worker(video_url, task_id, summary_model_selected, fact_check_mo
         if not api_key:
             raise Exception("未提供 API Key")
             
-        summary = summarize_text(
+        summary = _call_with_optional_kwargs(
+            summarize_text,
             text,
             api_key,
             base_url,
             summary_model_selected,
             proxy_url=eff_proxy,
             fact_check_model=fact_check_model_selected,
+            ui_locale=ui_locale,
             stream=False  # 后台任务默认不使用流式
         )
 
@@ -73,7 +85,7 @@ def _background_worker(video_url, task_id, summary_model_selected, fact_check_mo
         TASK_STATUS_DB[task_id]["status"] = "failed"
         TASK_STATUS_DB[task_id]["error"] = str(e)
 
-def submit_task(video_url, summary_model_selected, fact_check_model_selected, proxy_input, use_system_proxy, api_key, base_url):
+def submit_task(video_url, summary_model_selected, fact_check_model_selected, proxy_input, use_system_proxy, api_key, base_url, ui_locale="zh"):
     """
     网页调用这个函数，瞬间返回，后台偷偷启动线程
     """
@@ -91,7 +103,7 @@ def submit_task(video_url, summary_model_selected, fact_check_model_selected, pr
     # 把任务丢给一个独立的线程去跑
     thread = threading.Thread(
         target=_background_worker, 
-        args=(video_url, task_id, summary_model_selected, fact_check_model_selected, proxy_input, use_system_proxy, api_key, base_url)
+        args=(video_url, task_id, summary_model_selected, fact_check_model_selected, proxy_input, use_system_proxy, api_key, base_url, ui_locale)
     )
     # 设置为守护线程，网页服务关了它也跟着关
     thread.daemon = True

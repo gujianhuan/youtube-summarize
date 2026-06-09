@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,54 +8,50 @@
   </head>
   <body>
     <main class="wrap">
-      <h1>Transcript Helper</h1>
-      <p id="status" class="status">正在等待提取...</p>
+      <h1 id="popupTitle">Transcript Helper</h1>
+      <p id="status" class="status">Waiting for extraction...</p>
       <div class="actions">
-        <button id="extractBtn">提取字幕</button>
-        <button id="copyBtn" disabled>复制文本</button>
-        <button id="openBtn" disabled>一键总结</button>
+        <button id="extractBtn">Extract</button>
+        <button id="copyBtn" disabled>Copy</button>
+        <button id="openBtn" disabled>Summarize</button>
       </div>
       <section class="config-panel">
-        <h2>联调配置</h2>
+        <h2 id="configTitle">Debug Config</h2>
         <label class="field">
-          <span>主站地址</span>
-          <input id="mainUrlInput" placeholder="例如 http://127.0.0.1:8501/">
+          <span id="mainUrlLabel">Main Site URL</span>
+          <input id="mainUrlInput" placeholder="e.g. http://127.0.0.1:8501/">
         </label>
         <label class="field">
-          <span>Bridge 地址</span>
-          <input id="bridgeUrlInput" placeholder="例如 https://youtube-summarize-bridge.onrender.com">
-        </label>
-        <label class="field">
-          <span>Bridge Token（可选）</span>
-          <input id="bridgeTokenInput" placeholder="未配置可留空">
+          <span id="bridgeUrlLabel">Bridge URL</span>
+          <input id="bridgeUrlInput" placeholder="e.g. https://youtube-summarize-bridge.onrender.com">
         </label>
         <div class="helper-actions">
-          <button id="useLocalMainBtn" class="secondary-btn">切到本地主站</button>
-          <button id="saveConfigBtn" class="secondary-btn">保存配置</button>
-          <button id="resetConfigBtn" class="secondary-btn">恢复默认</button>
+          <button id="useLocalMainBtn" class="secondary-btn">Use Local</button>
+          <button id="saveConfigBtn" class="secondary-btn">Save</button>
+          <button id="resetConfigBtn" class="secondary-btn">Reset</button>
         </div>
       </section>
       <section id="helperPanel" class="helper-panel helper-panel-hidden">
-        <h2 id="helperTitle">需要本地转写助手</h2>
+        <h2 id="helperTitle">Local transcription helper recommended</h2>
         <p id="helperDesc" class="helper-desc"></p>
         <div class="helper-actions">
-          <button id="helperGuideBtn" class="secondary-btn">查看本地工具引导</button>
-          <button id="copyLinkBtn" class="secondary-btn">复制视频链接</button>
+          <button id="helperGuideBtn" class="secondary-btn">Open Guide</button>
+          <button id="copyLinkBtn" class="secondary-btn">Copy Video Link</button>
         </div>
       </section>
       <label class="field">
-        <span>标题</span>
+        <span id="titleLabel">Title</span>
         <input id="titleInput" readonly>
       </label>
       <label class="field">
-        <span>来源链接</span>
+        <span id="urlLabel">Source URL</span>
         <input id="urlInput" readonly>
       </label>
       <label class="field">
-        <span>提取结果</span>
-        <textarea id="transcriptOutput" rows="14" placeholder="这里会显示提取到的字幕文本"></textarea>
+        <span id="transcriptLabel">Transcript</span>
+        <textarea id="transcriptOutput" rows="14" placeholder="Extracted transcript text will appear here"></textarea>
       </label>
-      <p class="hint">MVP 版先做“提取 + 复制 + 手动粘贴到主站”的稳定链路。</p>
+      <p id="popupHint" class="hint">The MVP focuses on a stable flow: extract, copy, then summarize on the main site.</p>
     </main>
     <script src="popup.js"></script>
   </body>

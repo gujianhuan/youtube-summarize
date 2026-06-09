@@ -7,12 +7,15 @@ import traceback
 import json
 import os
 import re
+import inspect
 import hashlib
 import html
 import uuid
 import calendar
 import requests
 from datetime import datetime, timedelta, time as dt_time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from rate_limiter import RateLimiter
 from core_logic import (
     get_effective_proxy,
     check_network,
@@ -47,12 +50,918 @@ GUESTBOOK_FILE = os.path.join(BASE_DIR, "guestbook.json")
 FEEDBACK_FILE = os.path.join(BASE_DIR, "feedback_reports.json")
 BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
-BRIDGE_API_URL = str(os.environ.get("BRIDGE_API_URL", "https://youtube-summarize-bridge.onrender.com") or "").strip().rstrip("/")
+
+
+def _resolve_default_bridge_api_url() -> str:
+    configured_url = str(os.environ.get("BRIDGE_API_URL", "") or "").strip().rstrip("/")
+    if configured_url:
+        return configured_url
+    if str(os.environ.get("RENDER", "") or "").strip():
+        return "https://youtube-summarize-bridge.onrender.com"
+    return "http://127.0.0.1:8765"
+
+
+BRIDGE_API_URL = _resolve_default_bridge_api_url()
 BRIDGE_API_TOKEN = str(os.environ.get("BRIDGE_API_TOKEN", "") or "").strip()
+
+
+def _resolve_default_remote_transcribe_url() -> str:
+    if not BRIDGE_API_URL:
+        return ""
+    return f"{BRIDGE_API_URL.rstrip('/')}/fetch-transcript"
+
+
+DEFAULT_REMOTE_TRANSCRIBE_URL = _resolve_default_remote_transcribe_url()
+
+
+def ensure_default_remote_transcribe_config() -> None:
+    """为主站默认补齐服务端抓文本 worker 配置。"""
+    if DEFAULT_REMOTE_TRANSCRIBE_URL and not str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip():
+        os.environ["REMOTE_TRANSCRIBE_URL"] = DEFAULT_REMOTE_TRANSCRIBE_URL
+    if DEFAULT_REMOTE_TRANSCRIBE_URL and not str(os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "") or "").strip():
+        os.environ["REMOTE_TRANSCRIBE_ENABLED"] = "1"
+    if DEFAULT_REMOTE_TRANSCRIBE_URL and not str(os.environ.get("REMOTE_TRANSCRIBE_MODE", "") or "").strip():
+        os.environ["REMOTE_TRANSCRIBE_MODE"] = "prefer_remote"
+
+
+ensure_default_remote_transcribe_config()
 LEGACY_DEFAULT_SUMMARY_MODEL = "Pro/MiniMaxAI/MiniMax-M2.5"
 LEGACY_DEFAULT_FACT_CHECK_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 DEFAULT_SUMMARY_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 DEFAULT_FACT_CHECK_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+UI_DEFAULT_LOCALE = "zh"
+UI_TEXTS = {
+    "zh": {
+        "quota_remaining": "💡 您今日还可免费总结 {remaining} 个 YouTube 视频。填写您自己的 API Key 可解除限制。",
+        "fact_check_label_sources": "来源出处",
+        "fact_check_label_rationale": "来源线索说明",
+        "fact_check_label_pending": "建议继续查看",
+        "fact_check_label_conclusion": "来源定位",
+        "fact_check_sources_missing": "当前未提取到可点击来源链接。",
+        "fact_check_title": "🕵️ 来源导航",
+        "summary_tab_label": "📝 核心总结",
+        "main_title": "🎬 Video Summarizer",
+        "main_caption": "轻量的视频总结工具 | 插件优先提取 | 支持 YouTube",
+        "tab_home": "⚡ 立即总结",
+        "tab_history": "🗂️ 历史记录",
+        "tab_wishwall": "📝 留言板",
+        "tab_settings": "🛠️ 设置",
+        "hero_title": "快速获取视频总结",
+        "hero_desc": "贴入 YouTube 链接或视频 ID，系统会自动选择合适路径并生成总结。",
+        "home_path_input_title": "输入链接直连获取",
+        "home_path_input_desc": "适合直接贴视频链接。若已安装插件，主站会优先调用插件获取文本；若插件没直接拿到文本，再切到主站服务端抓取、生成总结，并补充相关新闻来源链接。",
+        "home_path_plugin_title": "插件一键获取总结",
+        "home_path_plugin_desc": "适合在视频页直接点击插件。插件会先提取文本并启动总结；若当前页面没拿到文本，会自动把原链接交给主站继续抓取。",
+        "video_input_label": "视频链接或 ID",
+        "video_input_placeholder": "粘贴 YouTube 链接或输入 11 位视频 ID",
+        "video_input_meta": "支持普通视频、Shorts、直播回放和 11 位视频 ID，直接粘贴即可。",
+        "video_auto_direct": "插件未直接拿到文本，已自动切换主站服务端抓取。",
+        "video_auto_extension": "已根据当前来源自动切换为插件抓取。",
+        "video_extension_fallback": "插件抓取未接管，正在自动切换主站服务端抓取...",
+        "video_extension_debug": "查看插件桥接链调试明细",
+        "video_summary_title": "### 📝 AI 总结",
+        "video_summary_duration": "⏱️ **总耗时: {total:.1f}s** (文本抓取: {fetch:.1f}s | AI 生成: {summary:.1f}s)",
+        "video_summary_pipeline": "🤖 模型流水线：{pipeline}",
+        "video_fact_check_title": "🕵️ 新闻来源导航",
+        "video_fact_check_running": "🕵️ 新闻来源检索正在后台补跑，完成后会自动刷新到右侧区域。",
+        "video_fact_check_failed": "新闻来源检索补跑失败：{error}",
+        "transcript_expander": "查看字幕原文",
+        "transcript_view_label": "字幕视图",
+        "view_mode_readable": "阅读版",
+        "view_mode_raw": "原始版",
+        "transcript_raw_caption": "原始版仅移除了内部调试标签，适合排查问题。",
+        "transcript_readable_caption": "阅读版已自动清理内部标签，并按更适合阅读的形式展示。",
+        "transcript_content_label": "字幕内容",
+        "manual_summary_title": "### 📝 字幕总结",
+        "manual_summary_duration": "⏱️ AI生成耗时: {duration:.1f}s",
+        "manual_summary_source": "本次总结来源：{summary}",
+        "manual_bridge_meta_expander": "查看本次总结的 bridge 元信息",
+        "manual_transcript_expander": "查看粘贴的字幕原文",
+        "manual_transcript_label": "字幕原文",
+        "manual_info": "💡 适合浏览器扩展、第三方 transcript 或你手动复制的字幕文本。这里不负责抓取，只负责基于文本做总结。",
+        "manual_source_label": "来源链接（可选）",
+        "manual_source_placeholder": "https://www.youtube.com/watch?v=... 或 11位视频 ID",
+        "manual_input_label": "粘贴 transcript / 字幕文本",
+        "manual_input_placeholder": "把浏览器扩展提取到的字幕文本粘贴到这里...",
+        "manual_summary_btn": "📝 总结字幕文本",
+        "manual_fallback_caption": "适合作为 YouTube/B站抓取失败时的稳定兜底入口。",
+        "manual_auto_start": "已接收到浏览器扩展传来的 transcript，正在自动开始总结...",
+        "document_summary_title": "### 📄 文档总结",
+        "document_strategy_chunked": "分块总结",
+        "document_strategy_direct": "直接总结",
+        "document_meta_file": "文件",
+        "document_meta_type": "类型",
+        "document_meta_body": "正文",
+        "document_meta_chars": "{count} 字符",
+        "document_meta_strategy": "策略",
+        "document_meta_chunks": "分块",
+        "document_meta_pages": "页数",
+        "document_meta_duration": "耗时",
+        "document_meta_ocr": "OCR：`已启用`",
+        "document_meta_doc_type": "文档判定",
+        "document_source_link": "来源链接：[{url}]({url})",
+        "document_fact_check_status": "来源分析判定：{status}。{reason}",
+        "document_fact_check_enabled": "已开启",
+        "document_fact_check_skipped": "已跳过",
+        "document_fact_check_title": "🕵️ 关键声明来源导航",
+        "document_fact_check_tab_title": "🕵️ 关键声明来源",
+        "document_fact_check_warning": "⚠️ 文档已被判定为适合做来源分析，但本次未成功生成来源结果。预期分析关键声明约 {count} 条。",
+        "document_fact_check_info": "📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。系统会自动判断是否需要补充关键声明的来源出处。",
+        "document_expander": "查看文档原文",
+        "document_view_label": "文档视图",
+        "document_raw_caption": "原始版为文档提取后的原始文本，适合排查解析问题。",
+        "document_readable_caption": "阅读版为清洗后的正文文本，更适合直接阅读。",
+        "document_content_label": "文档内容",
+        "document_info": "💡 二期已支持：本地 PDF / DOCX / TXT / Markdown / PPTX，以及在线 PDF 链接、网页文章链接。扫描版 PDF 会在提取不到文本时自动尝试 OCR。",
+        "document_info_caption": "系统会先自动判断文档类型。只有识别为新闻、研究、时评、政策解读、行业分析等适合追溯出处的文档，才会自动补充关键声明来源。",
+        "document_tab_upload": "📂 本地上传",
+        "document_tab_url": "🔗 在线链接",
+        "document_upload_caption": "支持 PDF、DOCX、TXT、Markdown、PPTX，建议单文件不超过 20MB。",
+        "document_upload_label": "上传文档",
+        "document_summary_btn": "📄 提取并总结文档",
+        "document_upload_footer": "长文档会自动分块总结；来源分析只针对关键声明进行。",
+        "document_url_label": "在线文档/文章链接",
+        "document_url_placeholder": "https://example.com/report.pdf 或 https://example.com/article",
+        "document_url_btn": "🌐 抓取并总结在线内容",
+        "document_url_footer": "支持在线 PDF、网页文章、公开 DOCX/PPTX/TXT/Markdown 链接。",
+        "document_upload_missing": "请先上传文档。",
+        "copy_button_default": "复制",
+        "copy_button_done": "已复制",
+        "copy_button_failed": "复制失败，请手动复制下方文本",
+        "issue_box_title": "诊断与问题上报",
+        "issue_box_caption": "先复制诊断信息，再提交问题反馈；后续排查会更快。",
+        "issue_box_copy": "复制诊断信息",
+        "issue_box_preview": "诊断信息预览",
+        "issue_box_reporter": "昵称",
+        "issue_box_type": "问题类型",
+        "issue_type_extract_failed": "提取失败",
+        "issue_type_summary_failed": "总结失败",
+        "issue_type_fact_check": "事实核查问题",
+        "issue_type_version": "版本/部署问题",
+        "issue_type_other": "其他",
+        "issue_box_source_url": "来源链接（可选）",
+        "issue_box_message": "问题描述",
+        "issue_box_message_placeholder": "请尽量描述你做了什么、预期是什么、实际发生了什么。",
+        "issue_box_submit": "提交问题",
+        "issue_box_submit_success": "问题已记录，可继续把上面的诊断信息直接发给我或测试群。",
+        "status_queued": "排队中",
+        "status_running": "运行中",
+        "status_success": "成功",
+        "status_success_done": "已完成",
+        "status_failed": "失败",
+        "status_partial": "部分成功",
+        "status_no_update": "无新增",
+        "status_in_progress": "进行中",
+        "status_expired": "已过期",
+        "status_idle": "空闲",
+        "status_unknown": "未知",
+        "task_center_header": "### 📋 任务中心",
+        "task_center_caption": "集中查看任务状态、失败重试、筛选搜索、批量操作和基础统计。",
+        "task_metric_running": "运行中任务",
+        "task_metric_failed": "失败条目",
+        "task_metric_success": "成功条目",
+        "task_metric_configured": "已配置自动任务",
+        "task_metric_success_rate_7d": "近7天成功率",
+        "task_overview": "状态概览：排队/运行 {running} | 成功 {success} | 失败 {failed} | 近7天运行批次 {runs}",
+        "task_center_no_bg": "当前没有后台异步任务。你可以在“处理中心”发起视频处理，或在“订阅自动化”中创建定时任务。",
+        "task_center_task_id": "任务 ID",
+        "task_center_status": "状态",
+        "task_center_done": "后台任务已完成。你可以清理状态后继续新任务，或在下方查看结果摘要。",
+        "task_center_view_result": "查看本次结果",
+        "task_center_failed": "后台任务失败：{error}",
+        "task_center_retry_current": "重试当前失败任务",
+        "task_center_retry_resubmitted": "已重新提交任务 {task_id}",
+        "task_center_running_info": "后台任务仍在执行中，页面会自动轮询刷新。",
+        "task_center_clear": "清理当前任务状态",
+        "task_center_refresh": "立即刷新任务状态",
+        "filter_all": "全部",
+        "task_filter_status": "状态",
+        "task_filter_source": "来源",
+        "task_filter_search": "搜索",
+        "task_filter_search_placeholder": "搜索标题 / URL / 错误信息",
+        "task_filter_summary": "当前共有 {total} 条任务记录，筛选后 {filtered} 条",
+        "task_batch_no_failed": "当前筛选结果中没有可批量重试的失败任务。",
+        "task_batch_select": "批量选择失败任务",
+        "task_unnamed": "未命名任务",
+        "task_batch_select_all": "选择当前筛选中的全部失败任务",
+        "task_batch_retry": "批量重试所选任务",
+        "task_batch_select_warning": "请先选择要重试的失败任务。",
+        "task_batch_submitted": "已批量提交 {count} 个重试任务",
+        "task_meta_channel": "频道",
+        "task_meta_time": "时间",
+        "task_meta_link": "链接",
+        "task_meta_source": "来源",
+        "task_source_auto": "自动任务",
+        "task_source_center": "处理中心",
+        "task_source_retry": "失败重试",
+        "task_source_center_retry": "处理中心失败重试",
+        "task_current_title": "当前任务",
+        "task_current_bg_title": "当前后台任务",
+        "task_meta_task_id": "任务ID",
+        "task_meta_duration": "耗时",
+        "task_result_expander": "查看结果摘要",
+        "task_result_empty": "本次任务未返回可展示摘要。",
+        "task_failure_reason": "失败原因：{error}",
+        "task_retry_single": "重试此任务",
+        "task_records_empty": "暂无任务记录。",
+        "task_logs_empty": "暂无运行日志。",
+        "task_tab_current": "🎯 当前任务",
+        "task_tab_list": "🗂️ 任务列表",
+        "task_tab_logs": "🧾 运行日志",
+        "history_search_label": "搜索历史记录 (标题/URL/内容)",
+        "history_search_fulltext": "全文搜索",
+        "history_clear": "清空历史",
+        "history_source_schedule": "⏰ 定时任务",
+        "history_source_single": "🎬 单次任务",
+        "history_entry_caption": "来源: {source} | URL: {url}",
+        "history_header": "### 🗂️ 历史记录",
+        "history_caption": "查看已经生成过的总结结果，支持搜索与全文检索。",
+        "history_export": "⬇️ 导出历史记录 (JSON)",
+        "history_empty": "暂无历史记录，等你生成第一条总结后会自动沉淀到这里。",
+        "history_count": "共 {total} 条历史记录，当前命中 {matched} 条",
+        "settings_diag_header": "### 🛠️ 设置与诊断",
+        "settings_diag_caption": "集中放置运行诊断和桥接状态，方便排查问题。",
+        "settings_diag_pipeline": "当前双模型流水线：`{pipeline}`",
+        "settings_metric_runtime": "运行版本",
+        "settings_metric_bg": "后台任务",
+        "settings_metric_bg_caption": "用于观察当前后台抓取与总结状态",
+        "settings_metric_bridge": "Bridge 元信息",
+        "settings_metric_bridge_caption": "用于判断扩展或本地工具是否已回传上下文",
+        "settings_runtime_detail": "查看运行版本详情",
+        "settings_runtime_detail_empty": "暂无可展示的运行版本诊断信息。",
+        "settings_render_detail": "查看 Render 部署信息",
+        "settings_render_deploy_hidden": "未暴露 deploy id",
+        "settings_render_deploy_caption": "当前 Render 环境变量未明确暴露 deploy id；页面会优先显示 commit、branch 与 service 信息。",
+        "settings_local_runtime_caption": "当前为本地运行环境，未检测到 Render 部署变量。",
+        "settings_bridge_expander": "查看提取与桥接诊断",
+        "settings_bridge_empty": "当前还没有可展示的 bridge 诊断数据。",
+        "settings_runtime_history": "📜 运行日志 & 历史",
+        "settings_runtime_log_tab": "日志",
+        "settings_runtime_history_tab": "历史",
+        "settings_runtime_no_log": "无日志",
+        "settings_runtime_no_history": "无历史",
+        "settings_runtime_day_summary": "**{date}**: 新增 {new_items} | 成功 {success_items}",
+        "wish_wall_header": "### 💌 留言板",
+        "wish_wall_caption": "像把便利签贴在墙上一样，任何人都可以匿名留言、查看和回复；只可新增，不提供删除。",
+        "wish_wall_intro_title": "留言板",
+        "wish_wall_message_label": "写下你的留言",
+        "wish_wall_message_placeholder": "你可以直接写下功能建议、使用感受、Bug 反馈或想做的新能力。留言默认匿名显示，所有人都能看，也都可以继续回复。",
+        "wish_wall_submit": "发布留言",
+        "wish_wall_submit_success": "已贴上留言。",
+        "wish_wall_empty": "现在还没有留言，来贴第一张便利签吧。",
+        "wish_wall_blank_message": "（空白留言）",
+        "wish_wall_note_prefix": "便利签",
+        "wish_wall_reply_count": "回复 {count} 条",
+        "wish_wall_view_reply": "查看与回复",
+        "wish_wall_reply_label": "回复",
+        "wish_wall_no_reply": "还没有回复，欢迎补充。",
+        "wish_wall_reply_input": "回复内容",
+        "wish_wall_reply_placeholder": "可以补充细节、回应建议，或者给这条留言点个赞。",
+        "wish_wall_reply_submit": "回复",
+        "wish_wall_reply_success": "回复已发布。",
+        "lite_settings_header": "### 🛠️ 设置",
+        "lite_settings_caption": "默认无需修改。只有在你想使用自己的 API、切换接口或调整模型时，才需要展开高级设置。",
+        "lite_settings_recommend_title": "推荐用法",
+        "lite_settings_recommend_body": "直接贴入视频链接即可开始使用。API Key、Base URL 和模型都已收纳到高级设置，避免普通用户看到过多技术项。",
+        "lite_settings_advanced": "高级设置",
+        "lite_settings_advanced_caption": "当前运行流水线：`{pipeline}`。适合需要自定义 Key、接口地址或模型的用户。",
+        "lite_settings_api_key_help": "填写后将优先使用你自己的 Key，且不受每日免费次数限制。",
+        "lite_settings_summary_model": "总结模型",
+        "lite_settings_summary_model_help": "建议填写 deepseek-ai/DeepSeek-V4-Flash",
+        "lite_settings_fact_model": "新闻核查模型",
+        "lite_settings_fact_model_help": "建议填写 deepseek-ai/DeepSeek-V4-Flash",
+        "lite_settings_use_defaults": "一键切到 DeepSeek-V4-Flash",
+        "lite_settings_save_models": "保存模型设置",
+        "lite_settings_use_defaults_success": "已切换到 DeepSeek-V4-Flash。",
+        "lite_settings_save_success": "模型设置已保存。",
+        "lite_settings_diag_manage": "诊断与任务管理",
+        "lite_settings_diag_manage_caption": "以下内容主要用于排查问题和维护站点，普通用户一般不需要展开。",
+        "lite_settings_view_task_center": "查看任务中心",
+        "lite_settings_view_automation": "查看订阅自动化",
+        "subscription_input_required": "请输入频道链接或关键词。",
+        "subscription_fetch_channel": "正在获取频道信息...",
+        "subscription_added_success": "已添加订阅: {name} ({platform})",
+        "subscription_exists": "频道 '{name}' 已在订阅列表中",
+        "subscription_add_failed": "添加失败: {error}",
+        "subscription_searching": "正在搜索 '{keyword}' ...",
+        "subscription_not_found": "未找到相关频道",
+        "subscription_unknown_name": "未知频道",
+        "subscription_youtube_channel": "YouTube 频道",
+        "subscription_search_add": "➕ 添加",
+        "subscription_added_short": "已添加: {name}",
+        "subscription_exists_short": "已存在: {name}",
+        "subscription_search_results": "### 🔍 搜索结果",
+        "subscription_no_results": "无结果",
+        "subscription_close_search": "✕ 关闭搜索",
+        "subscription_delete_help": "删除 {name}",
+        "subscription_list_title": "##### 📋 已订阅频道",
+        "subscription_view_mode": "视图模式",
+        "subscription_view_list": "列表",
+        "subscription_view_grid": "网格",
+        "subscription_empty": "暂无订阅，请添加",
+        "subscription_channel_section": "#### 📺 已订阅频道",
+        "subscription_manage_expander": "📺 订阅管理 (添加 / 查看 / 删除)",
+        "subscription_add_new": "##### ➕ 添加新订阅",
+        "subscription_input_label": "输入频道链接或关键词",
+        "subscription_input_placeholder": "例如 李永乐 或频道链接",
+        "subscription_search_button": "🔍 搜索 / 添加",
+        "subscription_empty_update": "暂无订阅频道，请先添加订阅后再检查更新。",
+        "subscription_checking_status": "正在检查更新...",
+        "subscription_check_prepare_proxy": "准备开始：正在检测网络代理...",
+        "subscription_check_prepare_tasks": "准备开始：正在初始化检查任务...",
+        "subscription_check_launch": "正在启动 {count} 个并发检查任务...",
+        "subscription_check_running": "正在检查更新... (已耗时 {elapsed}s)",
+        "subscription_check_waiting": "({done}/{total}) 任务已提交，等待结果...",
+        "subscription_check_progress": "({done}/{total}) 正在检查: {name}... | 预计剩余: {remain}s",
+        "subscription_check_found": "✅ {name}: 发现 {count} 个新视频",
+        "subscription_check_failed": "⚠️ {name} 检查失败: {error}",
+        "subscription_check_exception": "⚠️ {name} 异常: {error}",
+        "subscription_check_done_progress": "检查完成！总耗时 {elapsed}s",
+        "subscription_check_done": "✅ 更新检查完成 (耗时 {elapsed}s)",
+        "subscription_summary_footer": "本总结由 {pipeline} 流水线生成{device} | ⏳ 总耗时: {duration:.1f}s",
+        "subscription_summary_footer_timing": " (📥 下载: {download:.1f}s | 🎙️ 转写: {transcribe:.1f}s | 🤖 AI: {duration:.1f}s)",
+        "subscription_summary_close": "关闭总结",
+        "subscription_summary_init": "⏳ 正在初始化...",
+        "subscription_summary_prepare": "⏳ 正在准备抓取字幕/转写音频 (可能需要下载音频)...",
+        "subscription_summary_transcript_failed": "❌ 字幕获取失败: {error}",
+        "subscription_summary_ai_ready": "🚀 字幕获取成功，正在请求 AI 生成总结...",
+        "subscription_summary_ai_dual": "🚀 正在请求 AI 生成总结（双模型流水线）...",
+        "subscription_summary_ai_stream": "🚀 正在请求 AI 生成总结 (流式输出)...",
+        "subscription_summary_need_api": "请在侧边栏填写 API Key",
+        "subscription_summary_connect_api": "🚀 正在连接大模型 API...",
+        "subscription_summary_receive": "🚀 开始接收 AI 响应...",
+        "subscription_summary_error": "总结过程出错: {error}",
+        "subscription_process_error": "处理出错: {error}",
+        "subscription_duration_hm": "{hours}小时{minutes}分",
+        "subscription_duration_ms": "{minutes}分{seconds}秒",
+        "subscription_summarize_btn": "✨ 总结",
+        "subscription_updates_none_after": "检查完成 ({time})，暂无新内容",
+        "subscription_updates_none_before": "点击上方按钮检查更新",
+        "subscription_updates_header": "🆕 最新动态",
+        "subscription_updates_check_all": "🔄 检查所有订阅更新",
+        "daily_report_select_date": "选择日期",
+        "daily_report_filter_status": "状态筛选",
+        "daily_report_filter_success": "成功",
+        "daily_report_filter_failed": "失败",
+        "daily_report_search_title": "搜索标题",
+        "daily_report_search_placeholder": "🔍 搜索更新内容...",
+        "daily_report_metric_total": "总计更新",
+        "daily_report_item_untitled": "未命名内容",
+        "daily_report_video_link": "视频链接",
+        "daily_report_view_summary": "查看 AI 总结",
+        "daily_report_empty": "暂无更新记录，请先在“任务管理”中添加并执行任务",
+        "daily_report_empty_date": "该日期暂无更新内容",
+        "daily_report_empty_filter": "没有符合当前筛选条件的更新内容",
+        "automation_quick_actions": "##### 🚀 快捷操作",
+        "automation_no_tasks": "暂无可执行任务",
+        "automation_run_all": "立即执行全部",
+        "automation_running_all": "正在执行全部任务...",
+        "automation_run_all_done": "已执行全部启用任务",
+        "automation_create_task_title": "##### ➕ 新建任务",
+        "automation_create_task_btn": "添加新任务",
+        "automation_create_task_need_sub": "请先在“频道订阅”中添加频道",
+        "automation_search_channel": "搜索频道",
+        "automation_search_channel_placeholder": "输入关键词...",
+        "automation_select_all": "全选",
+        "automation_select_channels": "选择频道",
+        "automation_schedule_title": "⏰ 时间设置",
+        "automation_simple_mode": "简单模式",
+        "automation_schedule_type": "周期类型",
+        "automation_schedule_daily": "每天",
+        "automation_schedule_weekly": "每周",
+        "automation_schedule_interval": "间隔小时",
+        "automation_schedule_cron": "Cron",
+        "automation_schedule_daily_time": "每天几点运行",
+        "automation_schedule_time_point": "时间点",
+        "automation_schedule_weekdays": "星期",
+        "automation_schedule_interval_hours": "每隔几小时",
+        "automation_schedule_cron_expr": "Cron表达式",
+        "automation_weekday_mon": "周一",
+        "automation_weekday_tue": "周二",
+        "automation_weekday_wed": "周三",
+        "automation_weekday_thu": "周四",
+        "automation_weekday_fri": "周五",
+        "automation_weekday_sat": "周六",
+        "automation_weekday_sun": "周日",
+        "automation_create_task_submit": "创建任务",
+        "automation_create_task_pick_channel": "请选择频道",
+        "automation_create_task_success": "已创建 {count} 个任务",
+        "automation_create_task_skip_exists": "未创建任务（可能已存在）",
+        "automation_task_next_run": "下次: {time}",
+        "automation_task_toggle_disable": "停用",
+        "automation_task_toggle_enable": "启用",
+        "automation_task_delete_help": "删除任务",
+        "automation_task_list_title": "##### 📝 任务列表",
+        "automation_task_list_empty": "暂无任务",
+        "automation_daily_tab": "📅 每日简报",
+        "automation_manage_tab": "⚙️ 任务管理",
+        "automation_header": "### 📡 订阅自动化",
+        "automation_caption": "把频道订阅、更新检查和定时执行放到同一个页面中，统一管理自动化能力。",
+        "automation_tab_subs": "📺 订阅与动态",
+        "automation_tab_rules": "⏰ 规则与日报",
+        "automation_countdown_soon": "即将执行",
+        "automation_countdown_day": "{count}天",
+        "automation_countdown_hour": "{count}小时",
+        "automation_countdown_minute": "{count}分",
+        "automation_task_missing_channel": "任务缺少频道链接，已跳过",
+        "automation_task_missing_api": "缺少 API Key，无法生成总结",
+        "automation_task_run_done": "任务执行完成，新增 {count} 个视频",
+        "automation_task_retry_scheduled": "任务失败，将在 5 分钟后重试({retry}/3)：{error}",
+        "automation_task_retry_exhausted": "任务失败并超过最大重试次数：{error}",
+        "schedule_label_daily": "每天 {time}",
+        "schedule_label_weekly": "{days} {time}",
+        "schedule_label_interval": "每 {hours} 小时",
+        "schedule_label_unset": "未设置",
+    },
+    "en": {
+        "quota_remaining": "💡 You can still summarize {remaining} YouTube videos for free today. Add your own API key to remove the limit.",
+        "fact_check_label_sources": "Source Links",
+        "fact_check_label_rationale": "Source Notes",
+        "fact_check_label_pending": "Suggested Follow-ups",
+        "fact_check_label_conclusion": "Source Status",
+        "fact_check_sources_missing": "No clickable source links were extracted.",
+        "fact_check_title": "🕵️ Source Guide",
+        "summary_tab_label": "📝 Summary",
+        "main_title": "🎬 Video Summarizer",
+        "main_caption": "Lightweight video summarizer | Extension-first extraction | YouTube supported",
+        "tab_home": "⚡ Summarize",
+        "tab_history": "🗂️ History",
+        "tab_wishwall": "📝 Board",
+        "tab_settings": "🛠️ Settings",
+        "hero_title": "Get a Video Summary Fast",
+        "hero_desc": "Paste a YouTube URL or video ID and the app will choose the best path automatically.",
+        "home_path_input_title": "Paste Link Directly",
+        "home_path_input_desc": "Best when you already have the video URL. If the extension is installed, the site asks the extension to fetch text first; if that does not return text, the site continues with server-side fetch, summary generation, and source discovery.",
+        "home_path_plugin_title": "One-Click From Extension",
+        "home_path_plugin_desc": "Best on the video page itself. The extension extracts text first and starts the summary flow; if the page still does not return text, it hands the original URL back to the main site to continue.",
+        "video_input_label": "Video URL or ID",
+        "video_input_placeholder": "Paste a YouTube URL or enter an 11-character video ID",
+        "video_input_meta": "Supports regular videos, Shorts, archived livestreams, and 11-character video IDs.",
+        "video_auto_direct": "The extension did not return text directly, so the site switched to server-side fetch automatically.",
+        "video_auto_extension": "Automatically switched to extension-based extraction for this source.",
+        "video_extension_fallback": "The extension did not take over, switching to server-side site fetch...",
+        "video_extension_debug": "View extension bridge debug details",
+        "video_summary_title": "### 📝 AI Summary",
+        "video_summary_duration": "⏱️ **Total: {total:.1f}s** (Fetch: {fetch:.1f}s | AI: {summary:.1f}s)",
+        "video_summary_pipeline": "🤖 Model pipeline: {pipeline}",
+        "video_fact_check_title": "🕵️ News Source Guide",
+        "video_fact_check_running": "🕵️ Source discovery is still running in the background and will refresh automatically when ready.",
+        "video_fact_check_failed": "Background source discovery failed: {error}",
+        "transcript_expander": "View Transcript",
+        "transcript_view_label": "Transcript View",
+        "view_mode_readable": "Readable",
+        "view_mode_raw": "Raw",
+        "transcript_raw_caption": "Raw view only removes internal debug tags and is useful for troubleshooting.",
+        "transcript_readable_caption": "Readable view cleans internal tags and formats the transcript for easier reading.",
+        "transcript_content_label": "Transcript",
+        "manual_summary_title": "### 📝 Transcript Summary",
+        "manual_summary_duration": "⏱️ AI time: {duration:.1f}s",
+        "manual_summary_source": "Summary source: {summary}",
+        "manual_bridge_meta_expander": "View bridge metadata for this summary",
+        "manual_transcript_expander": "View Pasted Transcript",
+        "manual_transcript_label": "Transcript",
+        "manual_info": "💡 Best for browser extensions, third-party transcripts, or text you pasted manually. This entry only summarizes text and does not fetch it.",
+        "manual_source_label": "Source URL (optional)",
+        "manual_source_placeholder": "https://www.youtube.com/watch?v=... or an 11-character video ID",
+        "manual_input_label": "Paste transcript text",
+        "manual_input_placeholder": "Paste the transcript extracted by the browser extension here...",
+        "manual_summary_btn": "📝 Summarize Transcript",
+        "manual_fallback_caption": "Useful as a stable fallback when YouTube or Bilibili extraction fails.",
+        "manual_auto_start": "Transcript received from the browser extension. Starting summarization automatically...",
+        "document_summary_title": "### 📄 Document Summary",
+        "document_strategy_chunked": "Chunked summary",
+        "document_strategy_direct": "Direct summary",
+        "document_meta_file": "File",
+        "document_meta_type": "Type",
+        "document_meta_body": "Body",
+        "document_meta_chars": "{count} chars",
+        "document_meta_strategy": "Strategy",
+        "document_meta_chunks": "Chunks",
+        "document_meta_pages": "Pages",
+        "document_meta_duration": "Time",
+        "document_meta_ocr": "OCR: `enabled`",
+        "document_meta_doc_type": "Document type",
+        "document_source_link": "Source: [{url}]({url})",
+        "document_fact_check_status": "Fact-check status: {status}. {reason}",
+        "document_fact_check_enabled": "enabled",
+        "document_fact_check_skipped": "skipped",
+        "document_fact_check_title": "🕵️ Key Claim Source Guide",
+        "document_fact_check_tab_title": "🕵️ Key Claim Sources",
+        "document_fact_check_warning": "⚠️ This document was marked as suitable for source analysis, but no source output was produced this time. Estimated key claims: {count}.",
+        "document_fact_check_info": "📝 Document mode supports local uploads, online links, PPTX, and OCR fallback for scanned PDFs. The app decides automatically whether key-claim source discovery is needed.",
+        "document_expander": "View Source Document",
+        "document_view_label": "Document View",
+        "document_raw_caption": "Raw view shows the extracted source text and is useful for debugging parsing issues.",
+        "document_readable_caption": "Readable view shows cleaned body text for easier reading.",
+        "document_content_label": "Document Content",
+        "document_info": "💡 Document mode supports local PDF / DOCX / TXT / Markdown / PPTX files and online PDF or article links. Scanned PDFs automatically fall back to OCR when needed.",
+        "document_info_caption": "The app first classifies the document type. Only content such as news, research, commentary, policy analysis, or industry reports will trigger key-claim fact checking automatically.",
+        "document_tab_upload": "📂 Upload",
+        "document_tab_url": "🔗 Online Link",
+        "document_upload_caption": "Supports PDF, DOCX, TXT, Markdown, and PPTX. Recommended size: under 20MB.",
+        "document_upload_label": "Upload document",
+        "document_summary_btn": "📄 Extract and Summarize",
+        "document_upload_footer": "Long documents are summarized in chunks; fact checking only targets key claims.",
+        "document_url_label": "Online document/article URL",
+        "document_url_placeholder": "https://example.com/report.pdf or https://example.com/article",
+        "document_url_btn": "🌐 Fetch and Summarize",
+        "document_url_footer": "Supports online PDF, article pages, and public DOCX / PPTX / TXT / Markdown links.",
+        "document_upload_missing": "Please upload a document first.",
+        "copy_button_default": "Copy",
+        "copy_button_done": "Copied",
+        "copy_button_failed": "Copy failed. Please copy the text below manually.",
+        "issue_box_title": "Diagnostics and Feedback",
+        "issue_box_caption": "Copy the diagnostics first, then submit feedback to speed up troubleshooting.",
+        "issue_box_copy": "Copy Diagnostics",
+        "issue_box_preview": "Diagnostics Preview",
+        "issue_box_reporter": "Name",
+        "issue_box_type": "Issue Type",
+        "issue_type_extract_failed": "Extraction failed",
+        "issue_type_summary_failed": "Summary failed",
+        "issue_type_fact_check": "Fact check issue",
+        "issue_type_version": "Version/deployment issue",
+        "issue_type_other": "Other",
+        "issue_box_source_url": "Source URL (optional)",
+        "issue_box_message": "Description",
+        "issue_box_message_placeholder": "Describe what you did, what you expected, and what actually happened.",
+        "issue_box_submit": "Submit Feedback",
+        "issue_box_submit_success": "The issue has been recorded. You can continue sharing the diagnostics above with me or the test group.",
+        "status_queued": "Queued",
+        "status_running": "Running",
+        "status_success": "Success",
+        "status_success_done": "Completed",
+        "status_failed": "Failed",
+        "status_partial": "Partially succeeded",
+        "status_no_update": "No update",
+        "status_in_progress": "In progress",
+        "status_expired": "Expired",
+        "status_idle": "Idle",
+        "status_unknown": "Unknown",
+        "task_center_header": "### 📋 Task Center",
+        "task_center_caption": "View task states, retries, filters, batch actions, and basic metrics in one place.",
+        "task_metric_running": "Running tasks",
+        "task_metric_failed": "Failed items",
+        "task_metric_success": "Successful items",
+        "task_metric_configured": "Configured automations",
+        "task_metric_success_rate_7d": "7-day success rate",
+        "task_overview": "Overview: queued/running {running} | success {success} | failed {failed} | runs in last 7 days {runs}",
+        "task_center_no_bg": "There is no background async task right now. Start a video task from the processing center or create a scheduled task from automation.",
+        "task_center_task_id": "Task ID",
+        "task_center_status": "Status",
+        "task_center_done": "The background task has finished. Clear the state to continue, or review the result below.",
+        "task_center_view_result": "View Result",
+        "task_center_failed": "Background task failed: {error}",
+        "task_center_retry_current": "Retry Current Failed Task",
+        "task_center_retry_resubmitted": "Resubmitted task {task_id}",
+        "task_center_running_info": "The background task is still running. This page will refresh automatically.",
+        "task_center_clear": "Clear Current Task State",
+        "task_center_refresh": "Refresh Now",
+        "filter_all": "All",
+        "task_filter_status": "Status",
+        "task_filter_source": "Source",
+        "task_filter_search": "Search",
+        "task_filter_search_placeholder": "Search title / URL / error",
+        "task_filter_summary": "{total} task records in total, {filtered} after filtering",
+        "task_batch_no_failed": "No failed tasks are available for batch retry under the current filter.",
+        "task_batch_select": "Select failed tasks in batch",
+        "task_unnamed": "Untitled task",
+        "task_batch_select_all": "Select all failed tasks in the current filter",
+        "task_batch_retry": "Retry Selected Tasks",
+        "task_batch_select_warning": "Select at least one failed task to retry.",
+        "task_batch_submitted": "Submitted {count} retry tasks in batch",
+        "task_meta_channel": "Channel",
+        "task_meta_time": "Time",
+        "task_meta_link": "Link",
+        "task_meta_source": "Source",
+        "task_source_auto": "Automation",
+        "task_source_center": "Processing Center",
+        "task_source_retry": "Retry",
+        "task_source_center_retry": "Processing Center Retry",
+        "task_current_title": "Current Task",
+        "task_current_bg_title": "Current Background Task",
+        "task_meta_task_id": "Task ID",
+        "task_meta_duration": "Duration",
+        "task_result_expander": "View Summary",
+        "task_result_empty": "This task did not return any displayable summary.",
+        "task_failure_reason": "Failure reason: {error}",
+        "task_retry_single": "Retry This Task",
+        "task_records_empty": "No task records yet.",
+        "task_logs_empty": "No task logs yet.",
+        "task_tab_current": "🎯 Current Task",
+        "task_tab_list": "🗂️ Task List",
+        "task_tab_logs": "🧾 Logs",
+        "history_search_label": "Search history (title/URL/content)",
+        "history_search_fulltext": "Full-text search",
+        "history_clear": "Clear History",
+        "history_source_schedule": "⏰ Scheduled task",
+        "history_source_single": "🎬 One-off task",
+        "history_entry_caption": "Source: {source} | URL: {url}",
+        "history_header": "### 🗂️ History",
+        "history_caption": "Browse generated summaries with search and full-text lookup.",
+        "history_export": "⬇️ Export History (JSON)",
+        "history_empty": "No history yet. Your first generated summary will appear here automatically.",
+        "history_count": "{total} history items in total, {matched} matched now",
+        "settings_diag_header": "### 🛠️ Settings and Diagnostics",
+        "settings_diag_caption": "Shows runtime diagnostics and bridge state in one place for troubleshooting.",
+        "settings_diag_pipeline": "Current dual-model pipeline: `{pipeline}`",
+        "settings_metric_runtime": "Runtime",
+        "settings_metric_bg": "Background Tasks",
+        "settings_metric_bg_caption": "Used to observe current background fetching and summarization state",
+        "settings_metric_bridge": "Bridge Metadata",
+        "settings_metric_bridge_caption": "Used to confirm whether extension or local-tool context has been returned",
+        "settings_runtime_detail": "View Runtime Details",
+        "settings_runtime_detail_empty": "No runtime diagnostics are available right now.",
+        "settings_render_detail": "View Render Deployment Info",
+        "settings_render_deploy_hidden": "deploy id not exposed",
+        "settings_render_deploy_caption": "Render did not explicitly expose the deploy id, so the page prioritizes commit, branch, and service info.",
+        "settings_local_runtime_caption": "Running locally. No Render deployment variables were detected.",
+        "settings_bridge_expander": "View Extraction and Bridge Diagnostics",
+        "settings_bridge_empty": "No bridge diagnostics are available yet.",
+        "settings_runtime_history": "📜 Runtime Logs and History",
+        "settings_runtime_log_tab": "Logs",
+        "settings_runtime_history_tab": "History",
+        "settings_runtime_no_log": "No logs",
+        "settings_runtime_no_history": "No history",
+        "settings_runtime_day_summary": "**{date}**: new {new_items} | success {success_items}",
+        "wish_wall_header": "### 💌 Message Board",
+        "wish_wall_caption": "Like sticky notes on a wall: anyone can post anonymously, view, and reply. New entries only, no deletion.",
+        "wish_wall_intro_title": "Message Board",
+        "wish_wall_message_label": "Write your message",
+        "wish_wall_message_placeholder": "Share feature ideas, usage feedback, bug reports, or new capabilities you want. Messages are anonymous by default and everyone can view and reply.",
+        "wish_wall_submit": "Post Message",
+        "wish_wall_submit_success": "Your message has been posted.",
+        "wish_wall_empty": "No messages yet. Add the first sticky note.",
+        "wish_wall_blank_message": "(blank message)",
+        "wish_wall_note_prefix": "Note",
+        "wish_wall_reply_count": "{count} replies",
+        "wish_wall_view_reply": "View and Reply",
+        "wish_wall_reply_label": "Reply",
+        "wish_wall_no_reply": "No replies yet. Feel free to add one.",
+        "wish_wall_reply_input": "Reply",
+        "wish_wall_reply_placeholder": "Add details, respond to the suggestion, or simply show support.",
+        "wish_wall_reply_submit": "Reply",
+        "wish_wall_reply_success": "Reply posted.",
+        "lite_settings_header": "### 🛠️ Settings",
+        "lite_settings_caption": "You usually do not need to change anything here. Expand advanced settings only if you want your own API, a different endpoint, or custom models.",
+        "lite_settings_recommend_title": "Recommended Usage",
+        "lite_settings_recommend_body": "Paste a video URL and start right away. API key, base URL, and model settings are tucked into advanced settings so regular users do not see too many technical fields.",
+        "lite_settings_advanced": "Advanced Settings",
+        "lite_settings_advanced_caption": "Current pipeline: `{pipeline}`. Best for users who need custom keys, endpoints, or models.",
+        "lite_settings_api_key_help": "If provided, your own API key is used first and daily free limits no longer apply.",
+        "lite_settings_summary_model": "Summary Model",
+        "lite_settings_summary_model_help": "Recommended: deepseek-ai/DeepSeek-V4-Flash",
+        "lite_settings_fact_model": "Fact Check Model",
+        "lite_settings_fact_model_help": "Recommended: deepseek-ai/DeepSeek-V4-Flash",
+        "lite_settings_use_defaults": "Switch to DeepSeek-V4-Flash",
+        "lite_settings_save_models": "Save Model Settings",
+        "lite_settings_use_defaults_success": "Switched to DeepSeek-V4-Flash.",
+        "lite_settings_save_success": "Model settings saved.",
+        "lite_settings_diag_manage": "Diagnostics and Task Management",
+        "lite_settings_diag_manage_caption": "The content below is mainly for troubleshooting and site maintenance. Most users do not need to expand it.",
+        "lite_settings_view_task_center": "View Task Center",
+        "lite_settings_view_automation": "View Automation",
+        "subscription_input_required": "Please enter a channel link or keyword.",
+        "subscription_fetch_channel": "Fetching channel information...",
+        "subscription_added_success": "Subscription added: {name} ({platform})",
+        "subscription_exists": "Channel '{name}' is already in subscriptions",
+        "subscription_add_failed": "Add failed: {error}",
+        "subscription_searching": "Searching '{keyword}' ...",
+        "subscription_not_found": "No related channels found",
+        "subscription_unknown_name": "Unknown channel",
+        "subscription_youtube_channel": "YouTube channel",
+        "subscription_search_add": "➕ Add",
+        "subscription_added_short": "Added: {name}",
+        "subscription_exists_short": "Already exists: {name}",
+        "subscription_search_results": "### 🔍 Search Results",
+        "subscription_no_results": "No results",
+        "subscription_close_search": "✕ Close Search",
+        "subscription_delete_help": "Remove {name}",
+        "subscription_list_title": "##### 📋 Subscriptions",
+        "subscription_view_mode": "View mode",
+        "subscription_view_list": "List",
+        "subscription_view_grid": "Grid",
+        "subscription_empty": "No subscriptions yet. Add one first.",
+        "subscription_channel_section": "#### 📺 Subscribed Channels",
+        "subscription_manage_expander": "📺 Subscription Management (Add / View / Remove)",
+        "subscription_add_new": "##### ➕ Add Subscription",
+        "subscription_input_label": "Enter a channel link or keyword",
+        "subscription_input_placeholder": "For example, a channel name or URL",
+        "subscription_search_button": "🔍 Search / Add",
+        "subscription_empty_update": "No subscribed channels yet. Add subscriptions before checking updates.",
+        "subscription_checking_status": "Checking updates...",
+        "subscription_check_prepare_proxy": "Getting ready: checking proxy settings...",
+        "subscription_check_prepare_tasks": "Getting ready: initializing update tasks...",
+        "subscription_check_launch": "Starting {count} concurrent update tasks...",
+        "subscription_check_running": "Checking updates... ({elapsed}s elapsed)",
+        "subscription_check_waiting": "({done}/{total}) Tasks submitted. Waiting for results...",
+        "subscription_check_progress": "({done}/{total}) Checking {name}... | ETA: {remain}s",
+        "subscription_check_found": "✅ {name}: found {count} new videos",
+        "subscription_check_failed": "⚠️ {name} check failed: {error}",
+        "subscription_check_exception": "⚠️ {name} exception: {error}",
+        "subscription_check_done_progress": "Update check finished. Total time: {elapsed}s",
+        "subscription_check_done": "✅ Update check finished ({elapsed}s)",
+        "subscription_summary_footer": "Generated by the {pipeline} pipeline{device} | ⏳ Total: {duration:.1f}s",
+        "subscription_summary_footer_timing": " (📥 Download: {download:.1f}s | 🎙️ Transcribe: {transcribe:.1f}s | 🤖 AI: {duration:.1f}s)",
+        "subscription_summary_close": "Close summary",
+        "subscription_summary_init": "⏳ Initializing...",
+        "subscription_summary_prepare": "⏳ Preparing transcript fetch/audio transcription (audio download may be required)...",
+        "subscription_summary_transcript_failed": "❌ Transcript fetch failed: {error}",
+        "subscription_summary_ai_ready": "🚀 Transcript ready. Requesting AI summary...",
+        "subscription_summary_ai_dual": "🚀 Requesting AI summary (dual-model pipeline)...",
+        "subscription_summary_ai_stream": "🚀 Requesting AI summary (streaming output)...",
+        "subscription_summary_need_api": "Please enter an API key in the sidebar",
+        "subscription_summary_connect_api": "🚀 Connecting to the model API...",
+        "subscription_summary_receive": "🚀 Receiving AI response...",
+        "subscription_summary_error": "Summary generation error: {error}",
+        "subscription_process_error": "Processing error: {error}",
+        "subscription_duration_hm": "{hours}h {minutes}m",
+        "subscription_duration_ms": "{minutes}m {seconds}s",
+        "subscription_summarize_btn": "✨ Summarize",
+        "subscription_updates_none_after": "Check completed ({time}). No new content found.",
+        "subscription_updates_none_before": "Click the button above to check for updates",
+        "subscription_updates_header": "🆕 Latest Updates",
+        "subscription_updates_check_all": "🔄 Check All Subscription Updates",
+        "daily_report_select_date": "Date",
+        "daily_report_filter_status": "Status",
+        "daily_report_filter_success": "Success",
+        "daily_report_filter_failed": "Failed",
+        "daily_report_search_title": "Search title",
+        "daily_report_search_placeholder": "🔍 Search updates...",
+        "daily_report_metric_total": "Total updates",
+        "daily_report_item_untitled": "Untitled content",
+        "daily_report_video_link": "Video link",
+        "daily_report_view_summary": "View AI Summary",
+        "daily_report_empty": "No update records yet. Add and run tasks from Task Management first.",
+        "daily_report_empty_date": "No updates for this date",
+        "daily_report_empty_filter": "No updates match the current filters",
+        "automation_quick_actions": "##### 🚀 Quick Actions",
+        "automation_no_tasks": "No runnable tasks",
+        "automation_run_all": "Run All Now",
+        "automation_running_all": "Running all tasks...",
+        "automation_run_all_done": "All enabled tasks have been executed",
+        "automation_create_task_title": "##### ➕ Create Task",
+        "automation_create_task_btn": "Add New Task",
+        "automation_create_task_need_sub": "Add a channel in Subscriptions first",
+        "automation_search_channel": "Search channels",
+        "automation_search_channel_placeholder": "Enter keywords...",
+        "automation_select_all": "Select All",
+        "automation_select_channels": "Select channels",
+        "automation_schedule_title": "⏰ Schedule Settings",
+        "automation_simple_mode": "Simple mode",
+        "automation_schedule_type": "Schedule type",
+        "automation_schedule_daily": "Daily",
+        "automation_schedule_weekly": "Weekly",
+        "automation_schedule_interval": "Interval hours",
+        "automation_schedule_cron": "Cron",
+        "automation_schedule_daily_time": "Run time each day",
+        "automation_schedule_time_point": "Time",
+        "automation_schedule_weekdays": "Weekdays",
+        "automation_schedule_interval_hours": "Run every N hours",
+        "automation_schedule_cron_expr": "Cron expression",
+        "automation_weekday_mon": "Mon",
+        "automation_weekday_tue": "Tue",
+        "automation_weekday_wed": "Wed",
+        "automation_weekday_thu": "Thu",
+        "automation_weekday_fri": "Fri",
+        "automation_weekday_sat": "Sat",
+        "automation_weekday_sun": "Sun",
+        "automation_create_task_submit": "Create Task",
+        "automation_create_task_pick_channel": "Please select at least one channel",
+        "automation_create_task_success": "Created {count} tasks",
+        "automation_create_task_skip_exists": "No tasks were created (they may already exist)",
+        "automation_task_next_run": "Next: {time}",
+        "automation_task_toggle_disable": "Disable",
+        "automation_task_toggle_enable": "Enable",
+        "automation_task_delete_help": "Delete task",
+        "automation_task_list_title": "##### 📝 Task List",
+        "automation_task_list_empty": "No tasks yet",
+        "automation_daily_tab": "📅 Daily Report",
+        "automation_manage_tab": "⚙️ Task Management",
+        "automation_header": "### 📡 Subscription Automation",
+        "automation_caption": "Manage subscriptions, update checks, and scheduled runs in one place.",
+        "automation_tab_subs": "📺 Subscriptions & Updates",
+        "automation_tab_rules": "⏰ Rules & Reports",
+        "automation_countdown_soon": "Starting soon",
+        "automation_countdown_day": "{count}d",
+        "automation_countdown_hour": "{count}h",
+        "automation_countdown_minute": "{count}m",
+        "automation_task_missing_channel": "Task skipped because the channel URL is missing",
+        "automation_task_missing_api": "API key is missing, so the summary cannot be generated",
+        "automation_task_run_done": "Task finished with {count} new videos",
+        "automation_task_retry_scheduled": "Task failed and will retry in 5 minutes ({retry}/3): {error}",
+        "automation_task_retry_exhausted": "Task failed and exceeded the maximum retry count: {error}",
+        "schedule_label_daily": "Daily {time}",
+        "schedule_label_weekly": "{days} {time}",
+        "schedule_label_interval": "Every {hours} hours",
+        "schedule_label_unset": "Not set",
+    },
+}
+
+
+def _get_request_headers() -> dict:
+    try:
+        return dict(st.context.headers or {})
+    except Exception:
+        return {}
+
+
+def _normalize_ui_locale(raw_locale: str) -> str:
+    normalized = str(raw_locale or "").strip().lower().replace("_", "-")
+    if normalized.startswith("zh"):
+        return "zh"
+    if normalized.startswith("en"):
+        return "en"
+    return ""
+
+
+def detect_browser_ui_locale() -> str:
+    headers = _get_request_headers()
+    accept_language = str(
+        headers.get("accept-language")
+        or headers.get("Accept-Language")
+        or ""
+    ).strip()
+    for token in accept_language.split(","):
+        locale = _normalize_ui_locale(token.split(";")[0])
+        if locale:
+            return locale
+    return UI_DEFAULT_LOCALE
+
+
+def get_ui_locale() -> str:
+    current = _normalize_ui_locale(st.session_state.get("ui_locale"))
+    if current:
+        return current
+    detected = detect_browser_ui_locale()
+    st.session_state.ui_locale = detected
+    return detected
+
+
+def t(key: str, **kwargs) -> str:
+    locale = get_ui_locale()
+    template = (
+        UI_TEXTS.get(locale, {}).get(key)
+        or UI_TEXTS[UI_DEFAULT_LOCALE].get(key)
+        or key
+    )
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
+
+
+def _automation_weekday_labels() -> list[str]:
+    return [
+        t("automation_weekday_mon"),
+        t("automation_weekday_tue"),
+        t("automation_weekday_wed"),
+        t("automation_weekday_thu"),
+        t("automation_weekday_fri"),
+        t("automation_weekday_sat"),
+        t("automation_weekday_sun"),
+    ]
+
+# --- 限流器初始化 ---
+rate_limiter = RateLimiter(max_daily=3)
+
+
+def get_client_ip() -> str:
+    """获取客户端 IP 地址，兼容 Render/Cloudflare/Nginx 代理。"""
+    try:
+        # Streamlit 1.35+ 推荐使用 st.context.headers
+        headers = _get_request_headers()
+        # 常见代理头
+        x_forwarded_for = headers.get("x-forwarded-for")
+        if x_forwarded_for:
+            return x_forwarded_for.split(",")[0].strip()
+        
+        # 针对部分特定环境的备选头
+        remote_addr = headers.get("remote-addr")
+        if remote_addr:
+            return remote_addr
+            
+        return "127.0.0.1"
+    except Exception:
+        return "unknown"
+
+
+def render_quota_status():
+    """渲染当前用户的配额状态。"""
+    if rate_limiter.is_owner(st.session_state.settings):
+        return
+        
+    client_ip = get_client_ip()
+    allowed, msg = rate_limiter.check_limit(client_ip)
+    
+    user_data = rate_limiter.limits.get(client_ip, {"count": 0})
+    count = user_data.get("count", 0)
+    remaining = max(0, rate_limiter.max_daily - count)
+    
+    if remaining > 0:
+        st.info(t("quota_remaining", remaining=remaining))
+    else:
+        st.warning(msg)
+
 
 extension_bridge_reader = components.declare_component(
     "extension_bridge_reader",
@@ -177,6 +1086,32 @@ def resolve_pipeline_models(
     return summary_model, fact_check_model
 
 
+def normalize_persisted_pipeline_settings(settings_dict: dict | None = None) -> dict:
+    """把 SiliconFlow 下的历史默认模型名归一为当前默认值，避免显示与实际运行不一致。"""
+    settings_dict = dict(settings_dict or {})
+    base_url_value = str(settings_dict.get("base_url") or "").strip()
+    if not _looks_like_siliconflow_base_url(base_url_value):
+        return settings_dict
+
+    normalized_summary, normalized_fact_check = resolve_pipeline_models(
+        settings_dict,
+        env={},
+        base_url_value=base_url_value,
+    )
+    changed = False
+    if str(settings_dict.get("summary_model") or "").strip() != normalized_summary:
+        settings_dict["summary_model"] = normalized_summary
+        changed = True
+    if str(settings_dict.get("fact_check_model") or "").strip() != normalized_fact_check:
+        settings_dict["fact_check_model"] = normalized_fact_check
+        changed = True
+    if not str(settings_dict.get("model") or "").strip():
+        settings_dict["model"] = normalized_summary
+        changed = True
+    settings_dict["_normalized_pipeline_models"] = changed
+    return settings_dict
+
+
 def format_pipeline_model_label(summary_model_name: str, fact_check_model_name: str) -> str:
     summary_model_name = str(summary_model_name or "").strip() or "unknown"
     fact_check_model_name = str(fact_check_model_name or "").strip() or summary_model_name
@@ -195,6 +1130,44 @@ def load_guestbook():
 
 def save_guestbook(guestbook):
     save_json_file(GUESTBOOK_FILE, guestbook)
+
+
+def append_guestbook_message(content: str):
+    guestbook = load_guestbook()
+    guestbook.insert(
+        0,
+        {
+            "id": str(uuid.uuid4()),
+            "timestamp": _iso(_now()),
+            "content": str(content or "").strip(),
+            "replies": [],
+        },
+    )
+    save_guestbook(guestbook)
+
+
+def append_guestbook_reply(message_id: str, reply_text: str) -> bool:
+    guestbook = load_guestbook()
+    updated = False
+    for item in guestbook:
+        if str(item.get("id") or "") != str(message_id or ""):
+            continue
+        replies = item.get("replies")
+        if not isinstance(replies, list):
+            replies = []
+            item["replies"] = replies
+        replies.append(
+            {
+                "id": str(uuid.uuid4()),
+                "timestamp": _iso(_now()),
+                "content": str(reply_text or "").strip(),
+            }
+        )
+        updated = True
+        break
+    if updated:
+        save_guestbook(guestbook)
+    return updated
 
 def load_feedback_reports():
     return load_json_file(FEEDBACK_FILE, [])
@@ -272,8 +1245,10 @@ def format_issue_diagnostics_text(snapshot: dict) -> str:
 def render_copy_to_clipboard_button(label: str, text: str, key: str) -> None:
     button_id = f"copy_btn_{re.sub(r'[^a-zA-Z0-9_]+', '_', key)}"
     status_id = f"{button_id}_status"
-    button_label = html.escape(str(label or "复制"))
+    button_label = html.escape(str(label or t("copy_button_default")))
     text_payload = json.dumps(str(text or ""), ensure_ascii=False)
+    copied_text = json.dumps(t("copy_button_done"), ensure_ascii=False)
+    failed_text = json.dumps(t("copy_button_failed"), ensure_ascii=False)
     components.html(
         f"""
         <div style="display:flex;align-items:center;gap:8px;margin:0.1rem 0 0.4rem 0;">
@@ -289,10 +1264,10 @@ def render_copy_to_clipboard_button(label: str, text: str, key: str) -> None:
           const clipboard = navigator.clipboard || (window.parent && window.parent.navigator && window.parent.navigator.clipboard);
           try {{
             await clipboard.writeText({text_payload});
-            status.textContent = "已复制";
+          status.textContent = {copied_text};
             setTimeout(() => status.textContent = "", 1500);
           }} catch (err) {{
-            status.textContent = "复制失败，请手动复制下方文本";
+          status.textContent = {failed_text};
           }}
         }});
         </script>
@@ -308,7 +1283,7 @@ def render_issue_report_box(
     extra: dict | None = None,
     key_prefix: str,
     expanded: bool = False,
-    box_title: str = "诊断与问题上报",
+    box_title: str | None = None,
 ) -> None:
     snapshot = build_issue_diagnostics_snapshot(
         context_label,
@@ -317,35 +1292,41 @@ def render_issue_report_box(
         extra=extra,
     )
     diag_text = format_issue_diagnostics_text(snapshot)
-    with st.expander(box_title, expanded=expanded):
-        st.caption("先复制诊断信息，再提交问题反馈；后续排查会更快。")
-        render_copy_to_clipboard_button("复制诊断信息", diag_text, f"{key_prefix}_copy")
+    with st.expander(box_title or t("issue_box_title"), expanded=expanded):
+        st.caption(t("issue_box_caption"))
+        render_copy_to_clipboard_button(t("issue_box_copy"), diag_text, f"{key_prefix}_copy")
         st.text_area(
-            "诊断信息预览",
+            t("issue_box_preview"),
             diag_text,
             height=180,
             key=f"{key_prefix}_diag_preview",
         )
         with st.form(f"{key_prefix}_feedback_form", clear_on_submit=True):
-            reporter = st.text_input("昵称", value="User", max_chars=20)
+            reporter = st.text_input(t("issue_box_reporter"), value="User", max_chars=20)
             issue_type = st.selectbox(
-                "问题类型",
-                ["提取失败", "总结失败", "事实核查问题", "版本/部署问题", "其他"],
+                t("issue_box_type"),
+                [
+                    t("issue_type_extract_failed"),
+                    t("issue_type_summary_failed"),
+                    t("issue_type_fact_check"),
+                    t("issue_type_version"),
+                    t("issue_type_other"),
+                ],
                 key=f"{key_prefix}_issue_type",
             )
             report_source_url = st.text_input(
-                "来源链接（可选）",
+                t("issue_box_source_url"),
                 value=str(source_url or ""),
                 key=f"{key_prefix}_source_url",
             )
             report_message = st.text_area(
-                "问题描述",
+                t("issue_box_message"),
                 value=str(error_text or ""),
                 height=120,
-                placeholder="请尽量描述你做了什么、预期是什么、实际发生了什么。",
+                placeholder=t("issue_box_message_placeholder"),
                 key=f"{key_prefix}_message",
             )
-            submitted = st.form_submit_button("提交问题")
+            submitted = st.form_submit_button(t("issue_box_submit"))
             if submitted:
                 append_feedback_report(
                     {
@@ -360,7 +1341,7 @@ def render_issue_report_box(
                         "diagnostics_text": diag_text,
                     }
                 )
-                st.success("问题已记录，可继续把上面的诊断信息直接发给我或测试群。")
+                st.success(t("issue_box_submit_success"))
 
 def read_extension_bridge_payload(payload_id: str, consume: bool = True) -> dict | None:
     """从主站同域 bridge storage 读取扩展预先写入的 transcript 载荷。"""
@@ -632,8 +1613,9 @@ def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
     except:
         pass
     
+    entry_id = str(uuid.uuid4())
     entry = {
-        "id": str(uuid.uuid4()),
+        "id": entry_id,
         "timestamp": _iso(_now()),
         "source_type": source_type, # 'single' or 'schedule'
         "video_url": video_url,
@@ -646,6 +1628,27 @@ def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
     if len(history) > 500:
         history = history[:500]
     save_history(history)
+    return entry_id
+
+
+def update_history_entry_summary(entry_id: str, summary_text: str) -> bool:
+    """按历史记录 ID 回写最新总结内容，用于补充异步完成的新闻核查结果。"""
+    normalized_entry_id = str(entry_id or "").strip()
+    if not normalized_entry_id:
+        return False
+
+    history = load_history()
+    updated = False
+    for entry in history:
+        if str(entry.get("id") or "").strip() != normalized_entry_id:
+            continue
+        entry["summary_text"] = str(summary_text or "")
+        updated = True
+        break
+
+    if updated:
+        save_history(history)
+    return updated
 
 
 def _extract_whisper_device_info(text: str) -> tuple[str, str]:
@@ -791,7 +1794,7 @@ def _split_fact_check_sections(fact_check_md: str) -> list[str]:
     if not text:
         return []
     parts = re.split(
-        r"(?=^(?:###\s*条目\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻)[:：]))",
+        r"(?=^(?:###\s*(?:条目|Item)\s*\d+|\d+\.\s*(?:新闻/声明|关键声明|声明|新闻|Claim|Statement|News Claim|News)[:：]))",
         text,
         flags=re.M,
     )
@@ -799,7 +1802,7 @@ def _split_fact_check_sections(fact_check_md: str) -> list[str]:
 
 
 def _parse_fact_check_section(section_text: str) -> dict[str, object]:
-    """解析单条事实核查，拆出标题、结论、依据、待补充项和来源。"""
+    """解析单条来源分析结果，拆出标题、来源状态、说明、后续建议和来源链接。"""
     section = str(section_text or "").strip()
     lines = [line.rstrip() for line in section.splitlines()]
     title = ""
@@ -809,47 +1812,53 @@ def _parse_fact_check_section(section_text: str) -> dict[str, object]:
     body_lines: list[str] = []
     source_lines: list[str] = []
     active_field = ""
+    generic_title_pattern = re.compile(r"^(?:条目|Item)\s*\d+$", re.I)
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            if active_field in {"rationale", "pending"}:
-                target = rationale_lines if active_field == "rationale" else pending_lines
+            if active_field in {"rationale", "pending", "source"}:
+                target = (
+                    rationale_lines
+                    if active_field == "rationale"
+                    else pending_lines
+                    if active_field == "pending"
+                    else source_lines
+                )
                 if target and target[-1] != "":
                     target.append("")
             continue
-        if not title:
-            claim_match = re.search(r"(?:新闻/声明|关键声明|声明|新闻)[:：]\s*(.+)", stripped)
-            if claim_match:
-                title = claim_match.group(1).strip()
-                active_field = ""
-                continue
-            elif stripped.startswith("###"):
-                title = stripped.lstrip("#").strip()
-                active_field = ""
-                continue
-        conclusion_match = re.search(r"核查结论[:：]\s*(.+)", stripped)
+        claim_match = re.search(r"(?:新闻/声明|关键声明|声明|新闻|Claim|Statement|News Claim|News)[:：]\s*(.+)", stripped, re.I)
+        if claim_match and (not title or generic_title_pattern.match(title)):
+            title = claim_match.group(1).strip()
+            active_field = ""
+            continue
+        if not title and stripped.startswith("###"):
+            title = stripped.lstrip("#").strip()
+            active_field = ""
+            continue
+        conclusion_match = re.search(r"(?:核查结论|来源定位|检索状态|Conclusion|Source Status)[:：]\s*(.+)", stripped, re.I)
         if conclusion_match and not conclusion:
             conclusion = conclusion_match.group(1).strip()
             active_field = ""
             continue
-        rationale_match = re.search(r"(?:判断依据|依据)[:：]\s*(.*)", stripped)
+        rationale_match = re.search(r"(?:判断依据|依据|来源线索说明|线索说明|Rationale|Source Notes)[:：]\s*(.*)", stripped, re.I)
         if rationale_match:
             rationale_text = rationale_match.group(1).strip()
             if rationale_text:
                 rationale_lines.append(rationale_text)
             active_field = "rationale"
             continue
-        pending_match = re.search(r"待补充核查点[:：]\s*(.*)", stripped)
+        pending_match = re.search(r"(?:待补充核查点|建议继续查看|后续建议|Follow-up Checks|Suggested Follow-ups)[:：]\s*(.*)", stripped, re.I)
         if pending_match:
             pending_text = pending_match.group(1).strip()
             if pending_text:
                 pending_lines.append(pending_text)
             active_field = "pending"
             continue
-        if re.search(r"来源(?:链接|/出处|出处)?[:：]", stripped):
+        if re.search(r"(?:来源(?:链接|/出处|出处)?|Sources?|Source Links?)[:：]", stripped, re.I):
             source_lines.append(stripped)
-            active_field = ""
+            active_field = "source"
             continue
         if active_field == "rationale":
             rationale_lines.append(stripped)
@@ -857,16 +1866,24 @@ def _parse_fact_check_section(section_text: str) -> dict[str, object]:
         if active_field == "pending":
             pending_lines.append(stripped)
             continue
+        if active_field == "source":
+            if re.match(r"^(?:[-*]\s+|\d+\.\s+|\[[^\]]+\]\(https?://)", stripped):
+                source_lines.append(stripped)
+                continue
+            active_field = ""
         body_lines.append(line)
 
     if not title:
-        title = "事实核查"
+        title = "来源分析"
 
-    source_links = _extract_markdown_links(section)
+    source_block = "\n".join(_dedupe_text_lines(source_lines)).strip()
+    source_links = _extract_markdown_links(source_block) if source_block else []
+    if not source_links:
+        source_links = _extract_markdown_links(section)
     body_markdown = "\n".join(body_lines).strip()
     rationale_markdown = "\n".join(line for line in rationale_lines).strip()
     pending_markdown = "\n".join(line for line in pending_lines).strip()
-    source_summary = "\n".join(source_lines).strip()
+    source_summary = source_block
     return {
         "title": title,
         "conclusion": conclusion,
@@ -876,6 +1893,16 @@ def _parse_fact_check_section(section_text: str) -> dict[str, object]:
         "source_links": source_links,
         "source_summary": source_summary,
     }
+
+
+def _call_with_optional_kwargs(func, /, *args, **kwargs):
+    """兼容热重载时旧函数对象暂未携带新增参数的情况。"""
+    try:
+        supported = set(inspect.signature(func).parameters.keys())
+    except Exception:
+        supported = set()
+    filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+    return func(*args, **filtered_kwargs)
 
 
 def _render_fact_check_label(label: str) -> None:
@@ -890,30 +1917,78 @@ def _render_fact_check_label(label: str) -> None:
     )
 
 
+def _normalize_fact_check_source_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        filtered_query_pairs = []
+        for key, value in parse_qsl(parsed.query or "", keep_blank_values=True):
+            lowered_key = str(key or "").strip().lower()
+            if not lowered_key:
+                continue
+            if (
+                lowered_key.startswith("utm_")
+                or lowered_key in {
+                    "ved", "ei", "usg", "at", "ref", "ref_src", "feature", "fbclid", "gclid",
+                    "igshid", "mc_cid", "mc_eid", "src", "source", "spm", "from", "mkt_tok",
+                }
+            ):
+                continue
+            filtered_query_pairs.append((key, value))
+        normalized_path = re.sub(r"/+$", "", parsed.path or "")
+        normalized_query = urlencode(filtered_query_pairs, doseq=True)
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), normalized_path, normalized_query, ""))
+    except Exception:
+        return raw
+
+
+def _dedupe_text_lines(lines: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        normalized = str(line or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
 def _render_source_links(source_links: list[tuple[str, str]]) -> None:
     """将来源列表渲染为简洁链接列表。"""
     deduped: list[tuple[str, str]] = []
     seen: set[str] = set()
     for label, url in source_links:
-        normalized = str(url or "").strip()
-        if not normalized or normalized in seen:
+        raw_url = str(url or "").strip()
+        normalized = _normalize_fact_check_source_url(raw_url)
+        if not raw_url or normalized in seen:
             continue
         seen.add(normalized)
-        deduped.append((str(label or "").strip() or normalized, normalized))
+        deduped.append((str(label or "").strip() or raw_url, raw_url))
     if not deduped:
-        st.caption("当前未提取到可点击的核查来源。")
+        st.caption(t("fact_check_sources_missing"))
         return
-    _render_fact_check_label("来源/出处")
+    _render_fact_check_label(t("fact_check_label_sources"))
     source_lines = [f"- [{label}]({url})" for label, url in deduped[:12]]
     st.markdown("\n".join(source_lines))
 
 
-def render_fact_check_content(fact_check_md: str, *, fact_title: str = "🕵️ 事实核查") -> None:
-    """渲染简洁版事实核查正文与来源链接。"""
+def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = None) -> None:
+    """渲染以来源链接为中心的来源分析结果。"""
     text = str(fact_check_md or "").strip()
     if not text:
         return
-    st.markdown(f"### {fact_title}")
+    st.markdown(
+        (
+            "<div class='summary-workspace-title'>"
+            "<span class='summary-workspace-kicker'>核</span>"
+            f"<span>{html.escape(fact_title or t('fact_check_title'))}</span>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
     sections = _split_fact_check_sections(text)
     if not sections:
@@ -924,65 +1999,89 @@ def render_fact_check_content(fact_check_md: str, *, fact_title: str = "🕵️ 
         parsed = _parse_fact_check_section(section)
         title = str(parsed.get("title") or f"条目 {idx}")
         conclusion = str(parsed.get("conclusion") or "").strip()
-        st.markdown(f"#### {title}")
+        st.markdown("<div class='fact-check-item'>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='fact-check-item-title'>{idx}. {html.escape(title)}</div>",
+            unsafe_allow_html=True,
+        )
         if conclusion:
             st.markdown(
-                (
-                    "<div style='margin:0.25rem 0 0.75rem 0;padding:0.6rem 0.8rem;"
-                    "border:1px solid #d0d7de;border-radius:0.75rem;background:#f6f8fa;'>"
-                    "<div style='font-size:0.8rem;font-weight:600;color:#57606a;margin-bottom:0.2rem;'>核查结论</div>"
-                    f"<div style='color:#24292f;'>{html.escape(conclusion)}</div>"
-                    "</div>"
-                ),
+                f"<div class='fact-check-status-chip'>{html.escape(conclusion)}</div>",
                 unsafe_allow_html=True,
             )
-        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
-        if rationale_markdown:
-            _render_fact_check_label("判断依据")
-            st.markdown(rationale_markdown)
-        pending_markdown = str(parsed.get("pending_markdown") or "").strip()
-        if pending_markdown:
-            _render_fact_check_label("待补充核查点")
-            st.markdown(pending_markdown)
-        body_markdown = str(parsed.get("body_markdown") or "").strip()
-        if body_markdown:
-            st.markdown(body_markdown)
         _render_source_links(list(parsed.get("source_links") or []))
         source_summary = str(parsed.get("source_summary") or "").strip()
         if source_summary and not parsed.get("source_links"):
             st.caption(source_summary)
-        if idx < len(sections):
-            st.divider()
+        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
+        if rationale_markdown:
+            _render_fact_check_label(t("fact_check_label_rationale"))
+            st.markdown(rationale_markdown)
+        pending_markdown = str(parsed.get("pending_markdown") or "").strip()
+        if pending_markdown:
+            _render_fact_check_label(t("fact_check_label_pending"))
+            st.markdown(pending_markdown)
+        body_markdown = str(parsed.get("body_markdown") or "").strip()
+        if body_markdown:
+            st.markdown(body_markdown)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_summary_fact_check(
     summary_md: str,
     fact_check_md: str,
     *,
-    fact_title: str = "🕵️ 事实核查",
-    summary_tab_label: str = "📝 核心总结",
-    fact_tab_label: str = "🕵️ 事实核查",
+    fact_title: str | None = None,
+    summary_tab_label: str | None = None,
+    fact_tab_label: str | None = None,
 ) -> None:
     """统一渲染总结与事实核查，优先使用同页左右布局。"""
     has_fact_check = bool(str(fact_check_md or "").strip())
+    resolved_summary_tab_label = summary_tab_label or t("summary_tab_label")
+    resolved_fact_title = fact_title or t("fact_check_title")
     if not has_fact_check:
-        st.markdown(f"### {summary_tab_label}")
-        st.markdown(summary_md)
+        with st.container(border=True):
+            st.markdown(
+                (
+                    "<div class='summary-workspace-title'>"
+                    "<span class='summary-workspace-kicker'>摘</span>"
+                    f"<span>{html.escape(resolved_summary_tab_label)}</span>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(summary_md)
         return
 
+    st.markdown("<div class='summary-fact-workspace'>", unsafe_allow_html=True)
     col_sum, col_check = st.columns([1.15, 0.95], gap="large")
     with col_sum:
-        st.markdown(f"### {summary_tab_label}")
-        st.markdown(summary_md)
+        with st.container(border=True):
+            st.markdown("<div class='summary-workspace-panel'>", unsafe_allow_html=True)
+            st.markdown(
+                (
+                    "<div class='summary-workspace-title'>"
+                    "<span class='summary-workspace-kicker'>摘</span>"
+                    f"<span>{html.escape(resolved_summary_tab_label)}</span>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(summary_md)
+            st.markdown("</div>", unsafe_allow_html=True)
     with col_check:
-        render_fact_check_content(fact_check_md, fact_title=fact_title)
+        with st.container(border=True):
+            st.markdown("<div class='summary-workspace-panel fact-workspace-panel'>", unsafe_allow_html=True)
+            render_fact_check_content(fact_check_md, fact_title=resolved_fact_title)
+            st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_summary_content(
     summary_content: str,
     *,
-    fact_title: str = "🕵️ 事实核查",
-    fact_tab_label: str = "🕵️ 事实核查",
+    fact_title: str = "🕵️ 来源导航",
+    fact_tab_label: str = "🕵️ 来源导航",
 ) -> None:
     """
     统一处理总结内容展示，兼容结构化 JSON 总结和旧版纯文本总结。
@@ -997,6 +2096,27 @@ def render_summary_content(
         )
     else:
         st.markdown(summary_content)
+
+
+def render_browser_title_status(status: str, *, running_title: str, done_title: str) -> None:
+    """更新浏览器标签页标题，方便用户离开页面后看到后台任务状态。"""
+    status_value = str(status or "").strip().lower()
+    if status_value in {"queued", "running"}:
+        title = running_title
+    elif status_value == "success":
+        title = done_title
+    else:
+        title = "YouTube Summarizer"
+    components.html(
+        f"""
+        <script>
+        try {{
+          window.parent.document.title = {json.dumps(title, ensure_ascii=False)};
+        }} catch (error) {{}}
+        </script>
+        """,
+        height=0,
+    )
 
 
 def update_settings_partial(patch):
@@ -1190,13 +2310,13 @@ def _trim_schedule_records(runs, run_items, max_runs=200, max_items=1000):
 
 def _format_run_status(status):
     status_map = {
-        "success": "成功",
-        "partial": "部分成功",
-        "failed": "失败",
-        "no_update": "无新增",
-        "running": "进行中",
+        "success": t("status_success"),
+        "partial": t("status_partial"),
+        "failed": t("status_failed"),
+        "no_update": t("status_no_update"),
+        "running": t("status_in_progress"),
     }
-    return status_map.get(status or "", "未知")
+    return status_map.get(status or "", t("status_unknown"))
 
 def _format_time_label(dt_value):
     if not dt_value:
@@ -1287,7 +2407,7 @@ def _run_task_once(task, settings):
         base_url_value=str(settings.get("base_url") or ""),
     )
     if not channel_url:
-        _append_log(logs, "error", "任务缺少频道链接，已跳过", task.get("id"))
+        _append_log(logs, "error", t("automation_task_missing_channel"), task.get("id"))
         settings["schedule_logs"] = logs
         return settings
     max_items = int(task.get("max_items") or 5)
@@ -1353,19 +2473,21 @@ def _run_task_once(task, settings):
                 continue
             if not api_key:
                 item_record["status"] = "failed"
-                item_record["error"] = "缺少 API Key，无法生成总结"
+                item_record["error"] = t("automation_task_missing_api")
                 item_record["duration_seconds"] = int((_now() - item_start).total_seconds())
                 run_entry["failed_items"] += 1
                 run_items.append(item_record)
                 continue
             try:
-                summary = summarize_text(
+                summary = _call_with_optional_kwargs(
+                    summarize_text,
                     text,
                     api_key,
                     base_url,
                     summary_model_name,
                     eff_proxy,
                     fact_check_model=fact_check_model_name,
+                    ui_locale=get_ui_locale(),
                 )
                 item_record["status"] = "success"
                 item_record["summary"] = summary
@@ -1394,7 +2516,12 @@ def _run_task_once(task, settings):
             run_entry["status"] = "failed"
         else:
             run_entry["status"] = "partial"
-        _append_log(logs, "info", f"任务执行完成，新增 {run_entry.get('new_items') or 0} 个视频", task.get("id"))
+        _append_log(
+            logs,
+            "info",
+            t("automation_task_run_done", count=run_entry.get("new_items") or 0),
+            task.get("id"),
+        )
         task["last_error"] = ""
         task["retry_count"] = 0
         task["next_retry_at"] = ""
@@ -1407,10 +2534,20 @@ def _run_task_once(task, settings):
         if retry_count <= 3:
             next_retry = _now() + timedelta(minutes=5)
             task["next_retry_at"] = _iso(next_retry)
-            _append_log(logs, "warning", f"任务失败，将在 5 分钟后重试({retry_count}/3)：{e}", task.get("id"))
+            _append_log(
+                logs,
+                "warning",
+                t("automation_task_retry_scheduled", retry=retry_count, error=e),
+                task.get("id"),
+            )
         else:
             task["next_retry_at"] = ""
-            _append_log(logs, "error", f"任务失败并超过最大重试次数：{e}", task.get("id"))
+            _append_log(
+                logs,
+                "error",
+                t("automation_task_retry_exhausted", error=e),
+                task.get("id"),
+            )
         run_entry["status"] = "failed"
         run_entry["error"] = str(e)
     run_entry["finished_at"] = _iso(_now())
@@ -1500,32 +2637,32 @@ def _format_countdown(target_time):
     delta = target_time - now
     total_seconds = int(delta.total_seconds())
     if total_seconds <= 0:
-        return "即将执行"
+        return t("automation_countdown_soon")
     days = total_seconds // 86400
     hours = (total_seconds % 86400) // 3600
     minutes = (total_seconds % 3600) // 60
     parts = []
     if days > 0:
-        parts.append(f"{days}天")
+        parts.append(t("automation_countdown_day", count=days))
     if hours > 0:
-        parts.append(f"{hours}小时")
-    parts.append(f"{minutes}分")
+        parts.append(t("automation_countdown_hour", count=hours))
+    parts.append(t("automation_countdown_minute", count=minutes))
     return "".join(parts)
 
 def _format_schedule_label(task):
     schedule_type = (task.get("schedule_type") or "").lower()
     if schedule_type == "daily":
-        return f"每天 {task.get('time')}"
+        return t("schedule_label_daily", time=task.get("time"))
     if schedule_type == "weekly":
         weekdays = task.get("weekdays") or []
-        labels = ["周一","周二","周三","周四","周五","周六","周日"]
+        labels = _automation_weekday_labels()
         day_text = "、".join([labels[i] for i in weekdays if isinstance(i, int) and 0 <= i <= 6])
-        return f"{day_text} {task.get('time')}"
+        return t("schedule_label_weekly", days=day_text, time=task.get("time"))
     if schedule_type == "interval":
-        return f"每 {task.get('interval_hours')} 小时"
+        return t("schedule_label_interval", hours=task.get("interval_hours"))
     if schedule_type == "cron":
         return f"Cron: {task.get('cron')}"
-    return "未设置"
+    return t("schedule_label_unset")
 
 def _build_month_calendar(tasks):
     now = _now()
@@ -1559,59 +2696,358 @@ def _build_month_calendar(tasks):
 # --- 页面配置 ---
 st.set_page_config(
     page_title="YouTube Summarizer",
-    page_icon="🎬",
+    page_icon="📺",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# --- 界面美化 CSS ---
 st.markdown(
     """
     <style>
+    /* 全局容器优化 */
     .block-container {
-        padding-left: 1.5rem;
-        padding-right: 1.5rem;
+        padding-top: 0.75rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
         max-width: 1400px;
     }
-    div[data-testid="stMarkdownContainer"],
-    div[data-testid="stMarkdownContainer"] p,
-    div[data-testid="stMarkdownContainer"] li,
-    div[data-testid="stMarkdownContainer"] a,
-    div[data-testid="stMarkdownContainer"] code {
+
+    [data-testid="stToolbar"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"],
+    .stDeployButton {
+        display: none !important;
+    }
+    
+    /* 标题样式 */
+    h1, h2, h3 {
+        font-family: 'Inter', sans-serif;
+        font-weight: 700 !important;
+        color: #1E1E1E;
+    }
+    
+    /* 顶部 Hero 区域 */
+    .lite-home-hero {
+        text-align: center;
+        margin: 4.5rem auto 1.2rem auto;
+        max-width: 800px;
+        padding: 2.5rem;
+        background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
+        border-radius: 32px;
+        box-shadow: 0 20px 40px rgba(0,0,0,0.05);
+    }
+    
+    .lite-home-hero h1 {
+        font-size: 3rem !important;
+        background: linear-gradient(45deg, #FF0000, #CC0000);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.5rem;
+        font-weight: 800 !important;
+    }
+    
+    .lite-home-hero p {
+        color: #666;
+        font-size: 1.2rem;
+        margin-top: 1rem;
+    }
+
+    .lite-search-meta {
+        max-width: 1040px;
+        margin: 0.45rem auto 0.7rem auto;
+        text-align: center;
+        color: #7a7a7a;
+        font-size: 0.93rem;
+    }
+
+    .lite-entry-card {
+        padding: 0.15rem 0.1rem;
+    }
+
+    .lite-entry-card-title {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #1f2937;
+        margin-bottom: 0.35rem;
+    }
+
+    .lite-entry-card-desc {
+        color: #667085;
+        font-size: 0.93rem;
+        line-height: 1.65;
+        margin: 0;
+    }
+
+    .summary-section-title {
+        margin-bottom: 0.3rem;
+    }
+
+    .summary-section-meta {
+        color: #6b7280;
+        font-size: 0.92rem;
+        margin: -0.15rem 0 0.35rem 0;
+    }
+
+    .summary-fact-workspace {
+        margin-top: 0.25rem;
+    }
+
+    .summary-workspace-panel {
+        min-height: 0;
+        padding: 0.15rem 0.05rem;
+    }
+
+    .summary-workspace-title {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        margin-bottom: 0.65rem;
+        font-size: 1.05rem;
+        font-weight: 750;
+        color: #111827;
+    }
+
+    .summary-workspace-kicker {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.7rem;
+        height: 1.7rem;
+        border-radius: 8px;
+        background: #fff1f2;
+        color: #be123c;
+        font-size: 0.92rem;
+        font-weight: 800;
+    }
+
+    .fact-workspace-panel {
+        position: static;
+    }
+
+    .fact-check-item {
+        padding: 0.85rem 0;
+        border-top: 1px solid #edf0f3;
+    }
+
+    .fact-check-item:first-of-type {
+        border-top: 0;
+        padding-top: 0.2rem;
+    }
+
+    .fact-check-item-title {
+        margin: 0 0 0.45rem 0;
+        font-size: 0.98rem;
+        line-height: 1.45;
+        font-weight: 720;
+        color: #111827;
+    }
+
+    .fact-check-status-chip {
+        display: inline-flex;
+        margin: 0.15rem 0 0.45rem 0;
+        padding: 0.2rem 0.5rem;
+        border-radius: 999px;
+        background: #eef6ff;
+        color: #155e75;
+        font-size: 0.78rem;
+        font-weight: 700;
+        border: 1px solid #d8ecff;
+    }
+
+    .st-key-input_url {
+        max-width: 1040px;
+        margin: 0.2rem auto 0.1rem auto;
+    }
+
+    .st-key-input_url input {
+        min-height: 4rem !important;
+        font-size: 1.02rem !important;
+        font-weight: 500 !important;
+        padding-left: 1.35rem !important;
+        padding-right: 1.35rem !important;
+        border-radius: 999px !important;
+        border: 1px solid #e8e8e8 !important;
+        background: #ffffff !important;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06) !important;
+    }
+
+    .st-key-input_url input:focus {
+        border-color: #ff7d7f !important;
+        background: #ffffff !important;
+        box-shadow: 0 0 0 4px rgba(255, 125, 127, 0.1), 0 12px 28px rgba(255, 125, 127, 0.08) !important;
+    }
+
+    .wish-wall-shell {
+        margin-top: 0.8rem;
+    }
+
+    .wish-wall-intro {
+        padding: 1rem 1.1rem;
+        border-radius: 18px;
+        background: linear-gradient(180deg, #fffef7 0%, #fff9eb 100%);
+        border: 1px solid #f3e8c8;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+        margin-bottom: 1rem;
+    }
+
+    .wish-note {
+        min-height: 220px;
+        padding: 1rem 1rem 0.85rem 1rem;
+        border-radius: 18px;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+        margin-bottom: 1rem;
+        border: 1px solid rgba(0, 0, 0, 0.05);
+    }
+
+    .wish-note-yellow {
+        background: linear-gradient(180deg, #fff8b8 0%, #fff29b 100%);
+    }
+
+    .wish-note-pink {
+        background: linear-gradient(180deg, #ffe1ea 0%, #ffd2df 100%);
+    }
+
+    .wish-note-blue {
+        background: linear-gradient(180deg, #ddefff 0%, #cfe7ff 100%);
+    }
+
+    .wish-note-green {
+        background: linear-gradient(180deg, #e2f7d9 0%, #d6f0ca 100%);
+    }
+
+    .wish-note-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #6b5b2a;
+        font-size: 0.85rem;
+        margin-bottom: 0.55rem;
+    }
+
+    .wish-note-body {
+        color: #2f2f2f;
+        font-size: 1rem;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+        margin-bottom: 0.8rem;
+    }
+
+    .wish-note-reply-count {
+        color: #666;
+        font-size: 0.83rem;
+    }
+
+    .lite-settings-card {
+        padding: 1.1rem 1.15rem;
+        border-radius: 18px;
+        background: linear-gradient(180deg, #ffffff 0%, #fafafa 100%);
+        border: 1px solid #f0f0f0;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+        margin-bottom: 1rem;
+    }
+    
+    /* 任务提示框 */
+    .lite-home-task-tip {
+        background-color: #f0f7ff;
+        border-left: 4px solid #FF0000;
+        padding: 1rem;
+        border-radius: 12px;
+        margin: 1.5rem 0;
+        font-size: 0.95rem;
+        color: #333;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+    }
+    
+    /* 按钮美化 */
+    .stButton > button {
+        border-radius: 16px !important;
+        padding: 0.6rem 2.5rem !important;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        font-weight: 600 !important;
+        border: none !important;
+        background: #FF0000 !important;
+        color: white !important;
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 20px rgba(255, 0, 0, 0.3);
+        background: #CC0000 !important;
+    }
+    
+    /* 输入框美化 */
+    .stTextInput > div > div > input {
+        border-radius: 16px !important;
+        padding: 1rem 1.5rem !important;
+        border: 2px solid #EEE !important;
+        transition: all 0.3s ease !important;
+        font-size: 1.1rem !important;
+    }
+    
+    .stTextInput > div > div > input:focus {
+        border-color: #FF0000 !important;
+        box-shadow: 0 0 0 4px rgba(255, 0, 0, 0.1) !important;
+    }
+    
+    /* 选项卡样式 */
+    div[data-testid="stTabs"] button[role="tab"] {
+        font-size: 1.1rem !important;
+        font-weight: 600 !important;
+        padding: 0.8rem 2rem !important;
+        border-radius: 12px 12px 0 0 !important;
+    }
+    
+    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+        color: #FF0000 !important;
+        border-bottom-color: #FF0000 !important;
+    }
+    
+    /* 侧边栏美化 */
+    section[data-testid="stSidebar"] {
+        background-color: #F8F9FA;
+        border-right: 1px solid #EEE;
+    }
+    
+    /* 文件上传区域 */
+    div[data-testid="stFileUploaderDropzone"] {
+        border-radius: 20px !important;
+        border: 2px dashed #DDD !important;
+        padding: 2rem !important;
+    }
+    
+    /* 文本溢出处理 */
+    div[data-testid="stMarkdownContainer"] {
         overflow-wrap: anywhere;
         word-break: break-word;
-        white-space: normal;
     }
-    div[data-testid="stTabs"] button[role="tab"] {
-        white-space: normal;
+    
+    .st-key-btn_single_sum,
+    .st-key-btn_single_check {
+        max-width: 200px;
+        margin: 0 auto;
     }
-    div[data-testid="stFileUploader"] > label {
-        display: none;
+    
+    .lite-home-helper {
+        text-align: center;
+        margin: 0.85rem auto 0 auto;
+        max-width: 720px;
+        font-size: 0.92rem;
+        color: #5f6368;
     }
-    div[data-testid="stFileUploaderDropzone"] {
-        padding: 0.9rem 1rem;
-    }
-    div[data-testid="stFileUploaderDropzone"] > div {
-        flex-wrap: wrap;
-        row-gap: 0.6rem;
-    }
-    div[data-testid="stFileUploaderDropzoneInstructions"] {
-        min-width: 0;
-        flex: 1 1 260px;
-    }
-    div[data-testid="stFileUploaderDropzone"] button {
-        white-space: nowrap;
-    }
+    
     @media (max-width: 900px) {
         .block-container {
             padding-left: 0.85rem;
             padding-right: 0.85rem;
         }
-        div[data-testid="stFileUploaderDropzone"] > div {
-            flex-direction: column;
-            align-items: stretch;
+        .lite-home-hero {
+            margin-top: 2.2rem;
+            margin-bottom: 1rem;
         }
-        div[data-testid="stFileUploaderDropzone"] button {
-            width: 100%;
+        .lite-home-hero h1 {
+            font-size: 1.85rem;
         }
     }
     </style>
@@ -1622,6 +3058,12 @@ st.markdown(
 # --- Session State 初始化 ---
 if "settings" not in st.session_state:
     st.session_state.settings = load_settings()
+normalized_settings = normalize_persisted_pipeline_settings(st.session_state.settings)
+if normalized_settings.pop("_normalized_pipeline_models", False):
+    st.session_state.settings = normalized_settings
+    save_settings(normalized_settings)
+else:
+    st.session_state.settings = normalized_settings
 
 if "subscriptions" not in st.session_state:
     st.session_state.subscriptions = load_subscriptions()
@@ -1679,6 +3121,10 @@ if "video_extension_request_id" not in st.session_state:
     st.session_state.video_extension_request_id = ""
 if "video_extension_request_component_key" not in st.session_state:
     st.session_state.video_extension_request_component_key = ""
+if "video_extension_allow_local_fallback" not in st.session_state:
+    st.session_state.video_extension_allow_local_fallback = False
+if "video_extension_local_fallback_attempted" not in st.session_state:
+    st.session_state.video_extension_local_fallback_attempted = False
 if "current_video_url" not in st.session_state:
     st.session_state.current_video_url = ""
 if "video_extension_auto_summary_pending" not in st.session_state:
@@ -1687,6 +3133,16 @@ if "video_extension_auto_summary_url" not in st.session_state:
     st.session_state.video_extension_auto_summary_url = ""
 if "video_extension_auto_summary_fetch_duration" not in st.session_state:
     st.session_state.video_extension_auto_summary_fetch_duration = 0.0
+if "video_auto_fetch_pending" not in st.session_state:
+    st.session_state.video_auto_fetch_pending = False
+if "video_auto_fetch_url" not in st.session_state:
+    st.session_state.video_auto_fetch_url = ""
+if "video_auto_fetch_route" not in st.session_state:
+    st.session_state.video_auto_fetch_route = ""
+if "video_auto_fetch_last_signature" not in st.session_state:
+    st.session_state.video_auto_fetch_last_signature = ""
+if "current_processing_task" not in st.session_state:
+    st.session_state.current_processing_task = {}
 if "video_fact_check_task_id" not in st.session_state:
     st.session_state.video_fact_check_task_id = ""
 if "video_fact_check_status" not in st.session_state:
@@ -1771,6 +3227,8 @@ def reset_video_fact_check_state(prefix: str = "video_fact_check") -> None:
     st.session_state[_fact_check_state_key(prefix, "url")] = ""
     st.session_state[_fact_check_state_key(prefix, "applied_task_id")] = ""
     st.session_state[_fact_check_state_key(prefix, "note")] = ""
+    st.session_state[_fact_check_state_key(prefix, "success_toast_task_id")] = ""
+    st.session_state[_fact_check_state_key(prefix, "shown_success_toast_task_id")] = ""
 
 
 def _is_supported_video_source_url(url: str) -> bool:
@@ -1784,14 +3242,13 @@ def _is_supported_video_source_url(url: str) -> bool:
             "youtube.com/shorts/",
             "youtube.com/live/",
             "youtu.be/",
-            "bilibili.com/video/",
-            "b23.tv/",
         )
     )
 
 # --- 后台硬编码/环境变量配置 (对外隐藏设置) ---
 proxy_input = os.environ.get("PROXY_URL", st.session_state.settings.get("proxy", ""))
-use_system_proxy = False
+# On Windows, prefer the configured system proxy when no explicit proxy is set.
+use_system_proxy = (os.name == "nt") and (not str(proxy_input or "").strip())
 languages = "zh-Hans,zh-Hant,zh-TW,zh,en,ja,ko"
 cookies_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
 cookies_content = os.environ.get("YTDLP_COOKIES_CONTENT", "")
@@ -1827,6 +3284,7 @@ ext_payload_id = str(query_params.get("ext_payload_id", "") or "").strip()
 ext_source_url = str(query_params.get("ext_source_url", "") or "").strip()
 ext_transcript = str(query_params.get("ext_transcript", "") or "").strip()
 ext_autosubmit = str(query_params.get("ext_autosubmit", "") or "").strip().lower() in {"1", "true", "yes"}
+ext_route = str(query_params.get("ext_route", "") or "").strip().lower()
 bridge_payload_waiting = False
 bridge_payload_error = ""
 
@@ -1834,19 +3292,36 @@ if ext_source_url and not st.session_state.manual_source_url:
     st.session_state.manual_source_url = ext_source_url
     st.session_state.prefer_paste_tab = True
 
+if ext_source_url:
+    st.session_state.current_video_url = ext_source_url
+
+auto_fetch_signature = f"{ext_route}|{ext_source_url}"
+if (
+    ext_source_url
+    and ext_autosubmit
+    and not ext_payload_id
+    and ext_route in {"server_direct", "local_direct", "extension"}
+    and st.session_state.video_auto_fetch_last_signature != auto_fetch_signature
+):
+    st.session_state.video_auto_fetch_pending = True
+    st.session_state.video_auto_fetch_url = ext_source_url
+    st.session_state.video_auto_fetch_route = ext_route
+    st.session_state.video_auto_fetch_last_signature = auto_fetch_signature
+
 if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id:
     # 新一轮扩展导入开始时先清掉上一轮 bridge 元信息，避免残留“本地节点/兜底”说明。
     st.session_state.manual_bridge_meta = {}
 
 if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id and not ext_transcript:
     bridge_payload, bridge_payload_error = wait_for_extension_bridge_payload(ext_payload_id)
-    if not bridge_payload and bridge_payload_error != "payload_not_found":
+    if not bridge_payload:
         bridge_payload = read_extension_bridge_payload(ext_payload_id, consume=True)
     normalized_bridge_payload = normalize_extension_bridge_payload(bridge_payload)
     bridge_transcript = str(normalized_bridge_payload.get("transcript_text") or "").strip()
     if bridge_transcript:
         ext_transcript = bridge_transcript
         ext_source_url = str(normalized_bridge_payload.get("source_url") or ext_source_url).strip()
+        st.session_state.last_transcript_acquisition_path = "extension_bridge_payload"
         st.session_state.manual_bridge_meta = {
             "payload_id": str(normalized_bridge_payload.get("payload_id") or ext_payload_id).strip(),
             "bridge_version": int(normalized_bridge_payload.get("bridge_version") or 1),
@@ -1861,6 +3336,7 @@ if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id 
         bridge_payload_waiting = True
 
 if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id != ext_payload_id:
+    st.session_state.last_transcript_acquisition_path = "extension_bridge_payload"
     st.session_state.manual_source_url = ext_source_url
     st.session_state.manual_transcript_text = ext_transcript
     st.session_state.manual_summary_text = ""
@@ -1886,11 +3362,12 @@ video_extension_payload_id = st.session_state.get("video_extension_payload_id") 
 video_extension_last_payload_id = st.session_state.get("video_extension_last_payload_id") or ""
 if video_extension_payload_id and video_extension_payload_id != video_extension_last_payload_id:
     video_bridge_payload, video_bridge_payload_error = wait_for_extension_bridge_payload(video_extension_payload_id)
-    if not video_bridge_payload and video_bridge_payload_error != "payload_not_found":
+    if not video_bridge_payload:
         video_bridge_payload = read_extension_bridge_payload(video_extension_payload_id, consume=True)
     normalized_video_bridge_payload = normalize_extension_bridge_payload(video_bridge_payload)
     video_bridge_transcript = str(normalized_video_bridge_payload.get("transcript_text") or "").strip()
     if video_bridge_transcript:
+        st.session_state.last_transcript_acquisition_path = "extension_bridge_payload"
         st.session_state.video_fact_check_task_id = ""
         st.session_state.video_fact_check_status = "idle"
         st.session_state.video_fact_check_error = ""
@@ -1932,23 +3409,20 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
 
 
 # --- 主界面 ---
-st.title("🎬 Video Summarizer")
-st.caption("本地运行的视频字幕抓取与 AI 总结工具 | 支持 YouTube & Bilibili | 插件优先字幕提取")
+st.title(t("main_title"))
+st.caption(t("main_caption"))
 
-# 一级导航：按用户任务而不是输入形态组织页面。
-tab_processing, tab_tasks, tab_automation, tab_library, tab_settings = st.tabs([
-    "🧭 处理中心",
-    "📋 任务中心",
-    "📡 订阅自动化",
-    "🗂️ 内容资产库",
-    "🛠️ 设置与诊断",
+# Lite 一级导航：突出立即总结，其他能力下沉。
+tab_home, tab_history, tab_wishwall, tab_settings = st.tabs([
+    t("tab_home"),
+    t("tab_history"),
+    t("tab_wishwall"),
+    t("tab_settings"),
 ])
 
 # --- 通用逻辑函数 (供两个 Tab 使用) ---
-def internal_fetch_transcript(video_url, progress_callback=None):
-    """
-    核心抓取逻辑，返回 (transcript_text, error_msg)
-    """
+def fetch_transcript_via_shared_service(video_url, progress_callback=None):
+    """主站输入和插件失败兜底共用的服务端字幕抓取链路，不启用本地转写。"""
     try:
         def is_html_like_text(text: str) -> bool:
             if not text:
@@ -1976,7 +3450,8 @@ def internal_fetch_transcript(video_url, progress_callback=None):
         setattr(api, "_cookies_content", cookies_content)
         setattr(api, "_cookies_content_b64", cookies_content_b64)
         setattr(api, "_cookies_from_browser", cookies_browser if auto_cookies else "")
-        setattr(api, "_asr_enabled", asr_enabled)
+        setattr(api, "_asr_enabled", False)
+        setattr(api, "_disable_audio_transcribe_override", True)
         setattr(api, "_asr_model", asr_model) # 传递用户选择的 model
         setattr(api, "_asr_language", "auto")
         setattr(api, "_asr_fast_mode", asr_fast_mode)
@@ -2005,9 +3480,18 @@ def internal_fetch_transcript(video_url, progress_callback=None):
         elapsed = t1 - t0
         
         if progress_callback: progress_callback(100, f"抓取完成！耗时: {elapsed:.1f}s")
+        st.session_state.last_transcript_acquisition_path = "shared_service_no_asr"
         return text, None
     except Exception as e:
         return None, format_error(e)
+
+
+def internal_fetch_transcript(video_url, progress_callback=None):
+    """
+    核心抓取逻辑，返回 (transcript_text, error_msg)。
+    当前仅代理到统一服务端字幕链路，供主站输入和插件失败兜底复用。
+    """
+    return fetch_transcript_via_shared_service(video_url, progress_callback)
 
 def internal_summarize(
     text,
@@ -2024,8 +3508,20 @@ def internal_summarize(
         """
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
-        eff_proxy = proxy_override or proxy_input
+        eff_proxy = (
+            str(proxy_override or "").strip()
+            if proxy_override is not None
+            else get_effective_proxy(proxy_input, use_system_proxy)[0]
+        )
         
+        # --- 限流检查 ---
+        client_ip = get_client_ip()
+        is_owner = rate_limiter.is_owner(st.session_state.settings)
+        if not is_owner:
+            allowed, msg = rate_limiter.check_limit(client_ip)
+            if not allowed:
+                return None, msg
+
         if not eff_api_key:
             return None, "请在侧边栏填写 API Key"
         try:
@@ -2036,7 +3532,8 @@ def internal_summarize(
                 f"fact_check_model={fact_check_model_name}, "
                 f"enable_fact_check={bool(enable_fact_check)}"
             , flush=True)
-            summary = summarize_text(
+            summary = _call_with_optional_kwargs(
+                summarize_text,
                 text,
                 eff_api_key,
                 eff_base_url,
@@ -2044,8 +3541,19 @@ def internal_summarize(
                 eff_proxy,
                 fact_check_model=fact_check_model_name,
                 enable_fact_check=enable_fact_check,
+                ui_locale=get_ui_locale(),
                 stream=False  # 后台任务默认不使用流式
             )
+            summary_text = str(summary or "").strip()
+            if not summary_text:
+                return None, "总结结果为空，请稍后重试"
+            if summary_text.startswith("总结失败：") or summary_text.startswith("请填写 API Key"):
+                return None, summary_text
+            
+            # 总结成功，增加限流计数
+            if not is_owner:
+                rate_limiter.increment(client_ip)
+                
             return summary, None
         except Exception as e:
             return None, str(e)
@@ -2087,6 +3595,7 @@ def start_video_fact_check_async(
     *,
     summary_state_key: str = "summary_text",
     state_prefix: str = "video_fact_check",
+    history_entry_state_key: str = "video_history_entry_id",
 ) -> None:
     summary_md, _fact_md = _parse_summary_for_ui(summary_content)
     transcript_value = str(transcript_text or "").strip()
@@ -2112,14 +3621,17 @@ def start_video_fact_check_async(
         return
 
     max_claims = int(plan.get("recommended_claim_count") or 3)
-    if max_claims not in {3, 5}:
-        max_claims = 3
+    max_claims = max(3, min(12, max_claims))
     cache_key = _build_video_fact_check_cache_key(url_value, summary_md, transcript_value)
 
     with runtime["lock"]:
         cached_result = str((runtime.get("result_cache") or {}).get(cache_key) or "").strip()
     if cached_result:
         st.session_state[summary_state_key] = _merge_fact_check_into_summary(summary_content, cached_result)
+        update_history_entry_summary(
+            st.session_state.get(history_entry_state_key),
+            st.session_state[summary_state_key],
+        )
         cache_task_id = f"{state_prefix}_cache_{cache_key[:12]}"
         st.session_state[_fact_check_state_key(state_prefix, "task_id")] = cache_task_id
         st.session_state[_fact_check_state_key(state_prefix, "status")] = "success"
@@ -2152,6 +3664,7 @@ def start_video_fact_check_async(
     eff_base_url = base_url
     eff_proxy = proxy_input
     eff_fact_model = fact_check_model_selected
+    eff_ui_locale = get_ui_locale()
 
     def _worker():
         with runtime["lock"]:
@@ -2160,7 +3673,8 @@ def start_video_fact_check_async(
             runtime["tasks"][task_id] = task
         try:
             print(f"VideoFactCheckWorker: started task_id={task_id} url={url_value} max_claims={max_claims}", flush=True)
-            fact_markdown = fact_check_document_claims(
+            fact_markdown = _call_with_optional_kwargs(
+                fact_check_document_claims,
                 text=transcript_value,
                 summary_markdown=summary_md,
                 api_key=eff_api_key,
@@ -2168,6 +3682,7 @@ def start_video_fact_check_async(
                 model=eff_fact_model,
                 proxy_url=eff_proxy,
                 max_claims=max_claims,
+                ui_locale=eff_ui_locale,
             )
             with runtime["lock"]:
                 result_cache = runtime.setdefault("result_cache", {})
@@ -2204,6 +3719,7 @@ def sync_video_fact_check_state(
     *,
     summary_state_key: str = "summary_text",
     state_prefix: str = "video_fact_check",
+    history_entry_state_key: str = "video_history_entry_id",
 ) -> None:
     task_id = str(st.session_state.get(_fact_check_state_key(state_prefix, "task_id")) or "").strip()
     if not task_id:
@@ -2236,8 +3752,13 @@ def sync_video_fact_check_state(
             st.session_state[summary_state_key],
             str(task.get("result") or "").strip(),
         )
+        update_history_entry_summary(
+            st.session_state.get(history_entry_state_key),
+            st.session_state[summary_state_key],
+        )
         st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = task_id
         st.session_state[_fact_check_state_key(state_prefix, "status")] = "success"
+        st.session_state[_fact_check_state_key(state_prefix, "success_toast_task_id")] = task_id
 
 def run_document_summary_pipeline(
     extracted,
@@ -2251,17 +3772,20 @@ def run_document_summary_pipeline(
         """
         复用文档总结主流程，统一执行正文总结、文档判定与关键声明事实核查。
         """
+        ui_locale = get_ui_locale()
         def relay_document_progress(pct, message):
             if progress_callback:
                 progress_callback(25 + int(min(max(pct, 0), 100) * 0.45), message)
 
-        summary_result = summarize_document_text(
+        summary_result = _call_with_optional_kwargs(
+            summarize_document_text,
             extracted["clean_text"],
             eff_api_key,
             eff_base_url,
             summary_model_name,
             eff_proxy,
             progress_callback=relay_document_progress,
+            ui_locale=ui_locale,
         )
         if progress_callback:
             progress_callback(72, "正在判断文档类型与是否需要事实核查...")
@@ -2281,7 +3805,8 @@ def run_document_summary_pipeline(
                 if progress_callback:
                     progress_callback(72 + int(min(max(pct, 0), 100) * 0.28), message)
 
-            fact_check_markdown = fact_check_document_claims(
+            fact_check_markdown = _call_with_optional_kwargs(
+                fact_check_document_claims,
                 text=extracted["clean_text"],
                 summary_markdown=summary_result["summary_markdown"],
                 api_key=eff_api_key,
@@ -2290,6 +3815,7 @@ def run_document_summary_pipeline(
                 proxy_url=eff_proxy,
                 max_claims=int(fact_check_plan.get("recommended_claim_count") or 5),
                 progress_callback=relay_fact_progress,
+                ui_locale=ui_locale,
             )
 
         return {
@@ -2303,9 +3829,21 @@ def run_document_summary_pipeline(
 def internal_summarize_document(file_name, file_bytes, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
-        eff_proxy = proxy_override or proxy_input
+        eff_proxy = (
+            str(proxy_override or "").strip()
+            if proxy_override is not None
+            else get_effective_proxy(proxy_input, use_system_proxy)[0]
+        )
         summary_model_name = str(model_name or summary_model_selected).strip() or summary_model_selected
         fact_check_model_name = fact_check_model_selected
+
+        # --- 限流检查 ---
+        client_ip = get_client_ip()
+        is_owner = rate_limiter.is_owner(st.session_state.settings)
+        if not is_owner:
+            allowed, msg = rate_limiter.check_limit(client_ip)
+            if not allowed:
+                return None, msg
 
         ok, err = validate_document_upload(file_name, len(file_bytes))
         if not ok:
@@ -2319,7 +3857,7 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
 
         if progress_callback:
             progress_callback(25, f"文档解析完成，正文约 {extracted['char_count']} 字符。")
-        return run_document_summary_pipeline(
+        res = run_document_summary_pipeline(
             extracted,
             summary_model_name,
             fact_check_model_name,
@@ -2327,15 +3865,33 @@ def internal_summarize_document(file_name, file_bytes, model_name, progress_call
             eff_base_url,
             eff_proxy,
             progress_callback=progress_callback,
-        ), None
+        )
+        
+        # 总结成功，增加限流计数
+        if not is_owner:
+            rate_limiter.increment(client_ip)
+            
+        return res, None
 
 
 def internal_summarize_document_url(source_url, model_name, progress_callback=None, api_key_override=None, base_url_override=None, proxy_override=None):
         eff_api_key = api_key_override or api_key
         eff_base_url = base_url_override or base_url
-        eff_proxy = proxy_override or proxy_input
+        eff_proxy = (
+            str(proxy_override or "").strip()
+            if proxy_override is not None
+            else get_effective_proxy(proxy_input, use_system_proxy)[0]
+        )
         summary_model_name = str(model_name or summary_model_selected).strip() or summary_model_selected
         fact_check_model_name = fact_check_model_selected
+
+        # --- 限流检查 ---
+        client_ip = get_client_ip()
+        is_owner = rate_limiter.is_owner(st.session_state.settings)
+        if not is_owner:
+            allowed, msg = rate_limiter.check_limit(client_ip)
+            if not allowed:
+                return None, msg
 
         if not eff_api_key:
             return None, "请先填写 API Key。"
@@ -2345,7 +3901,7 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
         extracted = extract_document_from_url(source_url, proxy_url=eff_proxy)
         if progress_callback:
             progress_callback(25, f"在线内容解析完成，正文约 {extracted['char_count']} 字符。")
-        return run_document_summary_pipeline(
+        res = run_document_summary_pipeline(
             extracted,
             summary_model_name,
             fact_check_model_name,
@@ -2353,7 +3909,13 @@ def internal_summarize_document_url(source_url, model_name, progress_callback=No
             eff_base_url,
             eff_proxy,
             progress_callback=progress_callback,
-        ), None
+        )
+        
+        # 总结成功，增加限流计数
+        if not is_owner:
+            rate_limiter.increment(client_ip)
+            
+        return res, None
 
 
 # ==========================
@@ -2367,7 +3929,10 @@ if "bg_task_id" not in st.session_state:
 
 def render_background_task_status_panel():
     """
-    渲染后台任务状态轮询区，并返回当前任务 ID 与状态信息。
+    读取当前后台任务状态，并返回任务 ID 与状态信息。
+
+    注意：这里不要做全局的 sleep/rerun 轮询，否则整个页面会被频繁重刷，
+    Streamlit Tabs 会不断回到默认页，用户很难切到“任务中心”查看详情。
     """
     current_bg_task_id = st.session_state.bg_task_id or ""
     current_bg_task_status = None
@@ -2377,89 +3942,372 @@ def render_background_task_status_panel():
         status_info = get_task_status(task_id)
         current_bg_task_status = status_info
 
-        st.info(f"⏳ 后台任务进行中... (ID: {task_id[:8]})")
-        status_col1, status_col2 = st.columns([3, 1])
-
-        with status_col1:
-            if status_info["status"] == "queued":
-                st.warning("🔄 任务排队中...")
-            elif status_info["status"] == "running":
-                with st.spinner("🚀 正在抓取和总结中，请稍候..."):
-                    time.sleep(2)
-            elif status_info["status"] == "success":
-                st.success("✅ 任务完成！")
-                st.markdown("### 总结结果")
-                st.write(status_info.get("result", "无内容返回"))
-                if st.button("清理状态并开启新任务", key="bg_task_clear_success"):
-                    st.session_state.bg_task_id = None
-                    st.rerun()
-            elif status_info["status"] == "failed":
-                st.error(f"❌ 任务失败: {status_info.get('error', '未知错误')}")
-                if st.button("清理状态并重试", key="bg_task_clear_failed"):
-                    st.session_state.bg_task_id = None
-                    st.rerun()
-
-        with status_col2:
-            if status_info["status"] in ["queued", "running"]:
-                if st.button("刷新进度", key="bg_task_refresh_progress"):
-                    st.rerun()
-
-        if status_info["status"] in ["queued", "running"]:
-            time.sleep(3)
-            st.rerun()
+    current_processing_task = st.session_state.get("current_processing_task") or {}
+    processing_status = str(current_processing_task.get("status") or "").strip()
+    if (
+        not current_bg_task_status
+        and current_processing_task
+        and processing_status in {"queued", "running", "success", "failed"}
+    ):
+        current_bg_task_id = str(current_processing_task.get("task_id") or "").strip()
+        current_bg_task_status = current_processing_task
 
     return current_bg_task_id, current_bg_task_status
 # ====== 新增结束 ======
 
-def render_task_center_metrics(task_status_value, task_defs, task_run_items):
+
+def _update_current_processing_task(
+    *,
+    task_id: str = "",
+    url: str = "",
+    status: str = "",
+    source: str = "处理中心",
+    title: str = "",
+    error: str = "",
+    result: str = "",
+    note: str = "",
+):
+    existing = st.session_state.get("current_processing_task") or {}
+    normalized_task_id = str(task_id or existing.get("task_id") or "").strip()
+    normalized_url = str(url or existing.get("url") or "").strip()
+    created_at = str(existing.get("created_at") or "").strip()
+    if normalized_task_id and normalized_task_id != str(existing.get("task_id") or "").strip():
+        created_at = _iso(_now())
+    if not created_at:
+        created_at = _iso(_now())
+    st.session_state.current_processing_task = {
+        "task_id": normalized_task_id,
+        "url": normalized_url,
+        "status": str(status or existing.get("status") or "").strip(),
+        "source": str(source or existing.get("source") or t("task_source_center")).strip() or t("task_source_center"),
+        "title": str(title or existing.get("title") or normalized_url or t("task_current_title")).strip() or t("task_current_title"),
+        "error": str(error or "").strip(),
+        "result": str(result or existing.get("result") or ""),
+        "note": str(note or "").strip(),
+        "created_at": created_at,
+    }
+
+
+def _clear_current_processing_task():
+    st.session_state.current_processing_task = {}
+
+def _task_center_status_label(status: str) -> str:
+    status_map = {
+        "queued": t("status_queued"),
+        "running": t("status_running"),
+        "success": t("status_success"),
+        "failed": t("status_failed"),
+        "partial": t("status_partial"),
+        "no_update": t("status_no_update"),
+        "not_found": t("status_expired"),
+    }
+    return status_map.get(str(status or "").strip(), t("status_unknown"))
+
+
+def _task_center_source_label(source: str) -> str:
+    normalized = str(source or "").strip()
+    source_map = {
+        "自动任务": t("task_source_auto"),
+        "处理中心": t("task_source_center"),
+        "失败重试": t("task_source_retry"),
+        "处理中心失败重试": t("task_source_center_retry"),
+    }
+    return source_map.get(normalized, normalized)
+
+
+def _task_center_status_icon(status: str) -> str:
+    status_map = {
+        "queued": "⏳",
+        "running": "🔄",
+        "success": "✅",
+        "failed": "❌",
+        "partial": "🟡",
+        "no_update": "🟦",
+        "not_found": "⚪",
+    }
+    return status_map.get(str(status or "").strip(), "❔")
+
+
+def _format_task_center_time(value: str) -> str:
+    dt_value = _parse_iso(value)
+    if not dt_value:
+        return "—"
+    return dt_value.strftime("%m-%d %H:%M")
+
+
+def _build_task_center_records(current_bg_task_id, current_bg_task_status, task_run_items):
+    records = []
+
+    for item in task_run_items:
+        if not isinstance(item, dict):
+            continue
+        record_id = f"scheduled:{item.get('run_id') or ''}:{item.get('video_id') or ''}:{item.get('created_at') or ''}"
+        records.append({
+            "record_id": record_id,
+            "task_id": "",
+            "kind": "scheduled_run_item",
+            "source": t("task_source_auto"),
+            "status": str(item.get("status") or "").strip() or "failed",
+            "title": str(item.get("title") or t("task_unnamed")).strip(),
+            "url": str(item.get("url") or "").strip(),
+            "channel_name": str(item.get("channel_name") or "").strip(),
+            "created_at": str(item.get("created_at") or "").strip(),
+            "duration_seconds": int(item.get("duration_seconds") or 0),
+            "summary": str(item.get("summary") or ""),
+            "error": str(item.get("error") or "").strip(),
+            "can_retry": bool(str(item.get("url") or "").strip()),
+        })
+
+    if current_bg_task_id and current_bg_task_status:
+        records.append({
+            "record_id": f"processing:{current_bg_task_id}",
+            "task_id": current_bg_task_id,
+            "kind": "processing_center",
+            "source": t("task_source_center"),
+            "status": str(current_bg_task_status.get("status") or "unknown").strip(),
+            "title": str(current_bg_task_status.get("url") or t("task_current_bg_title")).strip() or t("task_current_bg_title"),
+            "url": str(current_bg_task_status.get("url") or "").strip(),
+            "channel_name": "",
+            "created_at": "",
+            "duration_seconds": 0,
+            "summary": str(current_bg_task_status.get("result") or ""),
+            "error": str(current_bg_task_status.get("error") or "").strip(),
+            "can_retry": bool(str(current_bg_task_status.get("url") or "").strip()),
+        })
+
+    retry_jobs = st.session_state.get("task_center_retry_jobs") or []
+    normalized_retry_jobs = []
+    for job in retry_jobs:
+        if not isinstance(job, dict):
+            continue
+        task_id = str(job.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        live_status = get_task_status(task_id)
+        normalized_job = dict(job)
+        normalized_job["status"] = str(live_status.get("status") or "unknown").strip()
+        normalized_job["result"] = str(live_status.get("result") or normalized_job.get("result") or "")
+        normalized_job["error"] = str(live_status.get("error") or normalized_job.get("error") or "").strip()
+        normalized_retry_jobs.append(normalized_job)
+        if task_id == current_bg_task_id:
+            continue
+        records.append({
+            "record_id": f"retry:{task_id}",
+            "task_id": task_id,
+            "kind": "retry_task",
+            "source": t("task_source_retry"),
+            "status": normalized_job["status"],
+            "title": str(normalized_job.get("title") or normalized_job.get("url") or t("task_source_retry")).strip(),
+            "url": str(normalized_job.get("url") or "").strip(),
+            "channel_name": str(normalized_job.get("channel_name") or "").strip(),
+            "created_at": str(normalized_job.get("created_at") or "").strip(),
+            "duration_seconds": 0,
+            "summary": normalized_job["result"],
+            "error": normalized_job["error"],
+            "can_retry": bool(str(normalized_job.get("url") or "").strip()),
+        })
+    st.session_state.task_center_retry_jobs = normalized_retry_jobs[-50:]
+
+    records.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return records
+
+
+def _task_center_record_matches(record, status_filter, source_filter, keyword):
+    status_value = str(record.get("status") or "").strip()
+    if status_filter != t("filter_all"):
+        status_label = _task_center_status_label(status_value)
+        if status_filter != status_label:
+            return False
+    if source_filter != t("filter_all"):
+        if str(record.get("source") or "").strip() != source_filter:
+            return False
+    keyword = str(keyword or "").strip().lower()
+    if not keyword:
+        return True
+    haystack = "\n".join([
+        str(record.get("title") or ""),
+        str(record.get("url") or ""),
+        str(record.get("channel_name") or ""),
+        str(record.get("source") or ""),
+        str(record.get("error") or ""),
+    ]).lower()
+    return keyword in haystack
+
+
+def _submit_task_center_retry(url: str, *, title: str = "", channel_name: str = "", source: str = ""):
+    retry_task_id = submit_task(
+        url,
+        summary_model_selected,
+        fact_check_model_selected,
+        proxy_input,
+        use_system_proxy,
+        api_key,
+        base_url,
+        get_ui_locale(),
+    )
+    retry_jobs = st.session_state.get("task_center_retry_jobs") or []
+    retry_jobs.append({
+        "task_id": retry_task_id,
+        "url": str(url or "").strip(),
+        "title": str(title or "").strip(),
+        "channel_name": str(channel_name or "").strip(),
+        "source": str(source or t("task_source_retry")).strip() or t("task_source_retry"),
+        "created_at": _iso(_now()),
+        "result": "",
+        "error": "",
+        "status": "queued",
+    })
+    st.session_state.task_center_retry_jobs = retry_jobs[-50:]
+    return retry_task_id
+
+
+def render_task_center_metrics(task_defs, records, task_runs):
     """
     渲染任务中心顶部指标栏。
     """
-    failed_run_count = len([item for item in task_run_items if (item.get("status") or "") != "success"])
+    running_count = len([item for item in records if str(item.get("status") or "") in {"queued", "running"}])
+    failed_count = len([item for item in records if str(item.get("status") or "") == "failed"])
+    success_count = len([item for item in records if str(item.get("status") or "") == "success"])
+    total_finished = success_count + failed_count
+    success_rate = int((success_count / total_finished) * 100) if total_finished else 0
+    last_7d_runs = [
+        run for run in task_runs
+        if _parse_iso(run.get("triggered_at")) and _parse_iso(run.get("triggered_at")) >= (_now() - timedelta(days=7))
+    ]
 
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-    metric_col1.metric("当前后台任务", "运行中" if task_status_value in ["queued", "running"] else "空闲")
-    metric_col2.metric("已配置自动任务", len(task_defs))
-    metric_col3.metric("最近执行条目", len(task_run_items))
-    metric_col4.metric("失败条目", failed_run_count)
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+    metric_col1.metric(t("task_metric_running"), running_count)
+    metric_col2.metric(t("task_metric_failed"), failed_count)
+    metric_col3.metric(t("task_metric_success"), success_count)
+    metric_col4.metric(t("task_metric_configured"), len(task_defs))
+    metric_col5.metric(t("task_metric_success_rate_7d"), f"{success_rate}%")
+
+    st.caption(t("task_overview", running=running_count, success=success_count, failed=failed_count, runs=len(last_7d_runs)))
 
 
-def render_current_bg_task_panel(current_bg_task_id, current_bg_task_status, task_status_value):
+def render_current_bg_task_panel(current_bg_task_id, current_bg_task_status, *, key_prefix: str = "task_center"):
     """
     渲染当前后台任务状态面板。
     """
     if not current_bg_task_status:
-        st.info("当前没有后台异步任务。你可以在“处理中心”发起视频处理，或在“订阅自动化”中创建定时任务。")
+        st.info(t("task_center_no_bg"))
         return
 
     status_label_map = {
-        "queued": "排队中",
-        "running": "运行中",
-        "success": "已完成",
-        "failed": "失败",
+        "queued": t("status_queued"),
+        "running": t("status_running"),
+        "success": t("status_success_done"),
+        "failed": t("status_failed"),
     }
     with st.container(border=True):
-        st.markdown(f"**任务 ID**：`{current_bg_task_id[:8]}`")
-        st.caption(f"状态：`{status_label_map.get(task_status_value, task_status_value or 'unknown')}`")
+        current_status = str(current_bg_task_status.get("status") or "unknown").strip()
+        st.markdown(f"**{t('task_center_task_id')}**：`{current_bg_task_id[:8]}`")
+        st.caption(f"{t('task_center_status')}：`{status_label_map.get(current_status, current_status or t('status_unknown'))}`")
+        task_note = str(current_bg_task_status.get("note") or "").strip()
+        if task_note:
+            st.caption(task_note)
 
-        if task_status_value == "success":
-            st.success("后台任务已完成。你可以清理状态后继续新任务，或在下方查看结果摘要。")
+        if current_status == "success":
+            st.success(t("task_center_done"))
             result_text = str(current_bg_task_status.get("result") or "").strip()
             if result_text:
-                with st.expander("查看本次结果", expanded=False):
+                with st.expander(t("task_center_view_result"), expanded=False):
                     st.write(result_text)
-        elif task_status_value == "failed":
-            st.error(f"后台任务失败：{current_bg_task_status.get('error', '未知错误')}")
+        elif current_status == "failed":
+            st.error(t("task_center_failed", error=current_bg_task_status.get("error", t("status_unknown"))))
+            retry_url = str(current_bg_task_status.get("url") or "").strip()
+            if retry_url:
+                if st.button(t("task_center_retry_current"), key="task_center_retry_current_bg", use_container_width=True):
+                    retry_task_id = _submit_task_center_retry(
+                        retry_url,
+                        title=retry_url,
+                        source=t("task_source_center_retry"),
+                    )
+                    st.toast(t("task_center_retry_resubmitted", task_id=retry_task_id[:8]), icon="🔄")
+                    st.rerun()
         else:
-            st.info("后台任务仍在执行中，页面会自动轮询刷新。")
+            st.info(t("task_center_running_info"))
 
         action_col1, action_col2 = st.columns([1, 1])
         with action_col1:
-            if st.button("清理当前任务状态", key="task_center_clear_bg", use_container_width=True):
+            if st.button(t("task_center_clear"), key=f"{key_prefix}_clear_bg", use_container_width=True):
                 st.session_state.bg_task_id = None
+                _clear_current_processing_task()
                 st.rerun()
         with action_col2:
-            if st.button("立即刷新任务状态", key="task_center_refresh_bg", use_container_width=True):
+            if st.button(t("task_center_refresh"), key=f"{key_prefix}_refresh_bg", use_container_width=True):
+                st.rerun()
+
+
+def render_task_center_filters(records):
+    status_options = [t("filter_all"), t("status_queued"), t("status_running"), t("status_success"), t("status_failed")]
+    source_options = ["全部"] + sorted({str(item.get("source") or "").strip() for item in records if str(item.get("source") or "").strip()})
+    source_options = [t("filter_all")] + sorted({str(item.get("source") or "").strip() for item in records if str(item.get("source") or "").strip()})
+
+    filter_col1, filter_col2, filter_col3 = st.columns([1.1, 1.1, 2.2])
+    with filter_col1:
+        status_filter = st.selectbox(t("task_filter_status"), status_options, key="task_center_status_filter")
+    with filter_col2:
+        source_filter = st.selectbox(t("task_filter_source"), source_options, key="task_center_source_filter")
+    with filter_col3:
+        keyword = st.text_input(t("task_filter_search"), key="task_center_keyword", placeholder=t("task_filter_search_placeholder"))
+
+    filtered_records = [
+        item for item in records
+        if _task_center_record_matches(item, status_filter, source_filter, keyword)
+    ]
+    st.caption(t("task_filter_summary", total=len(records), filtered=len(filtered_records)))
+    return filtered_records
+
+
+def render_task_center_batch_actions(records):
+    failed_candidates = [
+        item for item in records
+        if str(item.get("status") or "") == "failed" and str(item.get("url") or "").strip()
+    ]
+    if not failed_candidates:
+        st.caption(t("task_batch_no_failed"))
+        return
+
+    option_map = {item["record_id"]: item for item in failed_candidates}
+    selected_ids = st.multiselect(
+        t("task_batch_select"),
+        options=list(option_map.keys()),
+        default=st.session_state.get("task_center_batch_retry_ids") or [],
+        format_func=lambda record_id: (
+            f"{option_map[record_id].get('title') or t('task_unnamed')}"
+            f" | {_task_center_source_label(option_map[record_id].get('source'))}"
+            f" | {_format_task_center_time(option_map[record_id].get('created_at') or '')}"
+        ),
+        key="task_center_batch_retry_ids",
+    )
+
+    action_col1, action_col2 = st.columns([1, 1])
+    with action_col1:
+        if st.button(t("task_batch_select_all"), use_container_width=True, key="task_center_select_all_failed"):
+            st.session_state.task_center_batch_retry_ids = list(option_map.keys())
+            st.rerun()
+    with action_col2:
+        if st.button(t("task_batch_retry"), type="primary", use_container_width=True, key="task_center_batch_retry_submit"):
+            if not selected_ids:
+                st.warning(t("task_batch_select_warning"))
+            else:
+                submitted_count = 0
+                for record_id in selected_ids:
+                    item = option_map.get(record_id)
+                    if not item:
+                        continue
+                    retry_url = str(item.get("url") or "").strip()
+                    if not retry_url:
+                        continue
+                    _submit_task_center_retry(
+                        retry_url,
+                        title=str(item.get("title") or "").strip(),
+                        channel_name=str(item.get("channel_name") or "").strip(),
+                    )
+                    submitted_count += 1
+                st.session_state.task_center_batch_retry_ids = []
+                st.toast(t("task_batch_submitted", count=submitted_count), icon="🚀")
                 st.rerun()
 
 
@@ -2470,42 +4318,68 @@ def render_recent_task_run_item(item):
     with st.container(border=True):
         head_c1, head_c2 = st.columns([4, 1])
         with head_c1:
-            st.markdown(f"**{item.get('title') or '未命名任务'}**")
+            item_title = str(item.get("title") or t("task_unnamed")).strip()
+            st.markdown(f"**{item_title}**")
             meta_parts = []
             if item.get("channel_name"):
-                meta_parts.append(f"频道：{item.get('channel_name')}")
+                meta_parts.append(f"{t('task_meta_channel')}：{item.get('channel_name')}")
             if item.get("created_at"):
-                meta_parts.append(f"时间：{_parse_iso(item.get('created_at')).strftime('%m-%d %H:%M')}")
+                meta_parts.append(f"{t('task_meta_time')}：{_format_task_center_time(item.get('created_at'))}")
             if item.get("url"):
-                meta_parts.append(f"[链接]({item.get('url')})")
+                meta_parts.append(f"[{t('task_meta_link')}]({item.get('url')})")
+            if item.get("source"):
+                meta_parts.append(f"{t('task_meta_source')}：{_task_center_source_label(item.get('source'))}")
             if meta_parts:
                 st.caption(" | ".join(meta_parts))
         with head_c2:
-            if item.get("status") == "success":
-                st.success("成功", icon="✅")
+            status_value = str(item.get("status") or "").strip()
+            status_label = _task_center_status_label(status_value)
+            if status_value == "success":
+                st.success(status_label, icon=_task_center_status_icon(status_value))
+            elif status_value in {"queued", "running"}:
+                st.info(status_label, icon=_task_center_status_icon(status_value))
             else:
-                st.error("失败", icon="❌")
+                st.error(status_label, icon=_task_center_status_icon(status_value))
+
+        detail_parts = []
+        if item.get("task_id"):
+            detail_parts.append(f"{t('task_meta_task_id')}：`{str(item.get('task_id'))[:8]}`")
+        if item.get("duration_seconds"):
+            detail_parts.append(f"{t('task_meta_duration')}：{int(item.get('duration_seconds') or 0)}s")
+        if detail_parts:
+            st.caption(" | ".join(detail_parts))
 
         if item.get("status") == "success":
-            with st.expander("查看结果摘要", expanded=False):
+            with st.expander(t("task_result_expander"), expanded=False):
                 summary_content = item.get("summary") or ""
                 if summary_content:
-                    render_summary_content(summary_content, fact_title="🕵️ 新闻事实核查")
+                    render_summary_content(summary_content, fact_title=t("video_fact_check_title"))
                 else:
-                    st.markdown("本次任务未返回可展示摘要。")
+                    st.markdown(t("task_result_empty"))
         else:
-            st.caption(f"失败原因：{item.get('error') or '未知错误'}")
+            st.caption(t("task_failure_reason", error=item.get("error") or t("status_unknown")))
+
+        if item.get("status") == "failed" and item.get("can_retry"):
+            retry_url = str(item.get("url") or "").strip()
+            if st.button(t("task_retry_single"), key=f"task_center_retry_{item.get('record_id')}", use_container_width=True):
+                retry_task_id = _submit_task_center_retry(
+                    retry_url,
+                    title=item_title,
+                    channel_name=str(item.get("channel_name") or "").strip(),
+                )
+                st.toast(t("task_center_retry_resubmitted", task_id=retry_task_id[:8]), icon="🔄")
+                st.rerun()
 
 
-def render_recent_task_runs_panel(task_run_items):
+def render_recent_task_runs_panel(records):
     """
-    渲染最近执行记录列表。
+    渲染任务记录列表。
     """
-    if not task_run_items:
-        st.caption("暂无最近执行记录。")
+    if not records:
+        st.caption(t("task_records_empty"))
         return
 
-    recent_items = sorted(task_run_items, key=lambda item: item.get("created_at") or "", reverse=True)[:12]
+    recent_items = sorted(records, key=lambda item: item.get("created_at") or "", reverse=True)[:30]
     for item in recent_items:
         render_recent_task_run_item(item)
 
@@ -2517,31 +4391,37 @@ def render_task_logs_panel(task_logs):
     if task_logs:
         st.dataframe(task_logs[-50:], use_container_width=True, hide_index=True)
     else:
-        st.caption("暂无运行日志。")
+        st.caption(t("task_logs_empty"))
 
 
-def render_task_center_page(current_bg_task_id, current_bg_task_status):
+def render_task_center_page(current_bg_task_id, current_bg_task_status, *, show_header: bool = True):
     """
     渲染任务中心页面，统一展示后台异步任务、最近执行记录与运行日志。
     """
-    st.markdown("### 📋 任务中心")
-    st.caption("集中查看后台异步任务、调度运行结果和最近错误，避免任务执行像黑箱。")
+    if show_header:
+        st.markdown(t("task_center_header"))
+        st.caption(t("task_center_caption"))
 
     _task_settings, task_defs, task_logs, task_runs, task_run_items, _task_processed_ids = _load_scheduled_state()
-    task_status_value = (current_bg_task_status or {}).get("status") or "idle"
+    records = _build_task_center_records(current_bg_task_id, current_bg_task_status, task_run_items)
 
-    render_task_center_metrics(task_status_value, task_defs, task_run_items)
-    current_task_tab, recent_runs_tab, logs_tab = st.tabs(["🎯 当前任务", "🕘 最近执行", "🧾 运行日志"])
+    render_task_center_metrics(task_defs, records, task_runs)
+    current_task_tab, recent_runs_tab, logs_tab = st.tabs([t("task_tab_current"), t("task_tab_list"), t("task_tab_logs")])
 
     with current_task_tab:
-        render_current_bg_task_panel(current_bg_task_id, current_bg_task_status, task_status_value)
+        render_current_bg_task_panel(current_bg_task_id, current_bg_task_status, key_prefix="task_center")
 
     with recent_runs_tab:
-        render_recent_task_runs_panel(task_run_items)
+        filtered_records = render_task_center_filters(records)
+        st.divider()
+        render_task_center_batch_actions(filtered_records)
+        st.divider()
+        render_recent_task_runs_panel(filtered_records)
 
     with logs_tab:
         render_task_logs_panel(task_logs)
 
+    task_status_value = (current_bg_task_status or {}).get("status") or "idle"
     return task_status_value, task_logs, task_runs, task_run_items
 
 
@@ -2551,12 +4431,12 @@ def render_library_filters(history_count: int):
     """
     filter_col1, filter_col2, filter_col3 = st.columns([4.2, 0.8, 1.2])
     with filter_col1:
-        hist_kw = st.text_input("搜索历史记录 (标题/URL/内容)", key="hist_kw")
+        hist_kw = st.text_input(t("history_search_label"), key="hist_kw")
     with filter_col2:
-        search_body = st.checkbox("全文搜索", value=True)
+        search_body = st.checkbox(t("history_search_fulltext"), value=True)
     with filter_col3:
         if history_count > 0:
-            if st.button("清空历史", use_container_width=True):
+            if st.button(t("history_clear"), use_container_width=True):
                 save_history([])
                 st.rerun()
 
@@ -2588,33 +4468,52 @@ def render_history_entry(entry):
     渲染单条历史记录。
     """
     with st.expander(f"{entry.get('timestamp')[:16].replace('T', ' ')} | {entry.get('title')}", expanded=False):
-        st.caption(f"来源: {'⏰ 定时任务' if entry.get('source_type') == 'schedule' else '🎬 单次任务'} | URL: {entry.get('video_url')}")
+        st.caption(
+            t(
+                "history_entry_caption",
+                source=t("history_source_schedule") if entry.get("source_type") == "schedule" else t("history_source_single"),
+                url=entry.get("video_url") or "",
+            )
+        )
 
         render_summary_content(
             entry.get("summary_text") or "",
-            fact_title="🕵️ 新闻事实核查",
+            fact_title=t("video_fact_check_title"),
         )
 
 
-def render_library_page():
+def render_library_page(*, show_header: bool = True):
     """
     渲染内容资产库，统一浏览历史摘要与全文检索结果。
     """
-    st.markdown("### 🗂️ 内容资产库")
-    st.caption("统一沉淀单次处理、手动粘贴、扩展桥接和定时任务产出的内容结果。")
+    if show_header:
+        st.markdown(t("history_header"))
+        st.caption(t("history_caption"))
 
     history = load_history() or []
+    if history:
+        try:
+            st.download_button(
+                t("history_export"),
+                data=json.dumps(history, ensure_ascii=False, indent=2),
+                file_name="youtube_summarizer_history.json",
+                mime="application/json",
+                use_container_width=False,
+                key="btn_export_history",
+            )
+        except Exception:
+            pass
     hist_kw, search_body = render_library_filters(len(history))
 
     if not history:
-        st.info("暂无历史记录，等你生成第一条总结后会自动沉淀到这里。")
+        st.info(t("history_empty"))
         return
 
     matched_entries = [
         entry for entry in history
         if history_entry_matches(entry, hist_kw, search_body)
     ]
-    st.caption(f"共 {len(history)} 条历史记录，当前命中 {len(matched_entries)} 条")
+    st.caption(t("history_count", total=len(history), matched=len(matched_entries)))
 
     for entry in matched_entries:
         render_history_entry(entry)
@@ -2631,44 +4530,44 @@ def render_settings_metrics(task_status_value):
         runtime_summary = render_info["commit_short"] or "unknown"
         runtime_caption = f"deploy={_short_display(render_info['deploy_id'] or 'n/a', 18)} | branch={render_info['branch'] or 'unknown'}"
     else:
-        runtime_summary = "本地开发版" if "expected_commit=latest-local" in runtime_diag else "运行中"
+        runtime_summary = "Local Dev" if get_ui_locale() == "en" and "expected_commit=latest-local" in runtime_diag else "本地开发版" if "expected_commit=latest-local" in runtime_diag else t("status_running")
         runtime_caption = f"commit={render_info['commit_short'] or 'local'} | deploy=local"
-    task_summary = "运行中" if task_status_value in ["queued", "running"] else "空闲"
-    bridge_summary = "已连接" if st.session_state.manual_bridge_meta else "暂无"
+    task_summary = t("status_running") if task_status_value in ["queued", "running"] else t("status_idle")
+    bridge_summary = "Connected" if get_ui_locale() == "en" and st.session_state.manual_bridge_meta else "已连接" if st.session_state.manual_bridge_meta else "Not yet" if get_ui_locale() == "en" else "暂无"
 
     diag_col1, diag_col2, diag_col3 = st.columns(3)
 
     with diag_col1:
         with st.container(border=True):
-            st.caption("运行版本")
+            st.caption(t("settings_metric_runtime"))
             st.markdown(f"### {runtime_summary}")
             st.caption(runtime_caption)
 
     with diag_col2:
         with st.container(border=True):
-            st.caption("后台任务")
+            st.caption(t("settings_metric_bg"))
             st.markdown(f"### {task_summary}")
-            st.caption("用于观察当前后台抓取与总结状态")
+            st.caption(t("settings_metric_bg_caption"))
 
     with diag_col3:
         with st.container(border=True):
-            st.caption("Bridge 元信息")
+            st.caption(t("settings_metric_bridge"))
             st.markdown(f"### {bridge_summary}")
-            st.caption("用于判断扩展或本地工具是否已回传上下文")
+            st.caption(t("settings_metric_bridge_caption"))
 
-    with st.expander("查看运行版本详情", expanded=False):
+    with st.expander(t("settings_runtime_detail"), expanded=False):
         if runtime_lines:
             st.code("\n".join(runtime_lines), language="text")
         else:
-            st.caption("暂无可展示的运行版本诊断信息。")
+            st.caption(t("settings_runtime_detail_empty"))
 
-    with st.expander("查看 Render 部署信息", expanded=False):
+    with st.expander(t("settings_render_detail"), expanded=False):
         if render_info["is_render"] == "yes":
             st.json(
                 {
                     "commit": render_info["commit"] or "unknown",
                     "branch": render_info["branch"] or "unknown",
-                    "deploy_id": render_info["deploy_id"] or "未暴露 deploy id",
+                    "deploy_id": render_info["deploy_id"] or t("settings_render_deploy_hidden"),
                     "service_id": render_info["service_id"] or "unknown",
                     "service_name": render_info["service_name"] or "unknown",
                     "service_type": render_info["service_type"] or "unknown",
@@ -2678,16 +4577,16 @@ def render_settings_metrics(task_status_value):
                 expanded=False,
             )
             if not render_info["deploy_id"]:
-                st.caption("当前 Render 环境变量未明确暴露 deploy id；页面会优先显示 commit、branch 与 service 信息。")
+                st.caption(t("settings_render_deploy_caption"))
         else:
-            st.caption("当前为本地运行环境，未检测到 Render 部署变量。")
+            st.caption(t("settings_local_runtime_caption"))
 
 
 def render_bridge_diagnostics_panel():
     """
     渲染 bridge 元信息与诊断内容。
     """
-    with st.expander("查看提取与桥接诊断", expanded=False):
+    with st.expander(t("settings_bridge_expander"), expanded=False):
         if st.session_state.manual_bridge_meta:
             bridge_context = build_manual_bridge_context(st.session_state.manual_bridge_meta)
             if bridge_context.get("summary"):
@@ -2698,76 +4597,121 @@ def render_bridge_diagnostics_panel():
             if bridge_meta_text:
                 st.code(bridge_meta_text)
         else:
-            st.caption("当前还没有可展示的 bridge 诊断数据。")
-
-
-def render_guestbook_form():
-    """
-    渲染留言表单并处理提交。
-    """
-    with st.form("guestbook_form", clear_on_submit=True):
-        user_name = st.text_input("昵称", value="User", max_chars=20)
-        message = st.text_area("留言内容", height=100)
-        submitted = st.form_submit_button("发布留言")
-
-        if submitted and message.strip():
-            guestbook = load_guestbook()
-            new_msg = {
-                "id": str(uuid.uuid4()),
-                "timestamp": _iso(_now()),
-                "user": user_name.strip() or "Anonymous",
-                "content": message.strip(),
-            }
-            guestbook.insert(0, new_msg)
-            save_guestbook(guestbook)
-            st.success("留言已发布")
-            st.rerun()
+            st.caption(t("settings_bridge_empty"))
 
 
 def render_runtime_history_panel(task_logs, task_runs, task_run_items):
     """
     渲染运行日志与历史概览。
     """
-    with st.expander("📜 运行日志 & 历史", expanded=False):
-        tab_log, tab_hist = st.tabs(["日志", "历史"])
+    with st.expander(t("settings_runtime_history"), expanded=False):
+        tab_log, tab_hist = st.tabs([t("settings_runtime_log_tab"), t("settings_runtime_history_tab")])
         with tab_log:
             if task_logs:
                 st.dataframe(task_logs[-50:], use_container_width=True, hide_index=True)
             else:
-                st.caption("无日志")
+                st.caption(t("settings_runtime_no_log"))
         with tab_hist:
             daily_runs, _ = _group_runs_by_day(task_runs, task_run_items)
             if not daily_runs:
-                st.caption("无历史")
+                st.caption(t("settings_runtime_no_history"))
             else:
                 for day in daily_runs[:5]:
-                    st.markdown(f"**{day.get('date')}**: 新增 {day.get('new_items')} | 成功 {day.get('success_items')}")
+                    st.markdown(t("settings_runtime_day_summary", date=day.get("date"), new_items=day.get("new_items"), success_items=day.get("success_items")))
 
 
-def render_guestbook_section(task_logs, task_runs, task_run_items):
+def render_wish_wall_page(task_logs, task_runs, task_run_items):
     """
-    渲染留言列表与附带的运行历史面板。
+    渲染便利签风格的留言板，支持匿名留言和回复。
     """
+    st.markdown(t("wish_wall_header"))
+    st.caption(t("wish_wall_caption"))
+
+    st.markdown('<div class="wish-wall-shell">', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="wish-wall-intro">
+            <strong>{html.escape(t("wish_wall_intro_title"))}</strong>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("wish_wall_message_form", clear_on_submit=True):
+        message = st.text_area(
+            t("wish_wall_message_label"),
+            height=120,
+            placeholder=t("wish_wall_message_placeholder"),
+        )
+        submitted = st.form_submit_button(t("wish_wall_submit"), type="primary")
+        if submitted and message.strip():
+            append_guestbook_message(message.strip())
+            st.success(t("wish_wall_submit_success"))
+            st.rerun()
+
     guestbook = load_guestbook()
     if not guestbook:
-        st.info("暂无留言，快来抢沙发吧！")
+        st.info(t("wish_wall_empty"))
+        st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    for msg in guestbook:
-        with st.chat_message("user" if msg.get("user") == "User" else "assistant", avatar="👤"):
-            st.markdown(f"**{msg.get('user')}** <span style='color:gray; font-size:0.8em'> {msg.get('timestamp')[:16].replace('T', ' ')}</span>", unsafe_allow_html=True)
-            st.markdown(msg.get("content"))
+    note_colors = ["wish-note-yellow", "wish-note-pink", "wish-note-blue", "wish-note-green"]
+    wall_columns = st.columns(3)
+    for idx, msg in enumerate(guestbook):
+        col = wall_columns[idx % 3]
+        replies = msg.get("replies")
+        if not isinstance(replies, list):
+            replies = []
+        note_class = note_colors[idx % len(note_colors)]
+        timestamp_text = str(msg.get("timestamp") or "")[:16].replace("T", " ")
+        content_html = html.escape(str(msg.get("content") or "").strip() or t("wish_wall_blank_message")).replace("\n", "<br/>")
+        with col:
+            st.markdown(
+                f"""
+                <div class="wish-note {note_class}">
+                    <div class="wish-note-head">
+                        <span>{html.escape(t("wish_wall_note_prefix"))} #{len(guestbook) - idx}</span>
+                        <span>{timestamp_text}</span>
+                    </div>
+                    <div class="wish-note-body">{content_html}</div>
+                    <div class="wish-note-reply-count">{html.escape(t("wish_wall_reply_count", count=len(replies)))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            with st.expander(t("wish_wall_view_reply"), expanded=False):
+                if replies:
+                    for reply in replies:
+                        reply_time = str(reply.get("timestamp") or "")[:16].replace("T", " ")
+                        st.markdown(f"**{t('wish_wall_reply_label')}** `{reply_time}`")
+                        st.write(str(reply.get("content") or ""))
+                else:
+                    st.caption(t("wish_wall_no_reply"))
 
-    render_runtime_history_panel(task_logs, task_runs, task_run_items)
+                with st.form(f"wish_reply_form_{msg.get('id')}", clear_on_submit=True):
+                    reply_text = st.text_area(
+                        t("wish_wall_reply_input"),
+                        height=90,
+                        placeholder=t("wish_wall_reply_placeholder"),
+                        key=f"wish_reply_text_{msg.get('id')}",
+                    )
+                    reply_submitted = st.form_submit_button(t("wish_wall_reply_submit"))
+                    if reply_submitted and reply_text.strip():
+                        append_guestbook_reply(str(msg.get("id") or ""), reply_text.strip())
+                        st.success(t("wish_wall_reply_success"))
+                        st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_settings_diagnostics_page(task_status_value, task_logs, task_runs, task_run_items):
+def render_settings_diagnostics_page(task_status_value, task_logs, task_runs, task_run_items, *, show_header: bool = True):
     """
-    渲染设置与诊断页面，聚合运行状态、bridge 信息与反馈入口。
+    渲染设置与诊断页面，聚合运行状态与 bridge 信息。
     """
-    st.markdown("### 🛠️ 设置与诊断")
-    st.caption("集中放置运行诊断、桥接状态和反馈入口，降低问题排查成本。")
-    st.caption(f"当前双模型流水线：`{pipeline_model_label}`")
+    if show_header:
+        st.markdown(t("settings_diag_header"))
+        st.caption(t("settings_diag_caption"))
+        st.caption(t("settings_diag_pipeline", pipeline=pipeline_model_label))
 
     render_settings_metrics(task_status_value)
     render_bridge_diagnostics_panel()
@@ -2782,17 +4726,8 @@ def render_settings_diagnostics_page(task_status_value, task_logs, task_runs, ta
         },
         key_prefix="settings_diag",
         expanded=False,
-        box_title="诊断信息与问题上报",
+        box_title=t("issue_box_title"),
     )
-
-    st.divider()
-    st.markdown("#### 💬 反馈与建议")
-    st.caption("原“留言板”功能先保留在这里，后续可逐步升级为问题反馈与诊断上报中心。")
-    render_guestbook_form()
-
-    st.divider()
-    render_guestbook_section(task_logs, task_runs, task_run_items)
-
 
 def do_video_summary_single(
     url,
@@ -2804,6 +4739,7 @@ def do_video_summary_single(
     duration_state_key: str = "summary_duration",
     fact_check_state_prefix: str = "video_fact_check",
     history_source_type: str = "single",
+    history_entry_state_key: str = "video_history_entry_id",
 ):
     """
     基于当前字幕内容生成单视频 AI 总结。
@@ -2815,6 +4751,15 @@ def do_video_summary_single(
         if manual:
             st.warning("请先抓取字幕")
         return
+
+    # --- 限流检查 ---
+    client_ip = get_client_ip()
+    is_owner = rate_limiter.is_owner(st.session_state.settings)
+    if not is_owner:
+        allowed, msg = rate_limiter.check_limit(client_ip)
+        if not allowed:
+            st.warning(msg)
+            return
 
     reset_video_fact_check_state(fact_check_state_prefix)
     print(
@@ -2829,6 +4774,12 @@ def do_video_summary_single(
     , flush=True)
     t_sum_start = time.time()
     with st.spinner(f"正在请求 AI 总结 ({pipeline_model_label})..."):
+        if not manual:
+            _update_current_processing_task(
+                url=str(url or "").strip(),
+                status="running",
+                note="字幕已到达，正在生成 AI 总结。",
+            )
         summary, err = internal_summarize(
             transcript_value,
             summary_model_selected,
@@ -2845,6 +4796,13 @@ def do_video_summary_single(
     }
 
     if err:
+        if not manual:
+            _update_current_processing_task(
+                url=str(url or "").strip(),
+                status="failed",
+                error=err,
+                note="AI 总结失败。",
+            )
         print(f"VideoSummarySingle: failed error={err}", flush=True)
         st.error(f"总结失败: {err}")
         render_issue_report_box(
@@ -2864,18 +4822,32 @@ def do_video_summary_single(
         f"duration={sum_duration:.2f}"
     , flush=True)
     st.session_state[summary_state_key] = summary
+    if not manual:
+        _update_current_processing_task(
+            url=str(url or "").strip(),
+            status="success",
+            result=str(summary or ""),
+            note="字幕抓取与总结已完成。",
+        )
     start_video_fact_check_async(
         url,
         transcript_value,
         summary,
         summary_state_key=summary_state_key,
         state_prefix=fact_check_state_prefix,
+        history_entry_state_key=history_entry_state_key,
     )
     if manual:
         st.success(f"总结完成 | AI生成耗时: {sum_duration:.1f}s")
 
     try:
-        add_history_entry(history_source_type, url, summary, transcript_value)
+        saved_summary = str(st.session_state.get(summary_state_key) or summary or "")
+        st.session_state[history_entry_state_key] = add_history_entry(
+            history_source_type,
+            url,
+            saved_summary,
+            transcript_value,
+        )
     except Exception as e_hist:
         print(f"Failed to save history: {e_hist}")
 
@@ -2910,14 +4882,47 @@ def get_current_video_url(url: str = "") -> str:
     return str(st.session_state.get("input_url") or "").strip()
 
 
-def do_video_fetch_single(url):
+def detect_video_platform(url: str) -> str:
+    """根据链接快速判断视频平台。"""
+    text = str(url or "").strip().lower()
+    if not text:
+        return ""
+    if any(part in text for part in ["youtube.com/", "youtu.be/", "youtube.com/watch", "youtube.com/shorts/", "youtube.com/live/"]):
+        return "youtube"
+    return ""
+
+
+def choose_video_fetch_strategy(url: str) -> tuple[str, str]:
+    """为输入链接选择合适的抓取路径。"""
+    platform = detect_video_platform(url)
+    if platform == "youtube":
+        return "extension", "已选择统一插件链路：优先通过浏览器页面提取 transcript，失败后再回退主站服务端字幕抓取。"
+    return "extension", "已选择插件提取：当前链接未明确识别平台，先走更通用的插件链路。"
+
+
+def clear_video_extension_fallback_flags():
+    """清理插件失败后回落主站直连的状态位，避免旧状态污染下一轮任务。"""
+    st.session_state.video_extension_allow_local_fallback = False
+    st.session_state.video_extension_local_fallback_attempted = False
+
+
+def do_video_fetch_single(url, *, allow_extension_fallback: bool = False) -> bool:
     """
     抓取单视频字幕，并在完成后触发总结。
     """
     url = get_current_video_url(url)
     if not url:
         st.warning("请输入视频链接")
-        return
+        return False
+
+    # --- 限流检查 ---
+    client_ip = get_client_ip()
+    is_owner = rate_limiter.is_owner(st.session_state.settings)
+    if not is_owner:
+        allowed, msg = rate_limiter.check_limit(client_ip)
+        if not allowed:
+            st.warning(msg)
+            return False
 
     status_container = st.empty()
     status_container.info("正在初始化...")
@@ -2936,7 +4941,7 @@ def do_video_fetch_single(url):
             else:
                 status.update(label="✅ 网络预检通过", state="complete")
 
-        status_container.info("正在抓取字幕/转写音频...")
+        status_container.info("正在抓取字幕文本...")
         progress_bar = st.progress(0)
         t_start_all = time.time()
 
@@ -2947,6 +4952,17 @@ def do_video_fetch_single(url):
         fetch_duration = time.time() - t_start_all
 
         if err:
+            if allow_extension_fallback:
+                progress_bar.empty()
+                status_container.warning("主站直连失败，正在自动切换插件抓取...")
+                handled_by_extension, extension_message = begin_video_extension_request(
+                    url,
+                    allow_local_fallback=False,
+                )
+                if handled_by_extension:
+                    st.info(extension_message)
+                    st.rerun()
+                    return False
             progress_bar.empty()
             status_container.error("❌ 抓取失败")
             st.error(err)
@@ -2958,7 +4974,7 @@ def do_video_fetch_single(url):
                 key_prefix="video_fetch_fail",
                 expanded=False,
             )
-            return
+            return False
 
         _whisper_device_info, text = _extract_whisper_device_info(text)
         st.session_state.whisper_device_tag = ""
@@ -2970,7 +4986,18 @@ def do_video_fetch_single(url):
         time.sleep(0.5)
         progress_bar.empty()
         do_video_summary_single(url, manual=False, fetch_duration=fetch_duration)
+        return True
     except Exception as e:
+        if allow_extension_fallback:
+            status_container.warning("主站直连异常，正在自动切换插件抓取...")
+            handled_by_extension, extension_message = begin_video_extension_request(
+                url,
+                allow_local_fallback=False,
+            )
+            if handled_by_extension:
+                st.info(extension_message)
+                st.rerun()
+                return False
         status_container.error("❌ 执行异常")
         st.error(f"{e}")
         st.code(traceback.format_exc())
@@ -2982,6 +5009,7 @@ def do_video_fetch_single(url):
             key_prefix="video_fetch_exception",
             expanded=False,
         )
+        return False
 
 
 def reset_video_extension_request_state(clear_result: bool = True):
@@ -2995,7 +5023,7 @@ def reset_video_extension_request_state(clear_result: bool = True):
         st.session_state.video_extension_request_debug_text = ""
 
 
-def begin_video_extension_request(url: str) -> tuple[bool, str]:
+def begin_video_extension_request(url: str, *, allow_local_fallback: bool = False) -> tuple[bool, str]:
     """初始化一次插件抓取请求，实际结果由后续 rerun 异步消费。"""
     url = get_current_video_url(url)
     if not url:
@@ -3007,6 +5035,15 @@ def begin_video_extension_request(url: str) -> tuple[bool, str]:
     st.session_state.video_extension_request_id = request_id
     st.session_state.video_extension_request_component_key = f"video_extension_request_{request_id}"
     st.session_state.video_extension_request_result = None
+    st.session_state.video_extension_allow_local_fallback = bool(allow_local_fallback)
+    st.session_state.video_extension_local_fallback_attempted = False
+    _update_current_processing_task(
+        task_id=request_id,
+        url=url,
+        status="queued",
+        title=url,
+        note="已发起插件抓取请求，等待扩展响应。",
+    )
     return True, "已向插件发起抓取请求，正在等待响应..."
 
 
@@ -3036,9 +5073,20 @@ def try_video_extension_first() -> tuple[str, str, str]:
     st.session_state.video_extension_request_result = normalized_result
     st.session_state.video_extension_request_debug_text = ""
     if normalized_result is None:
+        _update_current_processing_task(
+            url=url,
+            status="running",
+            note="插件已接收请求，正在等待抓取结果回传。",
+        )
         return "waiting", "已调用插件抓取，正在等待插件响应...", url
 
     if not isinstance(normalized_result, dict):
+        _update_current_processing_task(
+            url=url,
+            status="failed",
+            error="未检测到可用插件响应，且未再自动回退主站抓取。",
+            note="插件响应异常。",
+        )
         reset_video_extension_request_state()
         return "fallback", "未检测到可用插件响应，且未再自动回退主站抓取。", url
 
@@ -3078,8 +5126,14 @@ def try_video_extension_first() -> tuple[str, str, str]:
                     debug_summary = " | ".join(parts)
         if debug_lines:
             st.session_state.video_extension_request_debug_text = "\n".join(debug_lines)
+        _update_current_processing_task(
+            url=url,
+            status="failed",
+            error=error_text or "unknown_error",
+            note="插件未直接返回文本。",
+        )
         reset_video_extension_request_state(clear_result=False)
-        message = f"插件抓取未接管（{error_text or 'unknown_error'}）。请确认视频是否确实开启了字幕，或手动尝试刷新页面后再试。"
+        message = f"插件未直接返回文本（{error_text or 'unknown_error'}）。如果已启用自动续跑，主站会继续使用同一字幕抓取服务获取文本。"
         if tool_version_text:
             message += f" 当前扩展版本：v{tool_version_text}。"
         if helper_text:
@@ -3090,11 +5144,22 @@ def try_video_extension_first() -> tuple[str, str, str]:
 
     payload_id = str(normalized_result.get("payloadId") or normalized_result.get("payload_id") or "").strip()
     if not payload_id:
+        _update_current_processing_task(
+            url=url,
+            status="failed",
+            error="插件未返回 payloadId",
+            note="bridge payload 创建失败。",
+        )
         reset_video_extension_request_state(clear_result=False)
         return "fallback", "插件未返回 payloadId，且未再自动回退主站抓取。", url
 
     st.session_state.video_extension_payload_id = payload_id
     st.session_state.video_extension_last_payload_id = ""
+    _update_current_processing_task(
+        url=url,
+        status="running",
+        note="插件已返回 payloadId，主站正在读取 bridge payload。",
+    )
     reset_video_extension_request_state(clear_result=False)
     return "payload_ready", "已调用插件抓取，主站正在读取 bridge 回传...", url
 
@@ -3130,25 +5195,51 @@ def _render_video_summary_panel(
     summary_state_key: str = "summary_text",
     duration_state_key: str = "summary_duration",
     fact_check_state_prefix: str = "video_fact_check",
+    history_entry_state_key: str = "video_history_entry_id",
 ) -> None:
-    sync_video_fact_check_state(summary_state_key=summary_state_key, state_prefix=fact_check_state_prefix)
-    st.markdown("### 📝 AI 总结")
-    duration_info = st.session_state.get(duration_state_key) or {}
-    if duration_info:
-        fetch_t = duration_info.get("fetch", 0)
-        sum_t = duration_info.get("summary", 0)
-        total_t = duration_info.get("total", 0)
-        st.caption(f"⏱️ **总耗时: {total_t:.1f}s** (文本抓取: {fetch_t:.1f}s | AI 生成: {sum_t:.1f}s)")
-    st.caption(f"🤖 模型流水线：{pipeline_model_label}")
-
-    render_summary_content(
-        str(st.session_state.get(summary_state_key) or ""),
-        fact_title="🕵️ 新闻事实核查",
+    sync_video_fact_check_state(
+        summary_state_key=summary_state_key,
+        state_prefix=fact_check_state_prefix,
+        history_entry_state_key=history_entry_state_key,
     )
+    success_toast_task_id = str(
+        st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "success_toast_task_id")) or ""
+    ).strip()
+    shown_success_toast_task_id = str(
+        st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "shown_success_toast_task_id")) or ""
+    ).strip()
+    if success_toast_task_id and success_toast_task_id != shown_success_toast_task_id:
+        st.toast("来源核查已完成，右侧结果已刷新。", icon="✅")
+        st.session_state[_fact_check_state_key(fact_check_state_prefix, "shown_success_toast_task_id")] = success_toast_task_id
+    with st.container(border=True):
+        st.markdown(t("video_summary_title"))
+        duration_info = st.session_state.get(duration_state_key) or {}
+        if duration_info:
+            fetch_t = duration_info.get("fetch", 0)
+            sum_t = duration_info.get("summary", 0)
+            total_t = duration_info.get("total", 0)
+            st.markdown(
+                f'<div class="summary-section-meta">{html.escape(t("video_summary_duration", total=total_t, fetch=fetch_t, summary=sum_t))}</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            f'<div class="summary-section-meta">{html.escape(t("video_summary_pipeline", pipeline=pipeline_model_label))}</div>',
+            unsafe_allow_html=True,
+        )
+
+        render_summary_content(
+            str(st.session_state.get(summary_state_key) or ""),
+            fact_title=t("video_fact_check_title"),
+        )
     status = str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "status")) or "").strip()
     note = str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "note")) or "").strip()
+    render_browser_title_status(
+        status,
+        running_title="核查中... - YouTube Summarizer",
+        done_title="✅ 核查完成 - YouTube Summarizer",
+    )
     if status in {"queued", "running"}:
-        st.caption("🕵️ 新闻核查正在后台补跑，完成后会自动刷新到右侧区域。")
+        st.caption(t("video_fact_check_running"))
         if note:
             st.caption(note)
     elif status == "skipped":
@@ -3156,10 +5247,15 @@ def _render_video_summary_panel(
             st.caption(f"🕵️ {note}")
     elif status == "error":
         st.warning(
-            f"新闻核查补跑失败：{str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, 'error')) or '').strip()}"
+            t(
+                "video_fact_check_failed",
+                error=str(st.session_state.get(_fact_check_state_key(fact_check_state_prefix, "error")) or "").strip(),
+            )
         )
-    elif status == "success" and note:
-        st.caption(f"🕵️ {note}")
+    elif status == "success":
+        st.success("✅ 来源核查已完成，右侧结果已刷新。")
+        if note:
+            st.caption(f"🕵️ {note}")
 
     return status
 
@@ -3169,6 +5265,7 @@ def render_video_summary_section(
     summary_state_key: str = "summary_text",
     duration_state_key: str = "summary_duration",
     fact_check_state_prefix: str = "video_fact_check",
+    history_entry_state_key: str = "video_history_entry_id",
 ) -> None:
     """
     渲染视频链接入口的总结结果与耗时信息。
@@ -3186,6 +5283,7 @@ def render_video_summary_section(
             summary_state_key=summary_state_key,
             duration_state_key=duration_state_key,
             fact_check_state_prefix=fact_check_state_prefix,
+            history_entry_state_key=history_entry_state_key,
         )
         st.divider()
         if run_every is not None and status not in {"queued", "running"}:
@@ -3201,6 +5299,7 @@ def render_manual_video_summary_section(
     summary_state_key: str = "manual_summary_text",
     duration_state_key: str = "manual_summary_duration",
     fact_check_state_prefix: str = "manual_video_fact_check",
+    history_entry_state_key: str = "manual_video_history_entry_id",
 ) -> None:
     """
     渲染插件直达粘贴文本入口的总结结果与耗时信息。
@@ -3218,6 +5317,7 @@ def render_manual_video_summary_section(
             summary_state_key=summary_state_key,
             duration_state_key=duration_state_key,
             fact_check_state_prefix=fact_check_state_prefix,
+            history_entry_state_key=history_entry_state_key,
         )
         st.divider()
         if run_every is not None and status not in {"queued", "running"}:
@@ -3233,46 +5333,122 @@ def render_video_transcript_section():
     if not st.session_state.transcript_text:
         return
 
-    with st.expander("查看字幕原文", expanded=False):
+    with st.expander(t("transcript_expander"), expanded=False):
+        readable_label = t("view_mode_readable")
+        raw_label = t("view_mode_raw")
         transcript_view_mode = st.radio(
-            "字幕视图",
-            ["阅读版", "原始版"],
+            t("transcript_view_label"),
+            [readable_label, raw_label],
             horizontal=True,
             index=0,
             key="transcript_view_mode",
         )
-        if transcript_view_mode == "原始版":
-            st.caption("原始版仅移除了内部调试标签，适合排查问题。")
+        if transcript_view_mode == raw_label:
+            st.caption(t("transcript_raw_caption"))
             display_text = _raw_transcript_for_display(st.session_state.transcript_text)
         else:
-            st.caption("阅读版已自动清理内部标签，并按更适合阅读的形式展示。")
+            st.caption(t("transcript_readable_caption"))
             display_text = _clean_transcript_for_display(st.session_state.transcript_text)
-        st.text_area("字幕内容", display_text, height=360)
+        st.text_area(t("transcript_content_label"), display_text, height=360)
 
 
 def render_video_processing_tab():
     """
     渲染视频处理入口，包括抓取字幕、异步处理、字幕检测和结果展示。
     """
-    st.info("💡 支持输入：\n- YouTube 视频链接 / ID\n- Bilibili 视频链接 / BV号")
-    url = st.text_input(
-        "视频链接或 ID",
-        key="input_url",
-        placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...",
+    st.markdown(
+        f"""
+        <div class="lite-home-hero">
+            <h1>{html.escape(t("hero_title"))}</h1>
+            <p>{html.escape(t("hero_desc"))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+    url = st.text_input(
+        t("video_input_label"),
+        key="input_url",
+        placeholder=t("video_input_placeholder"),
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        f'<div class="lite-search-meta">{html.escape(t("video_input_meta"))}</div>',
+        unsafe_allow_html=True,
+    )
+    path_col1, path_col2 = st.columns(2, gap="large")
+    with path_col1:
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="lite-entry-card">
+                    <div class="lite-entry-card-title">{html.escape(t("home_path_input_title"))}</div>
+                    <p class="lite-entry-card-desc">{html.escape(t("home_path_input_desc"))}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    with path_col2:
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="lite-entry-card">
+                    <div class="lite-entry-card-title">{html.escape(t("home_path_plugin_title"))}</div>
+                    <p class="lite-entry-card-desc">{html.escape(t("home_path_plugin_desc"))}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
     remember_current_video_url(url)
     resolved_url = get_current_video_url(url)
+    fetch_strategy, fetch_strategy_message = choose_video_fetch_strategy(resolved_url)
+    auto_fetch_pending = bool(st.session_state.get("video_auto_fetch_pending"))
+    auto_fetch_url = get_current_video_url(st.session_state.get("video_auto_fetch_url") or resolved_url)
+    auto_fetch_route = str(st.session_state.get("video_auto_fetch_route") or "").strip()
+    if auto_fetch_pending and auto_fetch_url:
+        st.session_state.video_auto_fetch_pending = False
+        if auto_fetch_route in {"server_direct", "local_direct"}:
+            st.info(t("video_auto_direct"))
+            fetch_succeeded = do_video_fetch_single(auto_fetch_url, allow_extension_fallback=False)
+            if fetch_succeeded:
+                render_video_summary_section()
+                render_video_transcript_section()
+            return
+        handled_by_extension, extension_message = begin_video_extension_request(
+            auto_fetch_url,
+            allow_local_fallback=False,
+        )
+        if handled_by_extension:
+            st.info(t("video_auto_extension"))
+            st.info(extension_message)
+            st.rerun()
+            return
     extension_status, extension_message, extension_url = try_video_extension_first()
     if extension_status == "waiting" and extension_message:
         st.info(extension_message)
     elif extension_status == "payload_ready":
+        clear_video_extension_fallback_flags()
         st.rerun()
     elif extension_status == "fallback":
+        should_auto_local_fallback = (
+            bool(st.session_state.get("video_extension_allow_local_fallback"))
+            and not bool(st.session_state.get("video_extension_local_fallback_attempted"))
+            and bool(extension_url)
+        )
+        if should_auto_local_fallback:
+            st.session_state.video_extension_local_fallback_attempted = True
+            st.info("插件未直接返回文本，正在使用同一字幕抓取服务继续获取。")
+            clear_video_extension_fallback_flags()
+            fetch_succeeded = do_video_fetch_single(extension_url, allow_extension_fallback=False)
+            if fetch_succeeded:
+                render_video_summary_section()
+                render_video_transcript_section()
+            return
+        clear_video_extension_fallback_flags()
         if extension_message:
             st.error(extension_message)
         debug_text = str(st.session_state.get("video_extension_request_debug_text") or "").strip()
         if debug_text:
-            with st.expander("查看插件桥接链调试明细", expanded=False):
+            with st.expander(t("video_extension_debug"), expanded=False):
                 st.code(debug_text, language="json")
         
         # 获取当前的请求结果以提取日志
@@ -3308,23 +5484,48 @@ def render_video_processing_tab():
         st.caption("提示：本项目依赖插件提取页面文稿。如果该视频没有平台字幕，插件将无法获取文本。")
         return
 
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        fetch_btn = st.button("🚀 一键抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
-    with col2:
+    if resolved_url:
+        strategy_label = {
+            "server_direct": "统一服务端字幕抓取",
+            "local_direct": "统一服务端字幕抓取",
+            "extension": "统一插件页面提取",
+        }.get(fetch_strategy, "插件提取")
+        st.caption(f"当前智能路径：`{strategy_label}`。{fetch_strategy_message}")
+
+    action_spacer_left, action_main, action_spacer_right = st.columns([1.35, 1.3, 1.35])
+    with action_main:
+        fetch_btn = st.button("🚀 智能抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
+
+    sub_spacer_left, sub_col1, sub_col2, sub_spacer_right = st.columns([1.2, 1, 1, 1.2])
+    with sub_col1:
         summary_btn = st.button("🤖 仅重新生成总结", use_container_width=True, key="btn_single_sum")
-    with col3:
+    with sub_col2:
         check_btn = st.button("🔍 检测可用字幕", use_container_width=True, key="btn_single_check")
+    st.markdown(
+        '<div class="lite-home-helper">也可以直接在视频页点击插件，一键获取总结。</div>',
+        unsafe_allow_html=True,
+    )
 
     if fetch_btn:
         if not resolved_url:
             st.warning("请输入视频链接")
             return
-        handled_by_extension, extension_message = begin_video_extension_request(resolved_url)
+        if fetch_strategy == "server_direct":
+            st.info(fetch_strategy_message)
+            fetch_succeeded = do_video_fetch_single(resolved_url, allow_extension_fallback=True)
+            if fetch_succeeded:
+                render_video_summary_section()
+                render_video_transcript_section()
+            return
+        handled_by_extension, extension_message = begin_video_extension_request(
+            resolved_url,
+            allow_local_fallback=True,
+        )
         if handled_by_extension:
+            st.info(fetch_strategy_message)
             st.info(extension_message)
             st.rerun()
-        st.warning("当前入口已切换为插件优先模式；如果未触发插件，请检查扩展是否已在当前页面注入。")
+        st.error("未能发起插件请求，请确认扩展已在当前页面注入后重试。")
     if summary_btn:
         if not resolved_url:
             st.warning("请输入视频链接")
@@ -3369,8 +5570,9 @@ def _should_use_video_pipeline_for_extension_summary(manual_source_url: str, man
         return False
     if not _is_supported_video_source_url(manual_source_url):
         return False
-    manual_meta = st.session_state.manual_bridge_meta or {}
-    return str(manual_meta.get("source_kind") or "").strip() == "extension"
+    # 只要文本绑定的是受支持的视频链接，就统一走视频总结/新闻核查链路，
+    # 避免“输入链接”和“插件导入/手动粘贴”在同一条新闻上走出两套不同结果。
+    return True
 
 
 def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_paste_sum):
@@ -3381,8 +5583,23 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
         st.warning("请先粘贴字幕文本。")
         return
 
+    # --- 限流检查 ---
+    client_ip = get_client_ip()
+    is_owner = rate_limiter.is_owner(st.session_state.settings)
+    if not is_owner:
+        allowed, msg = rate_limiter.check_limit(client_ip)
+        if not allowed:
+            st.warning(msg)
+            return
+
     current_payload_id = st.session_state.manual_auto_payload_id if auto_paste_sum else ""
     if _should_use_video_pipeline_for_extension_summary(manual_source_url, manual_transcript):
+        manual_meta = st.session_state.manual_bridge_meta or {}
+        history_source_type = "manual_transcript"
+        if manual_meta.get("source_kind") == "extension":
+            history_source_type = "extension_bridge"
+        elif manual_meta.get("source_kind") == "local_tool":
+            history_source_type = "local_tool_bridge"
         st.session_state.manual_summary_text = ""
         st.session_state.manual_summary_duration = {}
         st.session_state.current_video_url = str(manual_source_url or "").strip()
@@ -3402,7 +5619,8 @@ def run_manual_transcript_summary(manual_source_url, manual_transcript, auto_pas
             summary_state_key="manual_summary_text",
             duration_state_key="manual_summary_duration",
             fact_check_state_prefix="manual_video_fact_check",
-            history_source_type="extension_bridge",
+            history_source_type=history_source_type,
+            history_entry_state_key="manual_video_history_entry_id",
         )
         return
 
@@ -3465,61 +5683,62 @@ def render_manual_summary_section():
             duration_state_key="manual_summary_duration",
             fact_check_state_prefix="manual_video_fact_check",
         )
-        with st.expander("查看粘贴的字幕原文", expanded=False):
-            st.text_area("字幕原文", st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
+        with st.expander(t("manual_transcript_expander"), expanded=False):
+            st.text_area(t("manual_transcript_label"), st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
         return
 
     if not st.session_state.manual_summary_text:
         return
 
-    st.markdown("### 📝 字幕总结")
+    st.markdown(t("manual_summary_title"))
     manual_dur = float((st.session_state.manual_summary_duration or {}).get("summary") or 0.0)
     if manual_dur:
-        st.caption(f"⏱️ AI生成耗时: {manual_dur:.1f}s")
-    st.caption(f"🤖 模型流水线：{pipeline_model_label}")
+        st.caption(t("manual_summary_duration", duration=manual_dur))
+    st.caption(t("video_summary_pipeline", pipeline=pipeline_model_label))
 
     if st.session_state.manual_bridge_meta:
         bridge_context = build_manual_bridge_context(st.session_state.manual_bridge_meta)
         if bridge_context.get("summary"):
-            st.info(f"本次总结来源：{bridge_context['summary']}")
+            st.info(t("manual_summary_source", summary=bridge_context["summary"]))
         if bridge_context.get("details"):
             st.caption(bridge_context["details"])
         bridge_meta_text = format_manual_bridge_meta(st.session_state.manual_bridge_meta)
         if bridge_meta_text:
-            with st.expander("查看本次总结的 bridge 元信息", expanded=False):
+            with st.expander(t("manual_bridge_meta_expander"), expanded=False):
                 st.caption(bridge_meta_text)
 
-    render_summary_content(
-        st.session_state.manual_summary_text,
-        fact_title="🕵️ 新闻事实核查",
+    render_manual_video_summary_section(
+        summary_state_key="manual_summary_text",
+        duration_state_key="manual_summary_duration",
+        fact_check_state_prefix="manual_video_fact_check",
     )
-    with st.expander("查看粘贴的字幕原文", expanded=False):
-        st.text_area("字幕原文", st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
+    with st.expander(t("manual_transcript_expander"), expanded=False):
+        st.text_area(t("manual_transcript_label"), st.session_state.manual_transcript_text, height=320, key="manual_transcript_view")
 
 
 def render_text_processing_tab():
     """
     渲染粘贴文本入口，兼容扩展 bridge 自动回填与手动粘贴总结。
     """
-    st.info("💡 适合浏览器扩展、第三方 transcript 或你手动复制的字幕文本。这里不负责抓取，只负责基于文本做总结。")
+    st.info(t("manual_info"))
     render_manual_bridge_status()
 
     manual_source_url = st.text_input(
-        "来源链接（可选）",
+        t("manual_source_label"),
         key="manual_source_url",
-        placeholder="https://www.youtube.com/watch?v=... 或 https://www.bilibili.com/video/BV...",
+        placeholder=t("manual_source_placeholder"),
     )
     manual_transcript = st.text_area(
-        "粘贴 transcript / 字幕文本",
+        t("manual_input_label"),
         height=260,
         key="manual_transcript_text",
-        placeholder="把浏览器扩展提取到的字幕文本粘贴到这里...",
+        placeholder=t("manual_input_placeholder"),
     )
     paste_col1, paste_col2 = st.columns([1, 3])
     with paste_col1:
-        paste_sum_btn = st.button("📝 总结字幕文本", type="primary", use_container_width=True, key="btn_manual_sum")
+        paste_sum_btn = st.button(t("manual_summary_btn"), type="primary", use_container_width=True, key="btn_manual_sum")
     with paste_col2:
-        st.caption("适合作为 YouTube/B站抓取失败时的稳定兜底入口。")
+        st.caption(t("manual_fallback_caption"))
 
     auto_paste_sum = bool(
         st.session_state.manual_auto_payload_id
@@ -3527,7 +5746,7 @@ def render_text_processing_tab():
         and manual_transcript.strip()
     )
     if auto_paste_sum:
-        st.caption("已接收到浏览器扩展传来的 transcript，正在自动开始总结...")
+        st.caption(t("manual_auto_start"))
 
     if paste_sum_btn or auto_paste_sum:
         run_manual_transcript_summary(manual_source_url, manual_transcript, auto_paste_sum)
@@ -3572,13 +5791,13 @@ def render_document_result(source_key: str):
     source_url_state = str(result_state.get("source_url") or "")
     doc_meta = result_state.get("meta") or {}
 
-    st.markdown("### 📄 文档总结")
+    st.markdown(t("document_summary_title"))
     file_name = doc_meta.get("file_name", "未命名文档")
     file_type = str(doc_meta.get("file_type") or "").upper() or "DOC"
     char_count = int(doc_meta.get("char_count") or 0)
     page_count = doc_meta.get("page_count")
     chunk_count = int(doc_meta.get("chunk_count") or 1)
-    strategy = "分块总结" if doc_meta.get("strategy") == "chunked" else "直接总结"
+    strategy = t("document_strategy_chunked") if doc_meta.get("strategy") == "chunked" else t("document_strategy_direct")
     duration = float(doc_meta.get("duration") or 0.0)
     source_url = str(doc_meta.get("source_url") or source_url_state or "").strip()
     ocr_used = bool(doc_meta.get("ocr_used", False))
@@ -3589,54 +5808,62 @@ def render_document_result(source_key: str):
     recommended_claim_count = int(fact_check_plan.get("recommended_claim_count") or 0)
 
     meta_parts = [
-        f"文件：`{file_name}`",
-        f"类型：`{file_type}`",
-        f"正文：`{char_count}` 字符",
-        f"策略：`{strategy}`",
-        f"分块：`{chunk_count}`",
+        f"{t('document_meta_file')}: `{file_name}`",
+        f"{t('document_meta_type')}: `{file_type}`",
+        f"{t('document_meta_body')}: `{t('document_meta_chars', count=char_count)}`",
+        f"{t('document_meta_strategy')}: `{strategy}`",
+        f"{t('document_meta_chunks')}: `{chunk_count}`",
     ]
     if page_count:
-        meta_parts.append(f"页数：`{page_count}`")
+        meta_parts.append(f"{t('document_meta_pages')}: `{page_count}`")
     if duration:
-        meta_parts.append(f"耗时：`{duration:.1f}s`")
+        meta_parts.append(f"{t('document_meta_duration')}: `{duration:.1f}s`")
     if ocr_used:
-        meta_parts.append("OCR：`已启用`")
-    meta_parts.append(f"文档判定：`{doc_type}`")
+        meta_parts.append(t("document_meta_ocr"))
+    meta_parts.append(f"{t('document_meta_doc_type')}: `{doc_type}`")
     st.caption(" | ".join(meta_parts))
     if source_url:
-        st.caption(f"来源链接：[{source_url}]({source_url})")
+        st.caption(t("document_source_link", url=source_url))
     if fact_check_reason:
-        st.caption(f"事实核查判定：{'已开启' if should_fact_check else '已跳过'}。{fact_check_reason}")
+        st.caption(
+            t(
+                "document_fact_check_status",
+                status=t("document_fact_check_enabled") if should_fact_check else t("document_fact_check_skipped"),
+                reason=fact_check_reason,
+            )
+        )
 
     if fact_check_content:
         render_summary_fact_check(
             summary_text,
             fact_check_content,
-            fact_title="🕵️ 关键声明事实核查",
-            fact_tab_label="🕵️ 关键声明核查",
+            fact_title=t("document_fact_check_title"),
+            fact_tab_label=t("document_fact_check_tab_title"),
         )
     else:
         st.markdown(summary_text)
         if should_fact_check and recommended_claim_count > 0:
-            st.warning(f"⚠️ 文档已被判定为适合事实核查，但本次未成功生成核查结果。预期核查关键声明约 {recommended_claim_count} 条。")
+            st.warning(t("document_fact_check_warning", count=recommended_claim_count))
         else:
-            st.info("📝 当前文档功能已支持本地上传、在线链接、PPTX 和扫描 PDF OCR 回退。系统会自动判断是否需要关键声明事实核查。")
+            st.info(t("document_fact_check_info"))
 
-    with st.expander("查看文档原文", expanded=False):
+    with st.expander(t("document_expander"), expanded=False):
+        readable_label = t("view_mode_readable")
+        raw_label = t("view_mode_raw")
         doc_view_mode = st.radio(
-            "文档视图",
-            ["阅读版", "原始版"],
+            t("document_view_label"),
+            [readable_label, raw_label],
             horizontal=True,
             index=0,
             key=f"document_view_mode_{source_key}",
         )
-        if doc_view_mode == "原始版":
-            st.caption("原始版为文档提取后的原始文本，适合排查解析问题。")
+        if doc_view_mode == raw_label:
+            st.caption(t("document_raw_caption"))
             display_text = raw_text
         else:
-            st.caption("阅读版为清洗后的正文文本，更适合直接阅读。")
+            st.caption(t("document_readable_caption"))
             display_text = clean_text
-        st.text_area("文档内容", display_text, height=420, key=f"document_content_{source_key}")
+        st.text_area(t("document_content_label"), display_text, height=420, key=f"document_content_{source_key}")
 
 
 def run_uploaded_document_summary(uploaded_doc):
@@ -3644,7 +5871,7 @@ def run_uploaded_document_summary(uploaded_doc):
     执行本地上传文档的提取与总结。
     """
     if not uploaded_doc:
-        st.warning("请先上传文档。")
+        st.warning(t("document_upload_missing"))
         return
 
     status_container = st.empty()
@@ -3752,24 +5979,24 @@ def render_document_processing_tab():
     """
     渲染文档处理入口，支持本地上传和在线链接两种文档总结方式。
     """
-    st.info("💡 二期已支持：本地 PDF / DOCX / TXT / Markdown / PPTX，以及在线 PDF 链接、网页文章链接。扫描版 PDF 会在提取不到文本时自动尝试 OCR。")
-    st.caption("系统会先自动判断文档类型。只有识别为新闻、研究、时评、政策解读、行业分析等适合核查的文档，才会自动执行关键声明事实核查。")
+    st.info(t("document_info"))
+    st.caption(t("document_info_caption"))
 
-    doc_source_upload, doc_source_url_tab = st.tabs(["📂 本地上传", "🔗 在线链接"])
+    doc_source_upload, doc_source_url_tab = st.tabs([t("document_tab_upload"), t("document_tab_url")])
 
     with doc_source_upload:
-        st.caption("支持 PDF、DOCX、TXT、Markdown、PPTX，建议单文件不超过 20MB。")
+        st.caption(t("document_upload_caption"))
         uploaded_doc = st.file_uploader(
-            "上传文档",
+            t("document_upload_label"),
             type=["pdf", "docx", "txt", "md", "markdown", "pptx"],
             key="doc_uploader",
             label_visibility="collapsed",
         )
         doc_col1, doc_col2 = st.columns([1, 2])
         with doc_col1:
-            doc_sum_btn = st.button("📄 提取并总结文档", type="primary", use_container_width=True, key="btn_doc_sum")
+            doc_sum_btn = st.button(t("document_summary_btn"), type="primary", use_container_width=True, key="btn_doc_sum")
         with doc_col2:
-            st.caption("长文档会自动分块总结；事实核查只针对关键声明进行。")
+            st.caption(t("document_upload_footer"))
 
         if doc_sum_btn:
             run_uploaded_document_summary(uploaded_doc)
@@ -3777,15 +6004,15 @@ def render_document_processing_tab():
 
     with doc_source_url_tab:
         doc_url = st.text_input(
-            "在线文档/文章链接",
+            t("document_url_label"),
             key="document_url_input",
-            placeholder="https://example.com/report.pdf 或 https://example.com/article",
+            placeholder=t("document_url_placeholder"),
         )
         doc_url_col1, doc_url_col2 = st.columns([1, 2])
         with doc_url_col1:
-            doc_url_btn = st.button("🌐 抓取并总结在线内容", type="primary", use_container_width=True, key="btn_doc_url_sum")
+            doc_url_btn = st.button(t("document_url_btn"), type="primary", use_container_width=True, key="btn_doc_url_sum")
         with doc_url_col2:
-            st.caption("支持在线 PDF、网页文章、公开 DOCX/PPTX/TXT/Markdown 链接。")
+            st.caption(t("document_url_footer"))
 
         if doc_url_btn:
             run_document_url_summary(doc_url)
@@ -3817,7 +6044,7 @@ def handle_subscription_search_or_add(new_channel_input):
     处理订阅输入，支持直接添加频道链接或按关键词搜索频道。
     """
     if not new_channel_input:
-        st.warning("请输入内容")
+        st.warning(t("subscription_input_required"))
         return
 
     is_url = (
@@ -3825,11 +6052,10 @@ def handle_subscription_search_or_add(new_channel_input):
         or "://" in new_channel_input
         or new_channel_input.startswith("@")
         or "www." in new_channel_input
-        or new_channel_input.startswith("BV")
     )
 
     if is_url:
-        with st.spinner("正在获取频道信息..."):
+        with st.spinner(t("subscription_fetch_channel")):
             try:
                 eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
                 cid, cname, curl, cavatar, cplatform = get_channel_info(
@@ -3838,15 +6064,15 @@ def handle_subscription_search_or_add(new_channel_input):
                     timeout_seconds=float(timeout),
                 )
                 if _append_subscription(cid, cname, curl, cavatar, cplatform):
-                    st.success(f"已添加订阅: {cname} ({cplatform})")
+                    st.success(t("subscription_added_success", name=cname, platform=cplatform))
                     st.rerun()
-                st.warning(f"频道 '{cname}' 已在订阅列表中")
+                st.warning(t("subscription_exists", name=cname))
             except Exception as e:
-                st.error(f"添加失败: {e}")
+                st.error(t("subscription_add_failed", error=e))
         return
 
     st.session_state.search_results = None
-    with st.spinner(f"正在搜索 '{new_channel_input}' ..."):
+    with st.spinner(t("subscription_searching", keyword=new_channel_input)):
         eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
         results = search_channels(
             new_channel_input,
@@ -3855,8 +6081,8 @@ def handle_subscription_search_or_add(new_channel_input):
             timeout_seconds=float(timeout),
         )
         st.session_state.search_results = results
-        if not results.get("youtube") and not results.get("bilibili"):
-            st.warning("未找到相关频道")
+        if not results.get("youtube"):
+            st.warning(t("subscription_not_found"))
         else:
             st.rerun()
 
@@ -3878,29 +6104,24 @@ def render_subscription_search_item(item):
                     f"</div>",
                     unsafe_allow_html=True,
                 )
-            elif item["platform"] == "youtube":
-                st.markdown(
-                    "<div style='height: 60px; display: flex; align-items: center; justify-content: center; font-size: 30px; background-color: #f0f0f0; border-radius: 50%;'>🟥</div>",
-                    unsafe_allow_html=True,
-                )
             else:
                 st.markdown(
-                    "<div style='height: 60px; display: flex; align-items: center; justify-content: center; font-size: 30px; background-color: #f0f0f0; border-radius: 50%;'>🟦</div>",
+                    "<div style='height: 60px; display: flex; align-items: center; justify-content: center; font-size: 30px; background-color: #f0f0f0; border-radius: 50%;'>📺</div>",
                     unsafe_allow_html=True,
                 )
         with c_info:
-            name = item.get("name", "Unknown")
+            name = item.get("name", t("subscription_unknown_name"))
             desc = item.get("desc", "")
             url = item.get("url", "")
             st.markdown(f"**[{name}]({url})**")
             if desc:
                 st.caption(desc)
             else:
-                st.caption(f"{'YouTube' if item['platform'] == 'youtube' else 'Bilibili'} 频道")
+                st.caption(t("subscription_youtube_channel"))
         with c_btn:
             st.write("")
-            if st.button("➕ 添加", key=f"add_res_{item['platform']}_{item['id']}", use_container_width=True):
-                with st.spinner("正在添加..."):
+            if st.button(t("subscription_search_add"), key=f"add_res_{item['platform']}_{item['id']}", use_container_width=True):
+                with st.spinner(t("subscription_fetch_channel")):
                     try:
                         eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
                         cid, cname, curl, cavatar, cplatform = get_channel_info(
@@ -3910,11 +6131,11 @@ def render_subscription_search_item(item):
                         )
                         if _append_subscription(cid, cname, curl, cavatar, cplatform):
                             st.session_state.search_results = None
-                            st.success(f"已添加: {cname}")
+                            st.success(t("subscription_added_short", name=cname))
                             st.rerun()
-                        st.warning(f"已存在: {cname}")
+                        st.warning(t("subscription_exists_short", name=cname))
                     except Exception as e:
-                        st.error(f"添加失败: {e}")
+                        st.error(t("subscription_add_failed", error=e))
 
 
 def render_subscription_search_results():
@@ -3925,50 +6146,26 @@ def render_subscription_search_results():
         return
 
     st.divider()
-    st.markdown("### 🔍 搜索结果")
+    st.markdown(t("subscription_search_results"))
 
     res_yt = st.session_state.search_results.get("youtube", [])
-    res_b = st.session_state.search_results.get("bilibili", [])
-    tab_res_yt, tab_res_b = st.tabs([f"YouTube ({len(res_yt)})", f"Bilibili ({len(res_b)})"])
+    
+    if not res_yt:
+        st.info(t("subscription_no_results"))
+    else:
+        for item in res_yt:
+            render_subscription_search_item(item)
 
-    with tab_res_yt:
-        if not res_yt:
-            st.info("无结果")
-        else:
-            for item in res_yt:
-                render_subscription_search_item(item)
-
-    with tab_res_b:
-        if not res_b:
-            st.info("无结果")
-        else:
-            for item in res_b:
-                render_subscription_search_item(item)
-
-    if st.button("✕ 关闭搜索", key="close_search"):
+    if st.button(t("subscription_close_search"), key="close_search"):
         st.session_state.search_results = None
         st.rerun()
 
 
 def split_subscriptions_by_platform():
     """
-    将当前订阅按平台拆分为 YouTube 与 Bilibili 两组。
+    获取 YouTube 订阅。
     """
-    youtube_subscriptions = []
-    bilibili_subscriptions = []
-
-    for sub in st.session_state.subscriptions:
-        platform = sub.get("platform")
-        if not platform:
-            sub_url = sub.get("url", "").lower()
-            platform = "bilibili" if "bilibili.com" in sub_url else "youtube"
-
-        if platform == "bilibili":
-            bilibili_subscriptions.append(sub)
-        else:
-            youtube_subscriptions.append(sub)
-
-    return youtube_subscriptions, bilibili_subscriptions
+    return st.session_state.subscriptions, []
 
 
 def render_subscription_card(sub, index_key_suffix, mode="grid"):
@@ -4003,7 +6200,7 @@ def render_subscription_card(sub, index_key_suffix, mode="grid"):
                 f"<div style='text-align: center; font-weight: bold; margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;' title='{sub['name']}'><a href='{sub['url']}' target='_blank' style='text-decoration: none; color: inherit;'>{name}</a></div>",
                 unsafe_allow_html=True,
             )
-            if st.button("🗑️", key=f"del_{real_index}_{index_key_suffix}", help=f"删除 {sub['name']}", use_container_width=True):
+            if st.button("🗑️", key=f"del_{real_index}_{index_key_suffix}", help=t("subscription_delete_help", name=sub["name"]), use_container_width=True):
                 st.session_state.subscriptions.pop(real_index)
                 save_subscriptions(st.session_state.subscriptions)
                 st.rerun()
@@ -4027,7 +6224,7 @@ def render_subscription_card(sub, index_key_suffix, mode="grid"):
             unsafe_allow_html=True,
         )
     with c_act:
-        if st.button("🗑️", key=f"del_list_{real_index}_{index_key_suffix}", help=f"删除 {sub['name']}"):
+        if st.button("🗑️", key=f"del_list_{real_index}_{index_key_suffix}", help=t("subscription_delete_help", name=sub["name"])):
             st.session_state.subscriptions.pop(real_index)
             save_subscriptions(st.session_state.subscriptions)
             st.rerun()
@@ -4042,7 +6239,7 @@ def render_subscription_platform_section(title, subscriptions, index_key_suffix,
         return
 
     st.markdown(title)
-    if view_mode == "网格":
+    if view_mode == "grid":
         cols_count = 4
         for i in range(0, len(subscriptions), cols_count):
             cols = st.columns(cols_count)
@@ -4061,32 +6258,44 @@ def render_subscription_list_panel():
     渲染已订阅频道列表。
     """
     st.divider()
-    st.markdown("##### 📋 已订阅频道")
-    view_mode = st.radio("视图模式", ["列表", "网格"], horizontal=True, index=0, key="sub_view_mode", label_visibility="collapsed")
+    st.markdown(t("subscription_list_title"))
+    view_mode_options = {
+        t("subscription_view_list"): "list",
+        t("subscription_view_grid"): "grid",
+    }
+    view_mode_label = st.radio(
+        t("subscription_view_mode"),
+        list(view_mode_options.keys()),
+        horizontal=True,
+        index=0,
+        key="sub_view_mode",
+        label_visibility="collapsed",
+    )
+    view_mode = view_mode_options.get(view_mode_label, "list")
 
     if not st.session_state.subscriptions:
-        st.info("暂无订阅，请添加")
+        st.info(t("subscription_empty"))
         return
 
-    yt_subs, b_subs = split_subscriptions_by_platform()
-    render_subscription_platform_section("#### 🟥 YouTube", yt_subs, "yt", view_mode)
-
-    if b_subs and yt_subs:
-        st.markdown("---")
-    render_subscription_platform_section("#### 🟦 Bilibili", b_subs, "b", view_mode)
+    yt_subs, _ = split_subscriptions_by_platform()
+    render_subscription_platform_section(t("subscription_channel_section"), yt_subs, "yt", view_mode)
 
 
 def render_subscription_management_panel():
     """
     渲染订阅管理面板，包含添加、搜索结果和订阅列表。
     """
-    with st.expander("📺 订阅管理 (添加 / 查看 / 删除)", expanded=False):
-        st.markdown("##### ➕ 添加新订阅")
-        new_channel_input = st.text_input("输入频道链接或关键词 (如 '李永乐')", key="sub_input")
+    with st.expander(t("subscription_manage_expander"), expanded=False):
+        st.markdown(t("subscription_add_new"))
+        new_channel_input = st.text_input(
+            t("subscription_input_label"),
+            key="sub_input",
+            placeholder=t("subscription_input_placeholder"),
+        )
 
         col_act_1, col_act_2 = st.columns([1, 3])
         with col_act_1:
-            if st.button("🔍 搜索 / 添加", use_container_width=True):
+            if st.button(t("subscription_search_button"), use_container_width=True):
                 handle_subscription_search_or_add(new_channel_input)
 
         render_subscription_search_results()
@@ -4095,18 +6304,9 @@ def render_subscription_management_panel():
 
 def _resolve_subscription_platform_display(sub):
     """
-    根据订阅信息返回平台标识与颜色，用于统一动态列表展示。
+    返回 YouTube 平台标识。
     """
-    sub_platform = sub.get("platform", "")
-    if not sub_platform:
-        if "bilibili" in sub.get("url", "").lower():
-            sub_platform = "bilibili"
-        else:
-            sub_platform = "youtube"
-
-    if sub_platform == "bilibili":
-        return "🟦 Bilibili", "blue"
-    return "🟥 YouTube", "red"
+    return "📺 YouTube", "red"
 
 
 def _check_subscription_recent_videos(sub, proxy, timeout_val):
@@ -4141,26 +6341,26 @@ def run_subscription_update_check():
     执行全量订阅更新检查，并维护进度与结果状态。
     """
     if not st.session_state.subscriptions:
-        st.info("暂无订阅频道，请先添加订阅后再检查更新。")
+        st.info(t("subscription_empty_update"))
         st.session_state.is_updating_all = False
         return
 
     st.session_state.is_updating_all = True
     st.session_state.updates = {}
 
-    with st.status("正在检查更新...", expanded=True) as status:
-        progress_text = "准备开始：正在检测网络代理..."
+    with st.status(t("subscription_checking_status"), expanded=True) as status:
+        progress_text = t("subscription_check_prepare_proxy")
         progress_bar = st.progress(0, text=progress_text)
 
         eff_proxy, _ = get_effective_proxy(proxy_input, use_system_proxy)
-        progress_bar.progress(0, text="准备开始：正在初始化检查任务...")
+        progress_bar.progress(0, text=t("subscription_check_prepare_tasks"))
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
     max_workers = min(len(st.session_state.subscriptions), 20)
-    progress_bar.progress(0, text=f"正在启动 {max_workers} 个并发检查任务...")
+    progress_bar.progress(0, text=t("subscription_check_launch", count=max_workers))
     start_time = time.time()
-    status.update(label="正在检查更新... (已耗时 0s)", state="running")
+    status.update(label=t("subscription_check_running", elapsed=0), state="running")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_sub = {
@@ -4170,7 +6370,7 @@ def run_subscription_update_check():
 
         completed_count = 0
         total_subs = len(st.session_state.subscriptions)
-        progress_bar.progress(0.01, text=f"(0/{total_subs}) 任务已提交，等待结果...")
+        progress_bar.progress(0.01, text=t("subscription_check_waiting", done=0, total=total_subs))
 
         for future in as_completed(future_to_sub):
             sub = future_to_sub[future]
@@ -4184,26 +6384,32 @@ def run_subscription_update_check():
 
             progress_bar.progress(
                 pct,
-                text=f"({completed_count}/{total_subs}) 正在检查: {sub['name']}... | 预计剩余: {int(remain_time)}s",
+                text=t(
+                    "subscription_check_progress",
+                    done=completed_count,
+                    total=total_subs,
+                    name=sub["name"],
+                    remain=int(remain_time),
+                ),
             )
-            status.update(label=f"正在检查更新... (已耗时 {int(elapsed)}s)", state="running")
+            status.update(label=t("subscription_check_running", elapsed=int(elapsed)), state="running")
 
             try:
                 sid, result = future.result()
                 if isinstance(result, list):
                     if result:
                         st.session_state.updates[sid] = result
-                        status.write(f"✅ {sub['name']}: 发现 {len(result)} 个新视频")
+                        status.write(t("subscription_check_found", name=sub["name"], count=len(result)))
                 else:
-                    status.write(f"⚠️ {sub['name']} 检查失败: {result}")
+                    status.write(t("subscription_check_failed", name=sub["name"], error=result))
             except Exception as exc:
-                status.write(f"⚠️ {sub['name']} 异常: {exc}")
+                status.write(t("subscription_check_exception", name=sub["name"], error=exc))
 
     total_elapsed = time.time() - start_time
-    progress_bar.progress(1.0, text=f"检查完成！总耗时 {int(total_elapsed)}s")
+    progress_bar.progress(1.0, text=t("subscription_check_done_progress", elapsed=int(total_elapsed)))
     time.sleep(0.5)
     progress_bar.empty()
-    status.update(label=f"✅ 更新检查完成 (耗时 {int(total_elapsed)}s)", state="complete", expanded=False)
+    status.update(label=t("subscription_check_done", elapsed=int(total_elapsed)), state="complete", expanded=False)
     st.session_state.last_update_check = datetime.now().strftime("%H:%M")
     st.session_state.is_updating_all = False
     st.rerun()
@@ -4219,7 +6425,7 @@ def render_cached_subscription_summary(video_id):
 
     render_summary_content(
         st.session_state[cache_key],
-        fact_title="🕵️ 新闻事实核查",
+        fact_title=t("video_fact_check_title"),
     )
 
     meta_key = f"cache_meta_{video_id}"
@@ -4233,7 +6439,12 @@ def build_subscription_summary_footer(duration, whisper_device_info, transcript_
     """
     构建订阅视频总结页脚信息。
     """
-    footer_str = f"本总结由 {pipeline_model_label} 流水线生成{whisper_device_info} | ⏳ 总耗时: {duration:.1f}s"
+    footer_str = t(
+        "subscription_summary_footer",
+        pipeline=pipeline_model_label,
+        device=whisper_device_info,
+        duration=duration,
+    )
 
     try:
         raw_text = transcript_text or ""
@@ -4244,7 +6455,12 @@ def build_subscription_summary_footer(duration, whisper_device_info, transcript_
             if m_timing:
                 dl_time = float(m_timing.group(1))
                 tr_time = float(m_timing.group(2))
-                footer_str += f" (📥 下载: {dl_time:.1f}s | 🎙️ 转写: {tr_time:.1f}s | 🤖 AI: {duration:.1f}s)"
+                footer_str += t(
+                    "subscription_summary_footer_timing",
+                    download=dl_time,
+                    transcribe=tr_time,
+                    duration=duration,
+                )
     except Exception:
         pass
 
@@ -4274,23 +6490,27 @@ def create_subscription_summary_stream(text):
     from core_logic import summarize_text
 
     if summary_model_selected != fact_check_model_selected:
-        return summarize_text(
+        return _call_with_optional_kwargs(
+            summarize_text,
             text,
             api_key,
             base_url,
             summary_model_selected,
             proxy_input,
             fact_check_model=fact_check_model_selected,
+            ui_locale=get_ui_locale(),
             stream=False,
         )
 
-    return summarize_text(
+    return _call_with_optional_kwargs(
+        summarize_text,
         text,
         api_key,
         base_url,
         summary_model_selected,
         proxy_input,
         fact_check_model=fact_check_model_selected,
+        ui_locale=get_ui_locale(),
         stream=True,
     )
 
@@ -4339,9 +6559,9 @@ def render_subscription_video_summary_panel(video):
     with st.container(border=True):
         c_head_1, c_head_2 = st.columns([15, 1])
         with c_head_1:
-            st.markdown("### 📝 AI 总结")
+            st.markdown(t("video_summary_title"))
         with c_head_2:
-            if st.button("✕", key=f"close_{video['id']}", help="关闭总结"):
+            if st.button("✕", key=f"close_{video['id']}", help=t("subscription_summary_close")):
                 st.session_state.viewing_summaries.pop(video["id"])
                 st.rerun()
 
@@ -4351,33 +6571,33 @@ def render_subscription_video_summary_panel(video):
 
         status_container = st.empty()
         progress_container = st.empty()
-        progress_bar = progress_container.progress(0, text="⏳ 正在初始化...")
+        progress_bar = progress_container.progress(0, text=t("subscription_summary_init"))
         start_time = time.time()
-        progress_bar.progress(10, text="⏳ 正在准备抓取字幕/转写音频 (可能需要下载音频)...")
+        progress_bar.progress(10, text=t("subscription_summary_prepare"))
 
         try:
             text, err, whisper_device_info = fetch_subscription_video_transcript(video["url"], progress_bar)
             if err:
                 progress_container.empty()
-                status_container.error(f"❌ 字幕获取失败: {err}")
+                status_container.error(t("subscription_summary_transcript_failed", error=err))
                 return
 
-            progress_bar.progress(40, text="🚀 字幕获取成功，正在请求 AI 生成总结...")
+            progress_bar.progress(40, text=t("subscription_summary_ai_ready"))
             if summary_model_selected != fact_check_model_selected:
-                status_container.info("🚀 正在请求 AI 生成总结（双模型流水线）...")
+                status_container.info(t("subscription_summary_ai_dual"))
             else:
-                status_container.info("🚀 正在请求 AI 生成总结 (流式输出)...")
+                status_container.info(t("subscription_summary_ai_stream"))
 
             if not api_key:
                 progress_container.empty()
-                status_container.error("请在侧边栏填写 API Key")
+                status_container.error(t("subscription_summary_need_api"))
                 return
 
             try:
-                progress_bar.progress(50, text="🚀 正在连接大模型 API...")
+                progress_bar.progress(50, text=t("subscription_summary_connect_api"))
                 stream = create_subscription_summary_stream(text)
 
-                progress_bar.progress(60, text="🚀 开始接收 AI 响应...")
+                progress_bar.progress(60, text=t("subscription_summary_receive"))
                 time.sleep(0.2)
                 progress_container.empty()
 
@@ -4407,10 +6627,10 @@ def render_subscription_video_summary_panel(video):
 
             except Exception as e:
                 progress_container.empty()
-                status_container.error(f"总结过程出错: {e}")
+                status_container.error(t("subscription_summary_error", error=e))
         except Exception as outer_e:
             progress_container.empty()
-            status_container.error(f"处理出错: {outer_e}")
+            status_container.error(t("subscription_process_error", error=outer_e))
 
 
 def format_subscription_video_meta(video):
@@ -4430,9 +6650,17 @@ def format_subscription_video_meta(video):
 
     if duration:
         if duration >= 3600:
-            duration_text = f"{int(duration // 3600)}小时{int((duration % 3600) // 60)}分"
+            duration_text = t(
+                "subscription_duration_hm",
+                hours=int(duration // 3600),
+                minutes=int((duration % 3600) // 60),
+            )
         else:
-            duration_text = f"{int(duration // 60)}分{int(duration % 60)}秒"
+            duration_text = t(
+                "subscription_duration_ms",
+                minutes=int(duration // 60),
+                seconds=int(duration % 60),
+            )
         info_parts.append(f"⏳ {duration_text}")
 
     return " | ".join(info_parts)
@@ -4461,7 +6689,7 @@ def render_subscription_video_item(video):
             st.write("")
             ensure_subscription_summary_state()
 
-            if st.button("✨ 总结", key=f"btn_sum_{video['id']}", use_container_width=True):
+            if st.button(t("subscription_summarize_btn"), key=f"btn_sum_{video['id']}", use_container_width=True):
                 st.session_state.viewing_summaries[video["id"]] = True
                 st.rerun()
 
@@ -4499,9 +6727,9 @@ def render_subscription_updates_results():
         return
 
     if "last_update_check" in st.session_state:
-        st.info(f"检查完成 ({st.session_state.last_update_check})，暂无新内容")
+        st.info(t("subscription_updates_none_after", time=st.session_state.last_update_check))
     else:
-        st.info("点击上方按钮检查更新")
+        st.info(t("subscription_updates_none_before"))
 
 
 def render_subscription_updates_panel():
@@ -4509,9 +6737,9 @@ def render_subscription_updates_panel():
     渲染订阅更新检查与最新动态列表。
     """
     with st.container():
-        st.subheader("🆕 最新动态")
+        st.subheader(t("subscription_updates_header"))
 
-        if st.button("🔄 检查所有订阅更新", type="primary", use_container_width=True):
+        if st.button(t("subscription_updates_check_all"), type="primary", use_container_width=True):
             run_subscription_update_check()
 
         update_container = st.empty()
@@ -4539,11 +6767,27 @@ def render_daily_report_filters(daily_items):
 
     filter_c1, filter_c2, filter_c3 = st.columns([2, 1, 2])
     with filter_c1:
-        selected_date = st.selectbox("选择日期", dates, index=default_index, label_visibility="collapsed")
+        selected_date = st.selectbox(t("daily_report_select_date"), dates, index=default_index, label_visibility="collapsed")
     with filter_c2:
-        status_filter = st.selectbox("状态筛选", ["全部", "成功", "失败"], index=0, label_visibility="collapsed")
+        status_options = {
+            t("filter_all"): "all",
+            t("daily_report_filter_success"): "success",
+            t("daily_report_filter_failed"): "failed",
+        }
+        status_label = st.selectbox(
+            t("daily_report_filter_status"),
+            list(status_options.keys()),
+            index=0,
+            label_visibility="collapsed",
+        )
+        status_filter = status_options.get(status_label, "all")
     with filter_c3:
-        keyword = st.text_input("搜索标题", value="", placeholder="🔍 搜索更新内容...", label_visibility="collapsed")
+        keyword = st.text_input(
+            t("daily_report_search_title"),
+            value="",
+            placeholder=t("daily_report_search_placeholder"),
+            label_visibility="collapsed",
+        )
 
     return selected_date, status_filter, keyword
 
@@ -4556,9 +6800,9 @@ def render_daily_report_metrics(day_info):
         return
 
     metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric("总计更新", day_info.get("total_items"))
-    metric_2.metric("成功", day_info.get("success_items"))
-    metric_3.metric("失败", day_info.get("failed_items"))
+    metric_1.metric(t("daily_report_metric_total"), day_info.get("total_items"))
+    metric_2.metric(t("status_success"), day_info.get("success_items"))
+    metric_3.metric(t("status_failed"), day_info.get("failed_items"))
 
 
 def filter_daily_report_items(items, status_filter, keyword):
@@ -4571,12 +6815,12 @@ def filter_daily_report_items(items, status_filter, keyword):
 
     for item in items_sorted:
         status = item.get("status") or ""
-        if status_filter == "成功" and status != "success":
+        if status_filter == "success" and status != "success":
             continue
-        if status_filter == "失败" and status == "success":
+        if status_filter == "failed" and status == "success":
             continue
 
-        title = item.get("title") or "未命名内容"
+        title = item.get("title") or t("daily_report_item_untitled")
         if keyword_text and keyword_text not in title.lower():
             continue
         filtered_items.append(item)
@@ -4589,7 +6833,7 @@ def render_daily_report_item(item):
     渲染单条日报记录卡片。
     """
     status = item.get("status") or ""
-    title = item.get("title") or "未命名内容"
+    title = item.get("title") or t("daily_report_item_untitled")
 
     with st.container(border=True):
         head_c1, head_c2 = st.columns([4, 1])
@@ -4604,22 +6848,22 @@ def render_daily_report_item(item):
             st.caption(" | ".join(caption_parts))
         with head_c2:
             if status == "success":
-                st.success("成功", icon="✅")
+                st.success(t("status_success"), icon="✅")
             else:
-                st.error("失败", icon="❌")
+                st.error(t("status_failed"), icon="❌")
 
         if item.get("url"):
-            st.caption(f"🔗 [视频链接]({item.get('url')})")
+            st.caption(f"🔗 [{t('daily_report_video_link')}]({item.get('url')})")
 
         if status == "success":
-            with st.expander("查看 AI 总结", expanded=False):
+            with st.expander(t("daily_report_view_summary"), expanded=False):
                 render_summary_content(
                     item.get("summary") or "",
-                    fact_title="🕵️ 新闻事实核查",
+                    fact_title=t("video_fact_check_title"),
                 )
         else:
-            err_text = item.get("error") or "未知错误"
-            st.error(f"失败原因: {err_text}")
+            err_text = item.get("error") or t("status_unknown")
+            st.error(t("task_failure_reason", error=err_text))
 
 
 def render_daily_report_tab(run_items):
@@ -4628,7 +6872,7 @@ def render_daily_report_tab(run_items):
     """
     daily_items, items_by_day = _group_items_by_day(run_items)
     if not daily_items:
-        st.info("暂无更新记录，请先在“任务管理”中添加并执行任务")
+        st.info(t("daily_report_empty"))
         return
 
     selected_date, status_filter, keyword = render_daily_report_filters(daily_items)
@@ -4638,12 +6882,12 @@ def render_daily_report_tab(run_items):
     st.divider()
     items = items_by_day.get(selected_date, [])
     if not items:
-        st.caption("该日期暂无更新内容")
+        st.caption(t("daily_report_empty_date"))
         return
 
     filtered_items = filter_daily_report_items(items, status_filter, keyword)
     if not filtered_items:
-        st.caption("没有符合当前筛选条件的更新内容")
+        st.caption(t("daily_report_empty_filter"))
         return
 
     for item in filtered_items:
@@ -4654,13 +6898,13 @@ def render_task_quick_actions(settings, tasks, runs, run_items, processed_ids):
     """
     渲染任务管理中的快捷操作区域。
     """
-    st.markdown("##### 🚀 快捷操作")
+    st.markdown(t("automation_quick_actions"))
     if not tasks:
-        st.caption("暂无可执行任务")
+        st.caption(t("automation_no_tasks"))
         return
 
-    if st.button("立即执行全部", type="primary", use_container_width=True):
-        with st.spinner("正在执行全部任务..."):
+    if st.button(t("automation_run_all"), type="primary", use_container_width=True):
+        with st.spinner(t("automation_running_all")):
             for task in tasks:
                 if not task.get("enabled"):
                     continue
@@ -4671,21 +6915,8 @@ def render_task_quick_actions(settings, tasks, runs, run_items, processed_ids):
             processed_ids = settings.get("scheduled_processed_ids") or processed_ids
             _save_scheduled_state(settings, tasks, settings.get("schedule_logs") or [], runs, run_items, processed_ids)
 
-        st.toast("已执行全部启用任务", icon="✅")
+        st.toast(t("automation_run_all_done"), icon="✅")
         st.rerun()
-
-
-def _get_subscription_platform_label(url):
-    """
-    根据频道 URL 返回平台展示名。
-    """
-    if not url:
-        return "❓"
-    if "youtube" in url or "youtu.be" in url:
-        return "YouTube"
-    if "bilibili" in url:
-        return "Bilibili"
-    return "❓"
 
 
 def build_task_subscription_label_map(subs):
@@ -4694,10 +6925,7 @@ def build_task_subscription_label_map(subs):
     """
     label_map = {}
     for sub in subs:
-        platform = sub.get("platform")
-        if not platform or platform == "?":
-            platform = _get_subscription_platform_label(sub.get("url"))
-        label = f"{sub.get('name')} ({platform})"
+        label = f"{sub.get('name')} (youtube)"
         label_map[label] = sub
     return label_map
 
@@ -4707,8 +6935,15 @@ def render_task_schedule_inputs():
     渲染任务调度配置输入，并返回统一的配置结果。
     """
     st.divider()
-    st.caption("⏰ 时间设置")
-    simple_mode = st.toggle("简单模式", value=True)
+    st.caption(t("automation_schedule_title"))
+    simple_mode = st.toggle(t("automation_simple_mode"), value=True)
+    schedule_options = {
+        t("automation_schedule_daily"): "daily",
+        t("automation_schedule_weekly"): "weekly",
+        t("automation_schedule_interval"): "interval",
+        t("automation_schedule_cron"): "cron",
+    }
+    weekday_labels = _automation_weekday_labels()
 
     interval_hours = 0
     cron_value = ""
@@ -4716,20 +6951,25 @@ def render_task_schedule_inputs():
     schedule_time = None
 
     if simple_mode:
-        schedule_type = "每天"
-        schedule_time = st.time_input("每天几点运行", value=dt_time(9, 0))
+        schedule_type = "daily"
+        schedule_time = st.time_input(t("automation_schedule_daily_time"), value=dt_time(9, 0))
     else:
-        schedule_type = st.selectbox("周期类型", ["每天", "每周", "间隔小时", "Cron"])
-        if schedule_type == "每天":
-            schedule_time = st.time_input("时间点", value=dt_time(9, 0))
-        elif schedule_type == "每周":
-            schedule_time = st.time_input("时间点", value=dt_time(9, 0))
-            selected_days = st.multiselect("星期", ["一", "二", "三", "四", "五", "六", "日"], default=["一", "二", "三", "四", "五"])
-            weekdays_value = [["一", "二", "三", "四", "五", "六", "日"].index(day) for day in selected_days]
-        elif schedule_type == "间隔小时":
-            interval_hours = st.number_input("每隔几小时", 1, 168, 6)
+        schedule_type_label = st.selectbox(t("automation_schedule_type"), list(schedule_options.keys()))
+        schedule_type = schedule_options.get(schedule_type_label, "daily")
+        if schedule_type == "daily":
+            schedule_time = st.time_input(t("automation_schedule_time_point"), value=dt_time(9, 0))
+        elif schedule_type == "weekly":
+            schedule_time = st.time_input(t("automation_schedule_time_point"), value=dt_time(9, 0))
+            selected_days = st.multiselect(
+                t("automation_schedule_weekdays"),
+                weekday_labels,
+                default=weekday_labels[:5],
+            )
+            weekdays_value = [weekday_labels.index(day) for day in selected_days]
+        elif schedule_type == "interval":
+            interval_hours = st.number_input(t("automation_schedule_interval_hours"), 1, 168, 6)
         else:
-            cron_value = st.text_input("Cron表达式", "0 9 * * *")
+            cron_value = st.text_input(t("automation_schedule_cron_expr"), "0 9 * * *")
 
     return {
         "schedule_type": schedule_type,
@@ -4744,11 +6984,12 @@ def normalize_schedule_type_label(schedule_type_label):
     """
     将任务创建弹层中的中文调度类型转换为内部标识。
     """
-    if schedule_type_label == "每天":
+    normalized = str(schedule_type_label or "").strip().lower()
+    if normalized in ["daily", "每天"]:
         return "daily"
-    if schedule_type_label == "每周":
+    if normalized in ["weekly", "每周"]:
         return "weekly"
-    if schedule_type_label == "间隔小时":
+    if normalized in ["interval", "间隔小时"]:
         return "interval"
     return "cron"
 
@@ -4781,33 +7022,37 @@ def render_task_creation_popover(settings, tasks, logs, runs, run_items, process
     """
     渲染新建任务弹层。
     """
-    st.markdown("##### ➕ 新建任务")
-    with st.popover("添加新任务", use_container_width=True):
+    st.markdown(t("automation_create_task_title"))
+    with st.popover(t("automation_create_task_btn"), use_container_width=True):
         if not st.session_state.subscriptions:
-            st.warning("请先在“频道订阅”中添加频道")
+            st.warning(t("automation_create_task_need_sub"))
             return
 
         subs = st.session_state.subscriptions
         label_map = build_task_subscription_label_map(subs)
 
-        keyword = st.text_input("搜索频道", placeholder="输入关键词...", label_visibility="collapsed")
+        keyword = st.text_input(
+            t("automation_search_channel"),
+            placeholder=t("automation_search_channel_placeholder"),
+            label_visibility="collapsed",
+        )
         filtered_labels = [label for label in label_map.keys() if keyword.lower() in label.lower()] if keyword else list(label_map.keys())
 
-        if st.button("全选", use_container_width=True):
+        if st.button(t("automation_select_all"), use_container_width=True):
             st.session_state.selected_channel_labels = filtered_labels
             st.rerun()
 
         if "selected_channel_labels" not in st.session_state:
             st.session_state.selected_channel_labels = []
 
-        selected_labels = st.multiselect("选择频道", filtered_labels, default=st.session_state.selected_channel_labels)
+        selected_labels = st.multiselect(t("automation_select_channels"), filtered_labels, default=st.session_state.selected_channel_labels)
         st.session_state.selected_channel_labels = selected_labels
 
         schedule_config = render_task_schedule_inputs()
 
-        if st.button("创建任务", type="primary", use_container_width=True):
+        if st.button(t("automation_create_task_submit"), type="primary", use_container_width=True):
             if not selected_labels:
-                st.error("请选择频道")
+                st.error(t("automation_create_task_pick_channel"))
                 return
 
             added_count = 0
@@ -4822,9 +7067,9 @@ def render_task_creation_popover(settings, tasks, logs, runs, run_items, process
 
             _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
             if added_count > 0:
-                st.success(f"已创建 {added_count} 个任务")
+                st.success(t("automation_create_task_success", count=added_count))
                 st.rerun()
-            st.warning("未创建任务（可能已存在）")
+            st.warning(t("automation_create_task_skip_exists"))
 
 
 def ensure_task_next_runs(settings, tasks, logs, runs, run_items, processed_ids):
@@ -4855,18 +7100,18 @@ def render_task_list_item(task, settings, tasks, logs, runs, run_items, processe
             st.markdown(f"**{task.get('channel_name')}**")
             st.caption(f"{_format_schedule_label(task)}")
         with c2:
-            st.caption(f"下次: {next_run.strftime('%m-%d %H:%M') if next_run else '-'}")
+            st.caption(t("automation_task_next_run", time=next_run.strftime("%m-%d %H:%M") if next_run else "-"))
             if task.get("last_error"):
                 st.caption(f":red[{task.get('last_error')[:10]}...]")
         with c3:
             col_btn1, col_btn2 = st.columns(2)
             with col_btn1:
-                if st.button("停用" if is_enabled else "启用", key=f"tg_{task['id']}"):
+                if st.button(t("automation_task_toggle_disable") if is_enabled else t("automation_task_toggle_enable"), key=f"tg_{task['id']}"):
                     task["enabled"] = not task["enabled"]
                     _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
                     st.rerun()
             with col_btn2:
-                if st.button("🗑️", key=f"del_{task['id']}", help="删除任务"):
+                if st.button("🗑️", key=f"del_{task['id']}", help=t("automation_task_delete_help")):
                     tasks[:] = [item for item in tasks if item["id"] != task["id"]]
                     _save_scheduled_state(settings, tasks, logs, runs, run_items, processed_ids)
                     st.rerun()
@@ -4877,9 +7122,9 @@ def render_task_list_panel(settings, tasks, logs, runs, run_items, processed_ids
     渲染任务列表区域。
     """
     st.divider()
-    st.markdown("##### 📝 任务列表")
+    st.markdown(t("automation_task_list_title"))
     if not tasks:
-        st.info("暂无任务")
+        st.info(t("automation_task_list_empty"))
         return
 
     ensure_task_next_runs(settings, tasks, logs, runs, run_items, processed_ids)
@@ -4909,7 +7154,7 @@ def render_automation_rules_tab():
     settings, tasks, logs, runs, run_items, processed_ids = _load_scheduled_state()
     settings["timeout_seconds"] = float(settings.get("timeout_seconds") or 20.0)
 
-    sub_tab_report, sub_tab_manage = st.tabs(["📅 每日简报", "⚙️ 任务管理"])
+    sub_tab_report, sub_tab_manage = st.tabs([t("automation_daily_tab"), t("automation_manage_tab")])
 
     with sub_tab_report:
         render_daily_report_tab(run_items)
@@ -4918,37 +7163,29 @@ def render_automation_rules_tab():
         render_task_management_tab(settings, tasks, logs, runs, run_items, processed_ids)
 
 
-def render_processing_center_page(current_bg_task_status):
+def render_processing_center_page(current_bg_task_id, current_bg_task_status):
     """
-    渲染处理中心页面壳，统一组织视频、文本和文档三个入口。
+    渲染 Lite 首页，突出视频链接与插件直达总结。
     """
-    st.markdown("### 🧭 处理中心")
-    st.caption("把原来的单视频处理、粘贴字幕、文档总结合并到一个工作台，统一输入、统一处理、统一查看结果。")
-    if current_bg_task_status and current_bg_task_status.get("status") in ["queued", "running"]:
-        st.warning("当前有后台任务正在运行。你仍然可以浏览页面，但建议等待当前任务完成后再发起新的抓取请求。")
+    render_quota_status()
+    render_video_processing_tab()
 
-    if st.session_state.prefer_paste_tab:
-        processing_tab_paste, processing_tab_video, processing_tab_doc = st.tabs(["✍️ 粘贴文本", "🎬 视频链接", "📄 上传文档"])
-    else:
-        processing_tab_video, processing_tab_paste, processing_tab_doc = st.tabs(["🎬 视频链接", "✍️ 粘贴文本", "📄 上传文档"])
-
-    with processing_tab_video:
-        render_video_processing_tab()
-
-    with processing_tab_paste:
-        render_text_processing_tab()
-
-    with processing_tab_doc:
-        render_document_processing_tab()
+    with st.expander("更多输入方式", expanded=bool(st.session_state.prefer_paste_tab)):
+        extra_tab_paste, extra_tab_doc = st.tabs(["✍️ 粘贴文本", "📄 上传文档"])
+        with extra_tab_paste:
+            render_text_processing_tab()
+        with extra_tab_doc:
+            render_document_processing_tab()
 
 
-def render_automation_page():
+def render_automation_page(*, show_header: bool = True):
     """
     渲染订阅自动化页面壳，统一组织订阅动态与规则日报。
     """
-    st.markdown("### 📡 订阅自动化")
-    st.caption("把频道订阅、更新检查和定时执行放到同一个页面中，统一管理自动化能力。")
-    automation_tab_subs, automation_tab_rules = st.tabs(["📺 订阅与动态", "⏰ 规则与日报"])
+    if show_header:
+        st.markdown(t("automation_header"))
+        st.caption(t("automation_caption"))
+    automation_tab_subs, automation_tab_rules = st.tabs([t("automation_tab_subs"), t("automation_tab_rules")])
 
     with automation_tab_subs:
         render_subscription_dynamic_tab()
@@ -4957,40 +7194,155 @@ def render_automation_page():
         render_automation_rules_tab()
 
 
-current_bg_task_id, current_bg_task_status = render_background_task_status_panel()
+def render_lite_settings_page(current_bg_task_id, current_bg_task_status, task_status_value, task_logs, task_runs, task_run_items):
+    """
+    渲染 Lite 版设置页：优先保留普通用户真正需要的设置。
+    """
+    st.markdown(t("lite_settings_header"))
+    st.caption(t("lite_settings_caption"))
 
-
-# ==========================
-# 处理中心：统一视频 / 文本 / 文档三种输入方式
-# ==========================
-with tab_processing:
-    render_processing_center_page(current_bg_task_status)
-
-
-# ==========================
-# 任务中心
-# ==========================
-with tab_tasks:
-    task_status_value, task_logs, task_runs, task_run_items = render_task_center_page(
-        current_bg_task_id,
-        current_bg_task_status,
+    st.markdown(
+        f"""
+        <div class="lite-settings-card">
+            <strong>{html.escape(t("lite_settings_recommend_title"))}</strong><br/>
+            {html.escape(t("lite_settings_recommend_body"))}
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    with st.expander(t("lite_settings_advanced"), expanded=False):
+        st.caption(t("lite_settings_advanced_caption", pipeline=pipeline_model_label))
+        with st.form("lite_model_settings_form"):
+            api_key_value = st.text_input(
+                "API Key",
+                value=str(st.session_state.settings.get("api_key") or ""),
+                type="password",
+                help=t("lite_settings_api_key_help"),
+            )
+            base_url_value = st.text_input(
+                "Base URL",
+                value=str(st.session_state.settings.get("base_url") or "https://api.openai.com/v1"),
+            )
+            summary_model_value = st.text_input(
+                t("lite_settings_summary_model"),
+                value=str(st.session_state.settings.get("summary_model") or DEFAULT_SUMMARY_MODEL),
+                help=t("lite_settings_summary_model_help"),
+            )
+            fact_check_model_value = st.text_input(
+                t("lite_settings_fact_model"),
+                value=str(st.session_state.settings.get("fact_check_model") or DEFAULT_FACT_CHECK_MODEL),
+                help=t("lite_settings_fact_model_help"),
+            )
+            use_deepseek_defaults = st.form_submit_button(t("lite_settings_use_defaults"))
+            save_model_settings = st.form_submit_button(t("lite_settings_save_models"), type="primary")
+
+        if use_deepseek_defaults:
+            updated_settings = dict(st.session_state.settings or {})
+            updated_settings["base_url"] = str(base_url_value or "").strip() or "https://api.siliconflow.cn/v1"
+            updated_settings["model"] = DEFAULT_SUMMARY_MODEL
+            updated_settings["summary_model"] = DEFAULT_SUMMARY_MODEL
+            updated_settings["fact_check_model"] = DEFAULT_FACT_CHECK_MODEL
+            st.session_state.settings = updated_settings
+            st.session_state.base_url = updated_settings["base_url"]
+            st.session_state.model = DEFAULT_SUMMARY_MODEL
+            st.session_state.summary_model = DEFAULT_SUMMARY_MODEL
+            st.session_state.fact_check_model = DEFAULT_FACT_CHECK_MODEL
+            st.session_state.last_saved_settings.update(
+                {
+                    "base_url": updated_settings["base_url"],
+                    "model": DEFAULT_SUMMARY_MODEL,
+                    "summary_model": DEFAULT_SUMMARY_MODEL,
+                    "fact_check_model": DEFAULT_FACT_CHECK_MODEL,
+                }
+            )
+            save_settings(updated_settings)
+            st.success(t("lite_settings_use_defaults_success"))
+            st.rerun()
+
+        if save_model_settings:
+            updated_settings = dict(st.session_state.settings or {})
+            updated_api_key = str(api_key_value or "").strip()
+            updated_base_url = str(base_url_value or "").strip() or "https://api.openai.com/v1"
+            updated_summary_model = str(summary_model_value or "").strip() or DEFAULT_SUMMARY_MODEL
+            updated_fact_check_model = str(fact_check_model_value or "").strip() or updated_summary_model
+            
+            updated_settings["api_key"] = updated_api_key
+            updated_settings["base_url"] = updated_base_url
+            updated_settings["model"] = updated_summary_model
+            updated_settings["summary_model"] = updated_summary_model
+            updated_settings["fact_check_model"] = updated_fact_check_model
+            
+            st.session_state.settings = updated_settings
+            st.session_state.api_key = updated_api_key or os.environ.get("OPENAI_API_KEY", "")
+            st.session_state.base_url = updated_base_url
+            st.session_state.model = updated_summary_model
+            st.session_state.summary_model = updated_summary_model
+            st.session_state.fact_check_model = updated_fact_check_model
+            st.session_state.last_saved_settings.update(
+                {
+                    "api_key": updated_api_key,
+                    "base_url": updated_base_url,
+                    "model": updated_summary_model,
+                    "summary_model": updated_summary_model,
+                    "fact_check_model": updated_fact_check_model,
+                }
+            )
+            save_settings(updated_settings)
+            st.success(t("lite_settings_save_success"))
+            st.rerun()
+
+    with st.expander(t("lite_settings_diag_manage"), expanded=False):
+        st.caption(t("lite_settings_diag_manage_caption"))
+        render_settings_diagnostics_page(
+            task_status_value,
+            task_logs,
+            task_runs,
+            task_run_items,
+            show_header=False,
+        )
+
+        st.divider()
+        with st.expander(t("lite_settings_view_task_center"), expanded=False):
+            render_task_center_page(current_bg_task_id, current_bg_task_status, show_header=False)
+
+        with st.expander(t("lite_settings_view_automation"), expanded=False):
+            render_automation_page(show_header=False)
+
+
+current_bg_task_id, current_bg_task_status = render_background_task_status_panel()
+task_status_value = (current_bg_task_status or {}).get("status") or "idle"
+_task_settings, _task_defs, task_logs, task_runs, task_run_items, _task_processed_ids = _load_scheduled_state()
+
 
 # ==========================
-# 订阅自动化
+# Lite 首页
 # ==========================
-with tab_automation:
-    render_automation_page()
+with tab_home:
+    render_processing_center_page(current_bg_task_id, current_bg_task_status)
+
 
 # ==========================
-# 内容资产库
+# 历史记录
 # ==========================
-with tab_library:
-    render_library_page()
+with tab_history:
+    render_library_page(show_header=True)
 
 # ==========================
-# 设置与诊断
+# 留言板
+# ==========================
+with tab_wishwall:
+    render_wish_wall_page(task_logs, task_runs, task_run_items)
+
+# ==========================
+# 设置与高级功能
 # ==========================
 with tab_settings:
-    render_settings_diagnostics_page(task_status_value, task_logs, task_runs, task_run_items)
+    render_lite_settings_page(
+        current_bg_task_id,
+        current_bg_task_status,
+        task_status_value,
+        task_logs,
+        task_runs,
+        task_run_items,
+    )

@@ -14,6 +14,7 @@ import secrets
 import threading
 import tempfile
 import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +24,10 @@ from urllib.parse import parse_qs, quote, urlparse
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in os.sys.path:
+    os.sys.path.insert(0, str(BASE_DIR))
+
+from core_logic import build_api, format_error, get_transcript_from_input, get_video_transcript
 
 
 def _resolve_bridge_store_file() -> Path:
@@ -62,6 +67,18 @@ STORE_LOCK = threading.Lock()
 BRIDGE_SCHEMA_VERSION = "1.0"
 BRIDGE_PAYLOAD_VERSION_V1 = 1
 BRIDGE_PAYLOAD_VERSION_V2 = 2
+BRIDGE_FETCH_WORKER_TOKEN = str(
+    os.environ.get("BRIDGE_FETCH_WORKER_TOKEN", os.environ.get("BRIDGE_API_TOKEN", "")) or ""
+).strip()
+BRIDGE_FETCH_TIMEOUT_SECONDS = float(os.environ.get("BRIDGE_FETCH_TIMEOUT_SECONDS", "120") or "120")
+BRIDGE_FETCH_RETRIES = int(os.environ.get("BRIDGE_FETCH_RETRIES", "1") or "1")
+BRIDGE_FETCH_PROXY_URL = str(os.environ.get("BRIDGE_FETCH_PROXY_URL", "") or "").strip()
+BRIDGE_FETCH_USE_SYSTEM_PROXY = str(
+    os.environ.get("BRIDGE_FETCH_USE_SYSTEM_PROXY", "1") or "1"
+).strip().lower() in {"1", "true", "yes"}
+FETCH_TASKS: dict[str, dict[str, Any]] = {}
+FETCH_TASKS_LOCK = threading.Lock()
+FETCH_INFLIGHT_TASKS: dict[str, str] = {}
 
 
 def _log(event: str, **kwargs: Any) -> None:
@@ -365,10 +382,126 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(encoded)))
     handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Token")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Token, X-Worker-Token")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.end_headers()
-    handler.wfile.write(encoded)
+    try:
+        handler.wfile.write(encoded)
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        pass
+
+
+def _set_fetch_task(task_id: str, **patch: Any) -> None:
+    with FETCH_TASKS_LOCK:
+        task = FETCH_TASKS.get(task_id) or {"task_id": task_id, "status": "queued", "created_at": time.time()}
+        task.update(patch)
+        FETCH_TASKS[task_id] = task
+
+
+def _get_fetch_task(task_id: str) -> dict[str, Any] | None:
+    with FETCH_TASKS_LOCK:
+        task = FETCH_TASKS.get(task_id)
+        return dict(task) if task else None
+
+
+def _make_fetch_task_key(payload: dict[str, Any]) -> str:
+    video_url = str(payload.get("video_url") or "").strip()
+    languages = payload.get("languages") or []
+    if not isinstance(languages, list):
+        languages = []
+    normalized_langs = ",".join(str(item).strip() for item in languages if str(item).strip())
+    return f"{video_url}||{normalized_langs}"
+
+
+def _set_fetch_stage(task_id: str, stage: str, detail: str = "") -> None:
+    _set_fetch_task(task_id, stage=stage, stage_detail=detail[:500], updated_at=time.time())
+
+
+def _pop_fetch_inflight(task_id: str) -> None:
+    with FETCH_TASKS_LOCK:
+        stale_keys = [key for key, current_task_id in FETCH_INFLIGHT_TASKS.items() if current_task_id == task_id]
+        for key in stale_keys:
+            FETCH_INFLIGHT_TASKS.pop(key, None)
+
+
+def _validate_fetch_worker_token(headers) -> str | None:
+    if not BRIDGE_FETCH_WORKER_TOKEN:
+        return None
+    provided = str(headers.get("X-Worker-Token", "") or "").strip()
+    if not provided or not secrets.compare_digest(provided, BRIDGE_FETCH_WORKER_TOKEN):
+        return "invalid_worker_token"
+    return None
+
+
+def _run_fetch_transcript_task(task_id: str, payload: dict[str, Any]) -> None:
+    try:
+        _set_fetch_task(task_id, status="running", started_at=time.time())
+        _set_fetch_stage(task_id, "prepare", "初始化服务端抓取参数")
+
+        video_url = str(payload.get("video_url") or "").strip()
+        languages = payload.get("languages") or ["zh-Hans", "zh", "en"]
+        if not isinstance(languages, list):
+            raise ValueError("languages must be a list")
+        languages = [str(item).strip() for item in languages if str(item).strip()]
+        if not video_url:
+            raise ValueError("video_url is required")
+
+        api = build_api(
+            proxy_url=BRIDGE_FETCH_PROXY_URL,
+            timeout_seconds=BRIDGE_FETCH_TIMEOUT_SECONDS,
+            use_system_proxy=BRIDGE_FETCH_USE_SYSTEM_PROXY,
+            retries=BRIDGE_FETCH_RETRIES,
+        )
+
+        def _status_cb(message: str) -> None:
+            msg = str(message or "").strip()
+            if msg:
+                _set_fetch_stage(task_id, "processing", msg)
+
+        setattr(api, "_status_callback", _status_cb)
+        setattr(api, "_cookies_file", str(payload.get("cookies_file") or "").strip())
+        setattr(api, "_cookies_content", str(payload.get("cookies_content") or ""))
+        setattr(api, "_cookies_content_b64", str(payload.get("cookies_content_b64") or "").strip())
+        setattr(api, "_cookies_from_browser", str(payload.get("cookies_from_browser") or "").strip().lower())
+        asr_enabled = bool(payload.get("asr_enabled", False))
+        setattr(api, "_asr_enabled", asr_enabled)
+        setattr(api, "_disable_audio_transcribe_override", not asr_enabled)
+        setattr(api, "_asr_model", str(payload.get("asr_model") or "base").strip() or "base")
+        setattr(api, "_asr_language", str(payload.get("asr_language") or "").strip())
+        setattr(api, "_asr_fast_mode", bool(payload.get("asr_fast_mode", True)))
+        setattr(api, "_asr_force_cpu", bool(payload.get("asr_force_cpu", False)))
+
+        video_id, normalized_url, _ = get_transcript_from_input(video_url, ",".join(languages))
+        _set_fetch_stage(task_id, "fetch", f"video_id={video_id}")
+        transcript = get_video_transcript(api, video_id, video_url=normalized_url, languages=languages)
+        if "\n\n" in transcript:
+            label, text = transcript.split("\n\n", 1)
+        else:
+            label, text = "bridge-worker", transcript
+        transcript_text = str(text or "").strip()
+        if not transcript_text:
+            raise RuntimeError("empty_transcript")
+
+        _set_fetch_task(
+            task_id,
+            status="success",
+            finished_at=time.time(),
+            stage="done",
+            stage_detail=f"label={label.strip().strip('[]')}",
+            transcript_label=label.strip().strip("[]"),
+            transcript_text=transcript_text,
+        )
+    except Exception as exc:
+        _set_fetch_task(
+            task_id,
+            status="failed",
+            finished_at=time.time(),
+            stage="failed",
+            stage_detail=str(exc)[:500],
+            error=format_error(exc),
+        )
+    finally:
+        _pop_fetch_inflight(task_id)
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -395,8 +528,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "max_transcript_chars": BRIDGE_MAX_TRANSCRIPT_CHARS,
                     "supported_bridge_versions": [BRIDGE_PAYLOAD_VERSION_V1, BRIDGE_PAYLOAD_VERSION_V2],
                     "schema_version": BRIDGE_SCHEMA_VERSION,
+                    "fetch_worker_enabled": True,
                 },
             )
+            return
+
+        if parsed.path.startswith("/task/"):
+            token_error = _validate_fetch_worker_token(self.headers)
+            if token_error:
+                _json_response(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": token_error})
+                return
+            task_id = parsed.path.rsplit("/", 1)[-1].strip()
+            task = _get_fetch_task(task_id)
+            if not task:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "task_not_found"})
+                return
+            _json_response(self, HTTPStatus.OK, {"ok": True, **task})
             return
 
         if parsed.path != "/api/bridge/payload":
@@ -444,6 +591,52 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/fetch-transcript":
+            token_error = _validate_fetch_worker_token(self.headers)
+            if token_error:
+                _json_response(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": token_error})
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                content_length = 0
+            raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                payload = json.loads(raw_body.decode("utf-8") or "{}")
+            except Exception:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
+                return
+            if not isinstance(payload, dict):
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "payload_must_be_object"})
+                return
+
+            task_key = _make_fetch_task_key(payload)
+            with FETCH_TASKS_LOCK:
+                existing_task_id = FETCH_INFLIGHT_TASKS.get(task_key)
+                existing_task = FETCH_TASKS.get(existing_task_id) if existing_task_id else None
+                if existing_task and str(existing_task.get("status") or "").lower() in {"queued", "running"}:
+                    _json_response(
+                        self,
+                        HTTPStatus.OK,
+                        {"ok": True, "task_id": existing_task_id, "status": existing_task.get("status"), "reused": True},
+                    )
+                    return
+                task_id = str(uuid.uuid4())
+                FETCH_TASKS[task_id] = {
+                    "task_id": task_id,
+                    "status": "queued",
+                    "created_at": time.time(),
+                    "stage": "queued",
+                    "stage_detail": "等待服务端抓取",
+                }
+                FETCH_INFLIGHT_TASKS[task_key] = task_id
+
+            worker = threading.Thread(target=_run_fetch_transcript_task, args=(task_id, payload), daemon=True)
+            worker.start()
+            _json_response(self, HTTPStatus.ACCEPTED, {"ok": True, "task_id": task_id, "status": "queued"})
+            return
+
         if parsed.path != "/api/bridge/payload":
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return

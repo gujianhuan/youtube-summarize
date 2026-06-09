@@ -59,7 +59,7 @@ git remote -v
 - Git
 - Python
 - FFmpeg
-- Chrome（若继续使用插件）
+- Chrome / Edge / Firefox（若继续使用浏览器扩展）
 
 建议优先检查：
 
@@ -117,14 +117,17 @@ pip install -r requirements.txt
 - 重新安装 FFmpeg
 - 或重新配置系统 `PATH`
 
-### 7.3 Chrome 插件失效
+### 7.3 浏览器扩展失效
 现象：
 - 插件目录路径变化，扩展无法加载
 
 处理建议：
-1. 打开 `chrome://extensions/`
-2. 开启开发者模式
-3. 重新加载已解压扩展目录
+1. 按当前浏览器打开扩展页：
+   - Chrome：`chrome://extensions/`
+   - Edge：`edge://extensions/`
+   - Firefox：`about:debugging#/runtime/this-firefox`
+2. 重新加载最新解压目录或重新临时载入 `manifest.json`
+3. 若需要重新打包，执行 `chrome_extension_mvp\build_packages.ps1`
 
 ### 7.4 本地工具路径失效
 现象：

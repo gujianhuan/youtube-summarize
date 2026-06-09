@@ -1,11 +1,16 @@
 import json
 import os
+import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ["LOCAL_FETCH_NODE_MODE"] = "worker"
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR and CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
 
 from core_logic import build_api, format_error, get_transcript_from_input, get_video_transcript
 
@@ -127,7 +132,14 @@ def _run_fetch_task(task_id: str, payload: dict) -> None:
         setattr(api, "_cookies_content_b64", cookie_inputs["cookies_content_b64"])
         setattr(api, "_cookies_from_browser", cookie_inputs["cookies_from_browser"])
         setattr(api, "_status_callback", _status_cb)
-        setattr(api, "_asr_enabled", False)
+        asr_enabled = bool(
+            payload.get(
+                "asr_enabled",
+                os.environ.get("LOCAL_FETCH_ASR_ENABLED", "1").strip() not in {"0", "false", "False"},
+            )
+        )
+        setattr(api, "_asr_enabled", asr_enabled)
+        setattr(api, "_disable_audio_transcribe_override", not asr_enabled)
         setattr(api, "_asr_model", str(payload.get("asr_model") or os.environ.get("LOCAL_FETCH_ASR_MODEL", "base")).strip() or "base")
         setattr(api, "_asr_language", str(payload.get("asr_language") or os.environ.get("LOCAL_FETCH_ASR_LANGUAGE", "")).strip())
         setattr(api, "_asr_fast_mode", bool(payload.get("asr_fast_mode", os.environ.get("LOCAL_FETCH_ASR_FAST_MODE", "1").strip() not in {"0", "false", "False"})))
