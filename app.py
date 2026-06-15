@@ -3280,6 +3280,7 @@ st.session_state.summary_model = summary_model_selected
 st.session_state.fact_check_model = fact_check_model_selected
 
 query_params = st.query_params
+page_param = str(query_params.get("page", "") or "").strip().lower()
 ext_payload_id = str(query_params.get("ext_payload_id", "") or "").strip()
 ext_source_url = str(query_params.get("ext_source_url", "") or "").strip()
 ext_transcript = str(query_params.get("ext_transcript", "") or "").strip()
@@ -3407,6 +3408,89 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
         st.session_state.video_extension_auto_summary_fetch_duration = 0.0
 
 
+def render_privacy_policy_page():
+    st.title("隐私权政策")
+    st.caption("YouTube Transcript Helper / YouTube Summarizer")
+
+    st.markdown(
+        """
+生效日期：2026 年 6 月 15 日
+
+本隐私权政策说明 YouTube Transcript Helper 浏览器扩展和 YouTube Summarizer 主站如何处理用户数据。
+
+### 我们收集或处理的数据
+
+当用户主动使用扩展或主站功能时，产品可能会处理以下数据：
+
+- YouTube 视频链接
+- YouTube 视频标题
+- YouTube 视频页面中公开可用的字幕文本 transcript
+- 用户粘贴到主站中的文本内容
+- 为生成摘要、整理要点和辅助事实核查所需的处理结果
+- 扩展配置和任务状态，例如总结站点地址、最近一次流程状态，这些数据主要保存在浏览器本地或服务端临时任务记录中
+
+我们不会主动收集以下类型的数据：
+
+- 身份证件、密码、验证码或付款信息
+- 健康信息
+- 精确地理位置
+- 与字幕提取和总结功能无关的网站内容
+- 用户的完整浏览历史
+
+### 数据用途
+
+我们仅将上述数据用于以下用途：
+
+- 从 YouTube 视频中提取公开可用的字幕文本
+- 将 transcript 发送到总结服务，用于生成摘要、要点整理和事实核查
+- 展示任务状态、处理结果和错误提示
+- 改善扩展和主站的稳定性与用户体验
+
+### 数据共享
+
+我们不会出售用户数据。
+
+为了完成摘要和事实核查功能，用户提交的 transcript、视频链接或文本内容可能会发送到产品后端服务，以及用于文本生成或检索的第三方 API 服务。我们只会在实现产品核心功能所必需的范围内传输这些数据。
+
+### 数据保存
+
+扩展配置通常保存在用户浏览器本地。主站和桥接服务可能会临时保存 transcript、摘要结果或任务状态，用于完成当前请求、展示结果、排查错误和避免重复处理。我们会避免保存与产品功能无关的数据。
+
+### 用户控制
+
+用户可以通过以下方式控制数据：
+
+- 不点击扩展或不提交链接时，扩展不会主动发送 transcript 到总结服务
+- 可以在浏览器扩展管理页面移除扩展
+- 可以清除浏览器本地存储和站点数据
+- 如需删除服务端相关记录，可以通过下方联系方式提出请求
+
+### 权限说明
+
+扩展请求的权限仅用于实现字幕提取和总结流程：
+
+- activeTab：在用户主动点击扩展后访问当前 YouTube 标签页
+- scripting：向当前页面注入脚本以读取字幕相关数据
+- tabs：读取当前标签页标题和 URL，并在用户点击时打开总结页面
+- clipboardWrite：在用户点击复制时写入剪贴板
+- storage：保存扩展配置和任务状态
+- YouTube 和产品服务域名权限：读取 YouTube 字幕并与总结服务通信
+
+### 联系方式
+
+如对隐私政策或数据删除有疑问，请通过项目页面或 Chrome Web Store 支持入口联系我们。
+
+### 政策更新
+
+我们可能会根据产品功能、部署方式或合规要求更新本隐私权政策。更新后的内容会发布在本页面。
+        """
+    )
+
+
+
+if page_param in {"privacy", "privacy-policy"}:
+    render_privacy_policy_page()
+    st.stop()
 
 # --- 主界面 ---
 st.title(t("main_title"))
