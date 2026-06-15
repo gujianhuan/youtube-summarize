@@ -45,6 +45,7 @@ const LOCAL_BRIDGE_URL_CANDIDATES = [
   "http://localhost:8765"
 ];
 let lastExtractResponse = null;
+let autoStartTriggered = false;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
 const DEBUG_SESSION_ID = "youtube-plugin-extract";
 const popupQuery = new URLSearchParams(globalThis.location?.search || "");
@@ -742,6 +743,46 @@ async function hydratePopupContextFromActiveTab() {
     titleInput.value = String(tab.title || "").trim();
   }
   return tab;
+}
+
+function isYouTubeWatchUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return false;
+  }
+  try {
+    const parsed = new URL(text);
+    const host = String(parsed.hostname || "").toLowerCase();
+    return host.includes("youtube.com") || host.includes("youtu.be");
+  } catch (_error) {
+    return text.includes("youtube.com") || text.includes("youtu.be");
+  }
+}
+
+async function autoStartBackgroundSummarizeFlow() {
+  if (autoStartTriggered) {
+    return;
+  }
+  const sourceUrl = String(urlInput.value || popupTargetSourceUrl || "").trim();
+  if (!isYouTubeWatchUrl(sourceUrl)) {
+    return;
+  }
+  autoStartTriggered = true;
+  try {
+    setStatus("正在后台自动提取字幕并打开主站...");
+    await sendRuntimeMessage({
+      action: "startBackgroundSummarizeFlowFromPage",
+      payload: {
+        sourceUrl,
+        requestOrigin: String(globalThis.location?.origin || ""),
+        requestPageUrl: String(globalThis.location?.href || ""),
+        preferLocal: false
+      }
+    });
+  } catch (error) {
+    autoStartTriggered = false;
+    setStatus(tp("startSummarizeFlowFailed", { message: ` ${error?.message || error || "unknown_error"}` }), true);
+  }
 }
 
 async function sendExtractMessage(tabId) {
@@ -2020,6 +2061,7 @@ void (async () => {
   await loadExtensionConfig();
   hydratePopupContextFromQuery();
   await hydratePopupContextFromActiveTab();
+  await autoStartBackgroundSummarizeFlow();
   syncActionButtons();
 })();
 

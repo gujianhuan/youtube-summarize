@@ -29,6 +29,8 @@ const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "0.1
 const EXTENSION_TOOL_VERSION = EXTENSION_VERSION;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
 const DEBUG_SESSION_ID = "youtube-plugin-extract";
+const BACKGROUND_SUMMARIZE_DEDUPE_MS = 30000;
+const backgroundSummarizeLocks = new Map();
 
 // Release: use manifest version as the single source of truth for UI/debug reporting.
 
@@ -4500,9 +4502,38 @@ async function startSummarizeFlowFromPage(payload) {
     ok: true,
     payloadId
   });
+  try {
+    attempts.push({
+      stage: "background_open_main_site",
+      ok: true,
+      sourceUrl
+    });
+    await setFlowStatus("Opening main site...", false, "opening");
+    await createTab({ url: await buildBridgeUrl(payloadId, sourceUrl, flowConfig) });
+    await setFlowStatus("Transcript sent. The main site is pulling it and starting summary automatically.", false, "done");
+  } catch (error) {
+    attempts.push({
+      stage: "background_open_main_site_failed",
+      ok: false,
+      error: String(error?.message || error || "main_site_open_failed")
+    });
+    return {
+      ok: false,
+      error: String(error?.message || error || "main_site_open_failed"),
+      helperMessage: "Transcript was extracted and uploaded, but opening the main site failed.",
+      debug: {
+        toolVersion: EXTENSION_TOOL_VERSION,
+        attempts: [
+          ...attempts,
+          ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
+        ]
+      }
+    };
+  }
   return {
     ok: true,
     payloadId,
+    helperMessage: "Transcript extracted and the background summary flow has started.",
     debug: {
       toolVersion: EXTENSION_TOOL_VERSION,
       attempts: [
@@ -4556,6 +4587,37 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
     })();
     return true;
+  }
+
+  if (message.action === "startBackgroundSummarizeFlowFromPage") {
+    const sourceUrl = String(message?.payload?.sourceUrl || "").trim();
+    const lockKey = parseYouTubeVideoId(sourceUrl) || sourceUrl;
+    const lockValue = lockKey ? backgroundSummarizeLocks.get(lockKey) : 0;
+    const now = Date.now();
+    if (lockKey && lockValue && now - lockValue < BACKGROUND_SUMMARIZE_DEDUPE_MS) {
+      sendResponse({ ok: true, started: false, deduped: true });
+      return undefined;
+    }
+    if (lockKey) {
+      backgroundSummarizeLocks.set(lockKey, now);
+    }
+    (async () => {
+      try {
+        await startSummarizeFlowFromPage(message.payload || {});
+      } catch (error) {
+        await setFlowStatus(
+          `后台自动总结失败。${String(error?.message || error || "unknown_error")}`,
+          true,
+          "error"
+        );
+      } finally {
+        if (lockKey) {
+          backgroundSummarizeLocks.delete(lockKey);
+        }
+      }
+    })();
+    sendResponse({ ok: true, started: true });
+    return undefined;
   }
 
   return undefined;
