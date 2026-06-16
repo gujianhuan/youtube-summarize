@@ -57,7 +57,7 @@ const POPUP_LOCALE = resolvePopupLocale();
 const POPUP_MESSAGES = {
   zh: {
     popupTitle: `Transcript Helper v${EXTENSION_VERSION}`,
-    popupStatusIdle: "正在等待提取...",
+    popupStatusIdle: "待命：打开 YouTube 视频后会自动提取并发送到主站。",
     extractBtn: "提取字幕",
     copyBtn: "复制文本",
     openBtn: "一键总结",
@@ -120,7 +120,7 @@ const POPUP_MESSAGES = {
   },
   en: {
     popupTitle: `Transcript Helper v${EXTENSION_VERSION}`,
-    popupStatusIdle: "Waiting for extraction...",
+    popupStatusIdle: "Ready: open a YouTube video to extract and send it to the main site automatically.",
     extractBtn: "Extract",
     copyBtn: "Copy",
     openBtn: "Summarize",
@@ -632,6 +632,10 @@ async function loadLastFlowStatus() {
     if (!status?.message) {
       return;
     }
+    if (String(status.stage || "") === "done") {
+      setStatus(tp("popupStatusIdle"));
+      return;
+    }
     setStatus(status.message, Boolean(status.isError));
   } catch (_error) {
     // Ignore storage read failures in popup.
@@ -769,8 +773,8 @@ async function autoStartBackgroundSummarizeFlow() {
   }
   autoStartTriggered = true;
   try {
-    setStatus("正在后台自动提取字幕并打开主站...");
-    await sendRuntimeMessage({
+    setStatus("已启动后台自动总结；弹窗关闭后任务会继续。主站打开后这里将回到待命。");
+    const startResult = await sendRuntimeMessage({
       action: "startBackgroundSummarizeFlowFromPage",
       payload: {
         sourceUrl,
@@ -779,6 +783,9 @@ async function autoStartBackgroundSummarizeFlow() {
         preferLocal: false
       }
     });
+    if (startResult?.deduped) {
+      setStatus(tp("popupStatusIdle"));
+    }
   } catch (error) {
     autoStartTriggered = false;
     setStatus(tp("startSummarizeFlowFailed", { message: ` ${error?.message || error || "unknown_error"}` }), true);
@@ -2049,6 +2056,10 @@ extensionApi.runtime.onMessage.addListener((message) => {
     return;
   }
   const payload = message.payload || {};
+  if (String(payload.stage || "") === "done") {
+    setStatus(tp("popupStatusIdle"));
+    return;
+  }
   if (payload.message) {
     setStatus(String(payload.message), Boolean(payload.isError));
   }

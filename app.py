@@ -302,7 +302,7 @@ UI_TEXTS = {
         "settings_runtime_no_history": "无历史",
         "settings_runtime_day_summary": "**{date}**: 新增 {new_items} | 成功 {success_items}",
         "wish_wall_header": "### 💌 留言板",
-        "wish_wall_caption": "像把便利签贴在墙上一样，任何人都可以匿名留言、查看和回复；只可新增，不提供删除。",
+        "wish_wall_caption": "像把便利签贴在墙上一样，任何人都可以匿名留言、查看和回复。普通用户发布后不能修改或删除。",
         "wish_wall_intro_title": "留言板",
         "wish_wall_message_label": "写下你的留言",
         "wish_wall_message_placeholder": "你可以直接写下功能建议、使用感受、Bug 反馈或想做的新能力。留言默认匿名显示，所有人都能看，也都可以继续回复。",
@@ -319,10 +319,17 @@ UI_TEXTS = {
         "wish_wall_reply_placeholder": "可以补充细节、回应建议，或者给这条留言点个赞。",
         "wish_wall_reply_submit": "回复",
         "wish_wall_reply_success": "回复已发布。",
+        "wish_wall_admin_panel": "管理员维护",
+        "wish_wall_admin_edit_label": "修改留言内容",
+        "wish_wall_admin_save": "保存修改",
+        "wish_wall_admin_delete": "删除留言",
+        "wish_wall_admin_save_success": "留言已更新。",
+        "wish_wall_admin_delete_success": "留言已删除。",
+        "wish_wall_admin_delete_help": "只有管理员可删除留言及其回复。",
         "lite_settings_header": "### 🛠️ 设置",
-        "lite_settings_caption": "默认无需修改。只有在你想使用自己的 API、切换接口或调整模型时，才需要展开高级设置。",
+        "lite_settings_caption": "默认无需修改。高级设置用于填写你自己的 API Key、接口地址或模型名称。",
         "lite_settings_recommend_title": "推荐用法",
-        "lite_settings_recommend_body": "直接贴入视频链接即可开始使用。API Key、Base URL 和模型都已收纳到高级设置，避免普通用户看到过多技术项。",
+        "lite_settings_recommend_body": "直接贴入视频链接即可开始使用。需要使用自己的 API Key、接口地址或模型时，再展开高级设置。",
         "lite_settings_advanced": "高级设置",
         "lite_settings_advanced_caption": "当前运行流水线：`{pipeline}`。适合需要自定义 Key、接口地址或模型的用户。",
         "lite_settings_api_key_help": "填写后将优先使用你自己的 Key，且不受每日免费次数限制。",
@@ -684,7 +691,7 @@ UI_TEXTS = {
         "settings_runtime_no_history": "No history",
         "settings_runtime_day_summary": "**{date}**: new {new_items} | success {success_items}",
         "wish_wall_header": "### 💌 Message Board",
-        "wish_wall_caption": "Like sticky notes on a wall: anyone can post anonymously, view, and reply. New entries only, no deletion.",
+        "wish_wall_caption": "Like sticky notes on a wall: anyone can post anonymously, view, and reply. Regular users cannot edit or delete posts after publishing.",
         "wish_wall_intro_title": "Message Board",
         "wish_wall_message_label": "Write your message",
         "wish_wall_message_placeholder": "Share feature ideas, usage feedback, bug reports, or new capabilities you want. Messages are anonymous by default and everyone can view and reply.",
@@ -701,10 +708,17 @@ UI_TEXTS = {
         "wish_wall_reply_placeholder": "Add details, respond to the suggestion, or simply show support.",
         "wish_wall_reply_submit": "Reply",
         "wish_wall_reply_success": "Reply posted.",
+        "wish_wall_admin_panel": "Admin maintenance",
+        "wish_wall_admin_edit_label": "Edit message content",
+        "wish_wall_admin_save": "Save changes",
+        "wish_wall_admin_delete": "Delete message",
+        "wish_wall_admin_save_success": "Message updated.",
+        "wish_wall_admin_delete_success": "Message deleted.",
+        "wish_wall_admin_delete_help": "Only admins can delete a message and its replies.",
         "lite_settings_header": "### 🛠️ Settings",
-        "lite_settings_caption": "You usually do not need to change anything here. Expand advanced settings only if you want your own API, a different endpoint, or custom models.",
+        "lite_settings_caption": "You usually do not need to change anything here. Advanced settings are for your own API key, endpoint, or model names.",
         "lite_settings_recommend_title": "Recommended Usage",
-        "lite_settings_recommend_body": "Paste a video URL and start right away. API key, base URL, and model settings are tucked into advanced settings so regular users do not see too many technical fields.",
+        "lite_settings_recommend_body": "Paste a video URL and start right away. Expand advanced settings only when you need your own API key, endpoint, or model names.",
         "lite_settings_advanced": "Advanced Settings",
         "lite_settings_advanced_caption": "Current pipeline: `{pipeline}`. Best for users who need custom keys, endpoints, or models.",
         "lite_settings_api_key_help": "If provided, your own API key is used first and daily free limits no longer apply.",
@@ -963,6 +977,22 @@ def render_quota_status():
         st.warning(msg)
 
 
+def is_admin_user() -> bool:
+    """Return true only for site maintenance users, not regular users with their own API key."""
+    configured_token = str(
+        os.environ.get("ADMIN_TOKEN")
+        or st.session_state.get("settings", {}).get("admin_token")
+        or ""
+    ).strip()
+    if not configured_token:
+        return False
+    try:
+        supplied_token = str(st.query_params.get("admin_token", "") or "").strip()
+    except Exception:
+        supplied_token = ""
+    return bool(supplied_token and supplied_token == configured_token)
+
+
 extension_bridge_reader = components.declare_component(
     "extension_bridge_reader",
     path=BRIDGE_COMPONENT_DIR,
@@ -1168,6 +1198,33 @@ def append_guestbook_reply(message_id: str, reply_text: str) -> bool:
     if updated:
         save_guestbook(guestbook)
     return updated
+
+
+def update_guestbook_message(message_id: str, content: str) -> bool:
+    guestbook = load_guestbook()
+    updated = False
+    for item in guestbook:
+        if str(item.get("id") or "") != str(message_id or ""):
+            continue
+        item["content"] = str(content or "").strip()
+        item["updated_at"] = _iso(_now())
+        updated = True
+        break
+    if updated:
+        save_guestbook(guestbook)
+    return updated
+
+
+def delete_guestbook_message(message_id: str) -> bool:
+    guestbook = load_guestbook()
+    next_guestbook = [
+        item for item in guestbook
+        if str(item.get("id") or "") != str(message_id or "")
+    ]
+    if len(next_guestbook) == len(guestbook):
+        return False
+    save_guestbook(next_guestbook)
+    return True
 
 def load_feedback_reports():
     return load_json_file(FEEDBACK_FILE, [])
@@ -1594,6 +1651,8 @@ def get_remote_worker_status_cached(refresh_key: int = 0):
     return get_remote_worker_status(timeout_seconds=4.0)
 
 def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
+    if not (is_admin_user() or str(source_type or "").strip() == "schedule"):
+        return ""
     history = load_history()
     # 尝试解析摘要中的标题 (如果可能)
     title = "未命名视频"
@@ -3495,14 +3554,23 @@ if page_param in {"privacy", "privacy-policy"}:
 # --- 主界面 ---
 st.title(t("main_title"))
 st.caption(t("main_caption"))
+admin_mode = is_admin_user()
 
 # Lite 一级导航：突出立即总结，其他能力下沉。
-tab_home, tab_history, tab_wishwall, tab_settings = st.tabs([
-    t("tab_home"),
-    t("tab_history"),
-    t("tab_wishwall"),
-    t("tab_settings"),
-])
+if admin_mode:
+    tab_home, tab_history, tab_wishwall, tab_settings = st.tabs([
+        t("tab_home"),
+        t("tab_history"),
+        t("tab_wishwall"),
+        t("tab_settings"),
+    ])
+else:
+    tab_home, tab_wishwall, tab_settings = st.tabs([
+        t("tab_home"),
+        t("tab_wishwall"),
+        t("tab_settings"),
+    ])
+    tab_history = None
 
 # --- 通用逻辑函数 (供两个 Tab 使用) ---
 def fetch_transcript_via_shared_service(video_url, progress_callback=None):
@@ -4519,7 +4587,7 @@ def render_library_filters(history_count: int):
     with filter_col2:
         search_body = st.checkbox(t("history_search_fulltext"), value=True)
     with filter_col3:
-        if history_count > 0:
+        if history_count > 0 and is_admin_user():
             if st.button(t("history_clear"), use_container_width=True):
                 save_history([])
                 st.rerun()
@@ -4710,6 +4778,7 @@ def render_wish_wall_page(task_logs, task_runs, task_run_items):
     """
     st.markdown(t("wish_wall_header"))
     st.caption(t("wish_wall_caption"))
+    admin_mode = is_admin_user()
 
     st.markdown('<div class="wish-wall-shell">', unsafe_allow_html=True)
     st.markdown(
@@ -4784,6 +4853,31 @@ def render_wish_wall_page(task_logs, task_runs, task_run_items):
                         append_guestbook_reply(str(msg.get("id") or ""), reply_text.strip())
                         st.success(t("wish_wall_reply_success"))
                         st.rerun()
+
+            if admin_mode:
+                with st.expander(t("wish_wall_admin_panel"), expanded=False):
+                    with st.form(f"wish_admin_form_{msg.get('id')}"):
+                        edited_content = st.text_area(
+                            t("wish_wall_admin_edit_label"),
+                            value=str(msg.get("content") or ""),
+                            height=120,
+                            key=f"wish_admin_edit_{msg.get('id')}",
+                        )
+                        save_col, delete_col = st.columns(2)
+                        save_clicked = save_col.form_submit_button(t("wish_wall_admin_save"), use_container_width=True)
+                        delete_clicked = delete_col.form_submit_button(
+                            t("wish_wall_admin_delete"),
+                            use_container_width=True,
+                            help=t("wish_wall_admin_delete_help"),
+                        )
+                        if save_clicked:
+                            update_guestbook_message(str(msg.get("id") or ""), edited_content)
+                            st.success(t("wish_wall_admin_save_success"))
+                            st.rerun()
+                        if delete_clicked:
+                            delete_guestbook_message(str(msg.get("id") or ""))
+                            st.success(t("wish_wall_admin_delete_success"))
+                            st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -7376,22 +7470,23 @@ def render_lite_settings_page(current_bg_task_id, current_bg_task_status, task_s
             st.success(t("lite_settings_save_success"))
             st.rerun()
 
-    with st.expander(t("lite_settings_diag_manage"), expanded=False):
-        st.caption(t("lite_settings_diag_manage_caption"))
-        render_settings_diagnostics_page(
-            task_status_value,
-            task_logs,
-            task_runs,
-            task_run_items,
-            show_header=False,
-        )
+    if is_admin_user():
+        with st.expander(t("lite_settings_diag_manage"), expanded=False):
+            st.caption(t("lite_settings_diag_manage_caption"))
+            render_settings_diagnostics_page(
+                task_status_value,
+                task_logs,
+                task_runs,
+                task_run_items,
+                show_header=False,
+            )
 
-        st.divider()
-        with st.expander(t("lite_settings_view_task_center"), expanded=False):
-            render_task_center_page(current_bg_task_id, current_bg_task_status, show_header=False)
+            st.divider()
+            with st.expander(t("lite_settings_view_task_center"), expanded=False):
+                render_task_center_page(current_bg_task_id, current_bg_task_status, show_header=False)
 
-        with st.expander(t("lite_settings_view_automation"), expanded=False):
-            render_automation_page(show_header=False)
+            with st.expander(t("lite_settings_view_automation"), expanded=False):
+                render_automation_page(show_header=False)
 
 
 current_bg_task_id, current_bg_task_status = render_background_task_status_panel()
@@ -7406,11 +7501,12 @@ with tab_home:
     render_processing_center_page(current_bg_task_id, current_bg_task_status)
 
 
-# ==========================
-# 历史记录
-# ==========================
-with tab_history:
-    render_library_page(show_header=True)
+if admin_mode and tab_history is not None:
+    # ==========================
+    # 历史记录
+    # ==========================
+    with tab_history:
+        render_library_page(show_header=True)
 
 # ==========================
 # 留言板

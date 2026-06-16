@@ -360,10 +360,33 @@ async function setFlowStatus(message, isError = false, stage = "info") {
     updatedAt: new Date().toISOString()
   };
   await storageLocalSet({ [FLOW_STATUS_KEY]: payload });
+  await updateActionTaskStatus(payload);
   try {
     await sendRuntimeMessage({ action: "summarizeFlowStatus", payload });
   } catch (_error) {
     // Popup may already be closed; storage persists the latest status for inspection.
+  }
+}
+
+async function updateActionTaskStatus(status) {
+  if (!extensionApi.action?.setTitle) {
+    return;
+  }
+  const stage = String(status?.stage || "info");
+  const message = String(status?.message || "").trim();
+  const isError = Boolean(status?.isError);
+  let title = "Transcript Helper：待命";
+  if (isError) {
+    title = `Transcript Helper：任务失败${message ? ` - ${message}` : ""}`;
+  } else if (["warming", "retrying", "uploading", "opening"].includes(stage)) {
+    title = `Transcript Helper：${message || "任务进行中"}`;
+  } else if (stage === "done") {
+    title = "Transcript Helper：已打开主站，正在自动总结";
+  }
+  try {
+    await callExtensionApi(extensionApi.action.setTitle, extensionApi.action, { title });
+  } catch (_error) {
+    // Title updates are best-effort status hints.
   }
 }
 
