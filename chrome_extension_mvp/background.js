@@ -4432,6 +4432,7 @@ async function startSummarizeFlowFromPage(payload) {
   const requestOrigin = String(payload?.requestOrigin || "").trim();
   const requestPageUrl = String(payload?.requestPageUrl || "").trim();
   const preferLocal = Boolean(payload?.preferLocal) || isLoopbackUrl(requestOrigin) || isLoopbackUrl(requestPageUrl);
+  const openMainSite = Boolean(payload?.openMainSite);
   const attempts = [
     {
       stage: "background_received_page_flow_request",
@@ -4525,33 +4526,37 @@ async function startSummarizeFlowFromPage(payload) {
     ok: true,
     payloadId
   });
-  try {
-    attempts.push({
-      stage: "background_open_main_site",
-      ok: true,
-      sourceUrl
-    });
-    await setFlowStatus("Opening main site...", false, "opening");
-    await createTab({ url: await buildBridgeUrl(payloadId, sourceUrl, flowConfig) });
-    await setFlowStatus("Transcript sent. The main site is pulling it and starting summary automatically.", false, "done");
-  } catch (error) {
-    attempts.push({
-      stage: "background_open_main_site_failed",
-      ok: false,
-      error: String(error?.message || error || "main_site_open_failed")
-    });
-    return {
-      ok: false,
-      error: String(error?.message || error || "main_site_open_failed"),
-      helperMessage: "Transcript was extracted and uploaded, but opening the main site failed.",
-      debug: {
-        toolVersion: EXTENSION_TOOL_VERSION,
-        attempts: [
-          ...attempts,
-          ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
-        ]
-      }
-    };
+  if (openMainSite) {
+    try {
+      attempts.push({
+        stage: "background_open_main_site",
+        ok: true,
+        sourceUrl
+      });
+      await setFlowStatus("Opening main site...", false, "opening");
+      await createTab({ url: await buildBridgeUrl(payloadId, sourceUrl, flowConfig) });
+      await setFlowStatus("Transcript sent. The main site is pulling it and starting summary automatically.", false, "done");
+    } catch (error) {
+      attempts.push({
+        stage: "background_open_main_site_failed",
+        ok: false,
+        error: String(error?.message || error || "main_site_open_failed")
+      });
+      return {
+        ok: false,
+        error: String(error?.message || error || "main_site_open_failed"),
+        helperMessage: "Transcript was extracted and uploaded, but opening the main site failed.",
+        debug: {
+          toolVersion: EXTENSION_TOOL_VERSION,
+          attempts: [
+            ...attempts,
+            ...((((extraction && extraction.debug) || {}).attempts) instanceof Array ? extraction.debug.attempts : [])
+          ]
+        }
+      };
+    }
+  } else {
+    await setFlowStatus("Transcript sent to the current main-site page.", false, "done");
   }
   return {
     ok: true,

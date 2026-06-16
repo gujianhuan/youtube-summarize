@@ -780,7 +780,8 @@ async function autoStartBackgroundSummarizeFlow() {
         sourceUrl,
         requestOrigin: String(globalThis.location?.origin || ""),
         requestPageUrl: String(globalThis.location?.href || ""),
-        preferLocal: false
+        preferLocal: false,
+        openMainSite: true
       }
     });
     if (startResult?.deduped) {

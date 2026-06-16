@@ -1155,6 +1155,50 @@ def load_history():
 def save_history(history):
     save_json_file(HISTORY_FILE, history)
 
+
+def get_session_history() -> list[dict]:
+    history = st.session_state.get("session_history")
+    if isinstance(history, list):
+        return history
+    st.session_state.session_history = []
+    return st.session_state.session_history
+
+
+def save_session_history(history: list[dict]) -> None:
+    st.session_state.session_history = list(history or [])
+
+
+def add_session_history_entry(source_type, video_url, summary_text, transcript_text=""):
+    history = get_session_history()
+    title = "未命名视频"
+    try:
+        if str(summary_text or "").strip().startswith("{"):
+            data = json.loads(summary_text)
+            md = data.get("summary_markdown", "")
+            for line in str(md or "").split("\n"):
+                if "核心主题" in line or "核心一句话" in line:
+                    continue
+                if line.strip() and not line.startswith("#"):
+                    title = line.strip()
+                    break
+    except Exception:
+        pass
+
+    entry_id = str(uuid.uuid4())
+    entry = {
+        "id": entry_id,
+        "timestamp": _iso(_now()),
+        "source_type": source_type,
+        "video_url": video_url,
+        "title": title,
+        "summary_text": summary_text,
+    }
+    history.insert(0, entry)
+    if len(history) > 50:
+        history = history[:50]
+    save_session_history(history)
+    return entry_id
+
 def load_guestbook():
     return load_json_file(GUESTBOOK_FILE, [])
 
@@ -1652,7 +1696,7 @@ def get_remote_worker_status_cached(refresh_key: int = 0):
 
 def add_history_entry(source_type, video_url, summary_text, transcript_text=""):
     if not (is_admin_user() or str(source_type or "").strip() == "schedule"):
-        return ""
+        return add_session_history_entry(source_type, video_url, summary_text, transcript_text)
     history = load_history()
     # 尝试解析摘要中的标题 (如果可能)
     title = "未命名视频"
@@ -3557,20 +3601,12 @@ st.caption(t("main_caption"))
 admin_mode = is_admin_user()
 
 # Lite 一级导航：突出立即总结，其他能力下沉。
-if admin_mode:
-    tab_home, tab_history, tab_wishwall, tab_settings = st.tabs([
-        t("tab_home"),
-        t("tab_history"),
-        t("tab_wishwall"),
-        t("tab_settings"),
-    ])
-else:
-    tab_home, tab_wishwall, tab_settings = st.tabs([
-        t("tab_home"),
-        t("tab_wishwall"),
-        t("tab_settings"),
-    ])
-    tab_history = None
+tab_home, tab_history, tab_wishwall, tab_settings = st.tabs([
+    t("tab_home"),
+    t("tab_history"),
+    t("tab_wishwall"),
+    t("tab_settings"),
+])
 
 # --- 通用逻辑函数 (供两个 Tab 使用) ---
 def fetch_transcript_via_shared_service(video_url, progress_callback=None):
@@ -4642,7 +4678,10 @@ def render_library_page(*, show_header: bool = True):
         st.markdown(t("history_header"))
         st.caption(t("history_caption"))
 
-    history = load_history() or []
+    if is_admin_user():
+        history = load_history() or []
+    else:
+        history = get_session_history() or []
     if history:
         try:
             st.download_button(
@@ -7501,12 +7540,11 @@ with tab_home:
     render_processing_center_page(current_bg_task_id, current_bg_task_status)
 
 
-if admin_mode and tab_history is not None:
-    # ==========================
-    # 历史记录
-    # ==========================
-    with tab_history:
-        render_library_page(show_header=True)
+# ==========================
+# 历史记录
+# ==========================
+with tab_history:
+    render_library_page(show_header=True)
 
 # ==========================
 # 留言板
