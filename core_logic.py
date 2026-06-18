@@ -4431,8 +4431,10 @@ ANYSEARCH_AUTHORITY_PATTERNS = re.compile(
 
 ANYSEARCH_IMPORTANT_TOPIC_PATTERNS = re.compile(
     r"(财经|金融|股市|股票|市值|汇率|央行|利率|通胀|原油|油价|政策|政府|选举|战争|冲突|外交|制裁|"
+    r"贸易|关税|进口|出口|配额|供应链|稀土|关键矿产|矿产|能源|核|协议|谈判|备忘录|G7|七国集团|"
     r"finance|financial|stock|market cap|inflation|central bank|interest rate|oil|policy|government|"
-    r"election|war|conflict|diplomacy|sanction)",
+    r"election|war|conflict|diplomacy|sanction|trade|tariff|import|export|quota|supply chain|"
+    r"rare earth|critical mineral|minerals|energy|nuclear|agreement|talks|memorandum|G7)",
     re.I,
 )
 

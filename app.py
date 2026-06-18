@@ -14,7 +14,7 @@ import uuid
 import calendar
 import requests
 from datetime import datetime, timedelta, time as dt_time
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from rate_limiter import RateLimiter
 from core_logic import (
     get_effective_proxy,
@@ -2078,6 +2078,46 @@ def _render_source_links(source_links: list[tuple[str, str]]) -> None:
     st.markdown("\n".join(source_lines))
 
 
+def _build_fact_check_search_entry_links(title: str, rationale_markdown: str = "") -> list[tuple[str, str]]:
+    query_candidates: list[str] = []
+    title_value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if title_value and title_value != "来源分析":
+        query_candidates.append(title_value)
+
+    rationale_text = str(rationale_markdown or "")
+    inline_terms = re.findall(r"`([^`]{6,160})`", rationale_text)
+    for term in inline_terms:
+        cleaned = re.sub(r"\s+", " ", str(term or "")).strip()
+        if cleaned:
+            query_candidates.append(cleaned)
+
+    query = ""
+    seen: set[str] = set()
+    merged_terms: list[str] = []
+    for candidate in query_candidates:
+        normalized = re.sub(r"\s+", " ", candidate).strip()
+        lowered = normalized.lower()
+        if not normalized or lowered in seen:
+            continue
+        seen.add(lowered)
+        merged_terms.append(normalized)
+        if len(merged_terms) >= 2:
+            break
+    if merged_terms:
+        query = " ".join(merged_terms)
+    if not query:
+        return []
+
+    encoded = quote(query[:240])
+    return [
+        ("Google 新闻搜索", f"https://www.google.com/search?tbm=nws&q={encoded}"),
+        ("Google 网页搜索", f"https://www.google.com/search?q={encoded}"),
+        ("Bing 新闻搜索", f"https://www.bing.com/news/search?q={encoded}"),
+        ("Bing 网页搜索", f"https://www.bing.com/search?q={encoded}"),
+        ("AnySearch", f"https://anysearch.com/search?q={encoded}"),
+    ]
+
+
 def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = None) -> None:
     """渲染以来源链接为中心的来源分析结果。"""
     text = str(fact_check_md or "").strip()
@@ -2112,11 +2152,14 @@ def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = No
                 f"<div class='fact-check-status-chip'>{html.escape(conclusion)}</div>",
                 unsafe_allow_html=True,
             )
-        _render_source_links(list(parsed.get("source_links") or []))
+        source_links = list(parsed.get("source_links") or [])
+        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
+        if not source_links:
+            source_links = _build_fact_check_search_entry_links(title, rationale_markdown)
+        _render_source_links(source_links)
         source_summary = str(parsed.get("source_summary") or "").strip()
         if source_summary and not parsed.get("source_links"):
             st.caption(source_summary)
-        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
         if rationale_markdown:
             _render_fact_check_label(t("fact_check_label_rationale"))
             st.markdown(rationale_markdown)
