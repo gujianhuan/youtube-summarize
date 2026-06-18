@@ -3810,6 +3810,7 @@ def start_video_fact_check_async(
 
     max_claims = int(plan.get("recommended_claim_count") or 3)
     max_claims = max(3, min(12, max_claims))
+    fast_claims = max(3, min(5, max_claims))
     cache_key = _build_video_fact_check_cache_key(url_value, summary_md, transcript_value)
 
     with runtime["lock"]:
@@ -3839,6 +3840,7 @@ def start_video_fact_check_async(
             "url": url_value,
             "cache_key": cache_key,
             "note": str(plan.get("reason") or "").strip(),
+            "result_version": "",
         }
 
     st.session_state[_fact_check_state_key(state_prefix, "task_id")] = task_id
@@ -3858,10 +3860,15 @@ def start_video_fact_check_async(
         with runtime["lock"]:
             task = runtime["tasks"].get(task_id) or {}
             task["status"] = "running"
+            task["phase"] = "fast"
             runtime["tasks"][task_id] = task
         try:
-            print(f"VideoFactCheckWorker: started task_id={task_id} url={url_value} max_claims={max_claims}", flush=True)
-            fact_markdown = _call_with_optional_kwargs(
+            print(
+                f"VideoFactCheckWorker: started fast task_id={task_id} url={url_value} "
+                f"fast_claims={fast_claims} max_claims={max_claims}",
+                flush=True,
+            )
+            fast_fact_markdown = _call_with_optional_kwargs(
                 fact_check_document_claims,
                 text=transcript_value,
                 summary_markdown=summary_md,
@@ -3869,9 +3876,37 @@ def start_video_fact_check_async(
                 base_url=eff_base_url,
                 model=eff_fact_model,
                 proxy_url=eff_proxy,
-                max_claims=max_claims,
+                max_claims=fast_claims,
                 ui_locale=eff_ui_locale,
+                search_mode="fast",
             )
+            with runtime["lock"]:
+                runtime["tasks"][task_id] = {
+                    "status": "running",
+                    "phase": "deep",
+                    "result": str(fast_fact_markdown or "").strip(),
+                    "result_version": "fast",
+                    "error": "",
+                    "url": url_value,
+                    "cache_key": cache_key,
+                    "note": f"快速核查已完成 {fast_claims} 条，深度核查正在后台补充到约 {max_claims} 条。",
+                }
+            if max_claims <= fast_claims:
+                fact_markdown = fast_fact_markdown
+            else:
+                print(f"VideoFactCheckWorker: started deep task_id={task_id} url={url_value} max_claims={max_claims}", flush=True)
+                fact_markdown = _call_with_optional_kwargs(
+                    fact_check_document_claims,
+                    text=transcript_value,
+                    summary_markdown=summary_md,
+                    api_key=eff_api_key,
+                    base_url=eff_base_url,
+                    model=eff_fact_model,
+                    proxy_url=eff_proxy,
+                    max_claims=max_claims,
+                    ui_locale=eff_ui_locale,
+                    search_mode="deep",
+                )
             with runtime["lock"]:
                 result_cache = runtime.setdefault("result_cache", {})
                 result_cache[cache_key] = str(fact_markdown or "").strip()
@@ -3881,18 +3916,22 @@ def start_video_fact_check_async(
                         result_cache.pop(oldest_key, None)
                 runtime["tasks"][task_id] = {
                     "status": "success",
+                    "phase": "done",
                     "result": str(fact_markdown or "").strip(),
+                    "result_version": "deep",
                     "error": "",
                     "url": url_value,
                     "cache_key": cache_key,
-                    "note": str(plan.get("reason") or "").strip(),
+                    "note": f"深度核查已完成，约 {max_claims} 条关键声明已刷新。",
                 }
-            print(f"VideoFactCheckWorker: success task_id={task_id} url={url_value}", flush=True)
+            print(f"VideoFactCheckWorker: success deep task_id={task_id} url={url_value}", flush=True)
         except Exception as exc:
             with runtime["lock"]:
                 runtime["tasks"][task_id] = {
                     "status": "error",
+                    "phase": "error",
                     "result": "",
+                    "result_version": "",
                     "error": str(exc),
                     "url": url_value,
                     "cache_key": cache_key,
@@ -3930,9 +3969,12 @@ def sync_video_fact_check_state(
         task.get("note") or st.session_state.get(_fact_check_state_key(state_prefix, "note")) or ""
     ).strip()
 
+    result_version = str(task.get("result_version") or ("deep" if status == "success" else "")).strip()
+    applied_task_marker = f"{task_id}:{result_version or status}"
     if (
-        status == "success"
-        and st.session_state.get(_fact_check_state_key(state_prefix, "applied_task_id")) != task_id
+        status in {"running", "success"}
+        and result_version
+        and st.session_state.get(_fact_check_state_key(state_prefix, "applied_task_id")) != applied_task_marker
         and str(task.get("result") or "").strip()
         and st.session_state.get(summary_state_key)
     ):
@@ -3944,9 +3986,10 @@ def sync_video_fact_check_state(
             st.session_state.get(history_entry_state_key),
             st.session_state[summary_state_key],
         )
-        st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = task_id
-        st.session_state[_fact_check_state_key(state_prefix, "status")] = "success"
-        st.session_state[_fact_check_state_key(state_prefix, "success_toast_task_id")] = task_id
+        st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = applied_task_marker
+        st.session_state[_fact_check_state_key(state_prefix, "status")] = status
+        if status == "success":
+            st.session_state[_fact_check_state_key(state_prefix, "success_toast_task_id")] = applied_task_marker
 
 def run_document_summary_pipeline(
     extracted,
