@@ -5250,6 +5250,11 @@ FACT_CHECK_ENGLISH_QUERY_REPLACEMENTS = [
     (r"美国银行", "Bank of America"),
     (r"格雷厄姆", "Graham"),
     (r"内塔尼亚胡", "Netanyahu"),
+    (r"山姆店|山姆会员店", "Sam's Club"),
+    (r"沃尔玛", "Walmart"),
+    (r"中国监管部门|监管部门", "China regulator"),
+    (r"约谈", "summons"),
+    (r"食品安全|普遍亏损", "food safety"),
     (r"重新开放", "reopen"),
     (r"清除水雷", "clear mines"),
     (r"解除封锁", "lift blockade"),
@@ -5261,6 +5266,10 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
     (
         re.compile(r"(雅虎财经|yahoo finance|沃尔玛|walmart|realty income|philip morris|blue chip|蓝筹股)", re.I),
         ["finance.yahoo.com", "www.reuters.com", "www.bloomberg.com", "www.wsj.com"],
+    ),
+    (
+        re.compile(r"(山姆店|山姆会员店|sam's club|sams club|沃尔玛|walmart|食品安全|food safety|市场监管|regulator|约谈|summons)", re.I),
+        ["www.reuters.com", "english.news.cn", "www.chinadaily.com.cn", "www.marketwatch.com"],
     ),
     (
         re.compile(r"(朝鲜|north korea|访问|visit|pyongyang)", re.I),
@@ -5412,6 +5421,10 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
     if re.search(r"(雅虎财经|Yahoo Finance|沃尔玛|Walmart|Realty Income|菲利普莫里斯|Philip Morris)", topic_haystack, re.I):
         add("Yahoo Finance three blue-chip stocks Walmart Realty Income Philip Morris")
         add("Walmart Realty Income Philip Morris defensive stocks Yahoo Finance")
+    if re.search(r"(山姆店|山姆会员店|Sam's Club|Walmart|沃尔玛|食品安全|市场监管|约谈|summons)", topic_haystack, re.I):
+        add("Sam's Club China food safety Walmart regulator summons Reuters")
+        add("China regulator summons Walmart China over Sam's Club food safety issues")
+        add("Sam's Club China food safety Xinhua Reuters")
     if re.search(r"[A-Za-z]{3,}", normalized):
         add(normalized)
     return candidates[:8]
@@ -5425,7 +5438,7 @@ def _score_fact_check_query(query: str) -> int:
     score = 0
     if lowered.startswith("site:"):
         score += 20
-    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|hormuz|kyiv|north korea|strait of hormuz|trump|iran|axios|state department|xi|jpmorgan)\b", lowered, re.I):
+    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|hormuz|kyiv|north korea|strait of hormuz|trump|iran|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator)\b", lowered, re.I):
         score += 10
     if re.search(r"[A-Za-z]{3,}", value):
         score += 4
