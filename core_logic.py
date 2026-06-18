@@ -5649,7 +5649,7 @@ def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = 
 
     mode = str(search_mode or "standard").strip().lower()
     is_fast_mode = mode == "fast"
-    anysearch_enabled = _env_flag("ANYSEARCH_ENABLED", default=False)
+    anysearch_enabled = _env_flag("ANYSEARCH_ENABLED", default=True)
     anysearch_limit = 0 if is_fast_mode else _env_int("ANYSEARCH_MAX_CALLS_PER_CLAIM", 2, minimum=0, maximum=4)
     anysearch_calls = 0
     results_text = []
