@@ -30,6 +30,8 @@ const EXTENSION_TOOL_VERSION = EXTENSION_VERSION;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
 const DEBUG_SESSION_ID = "youtube-plugin-extract";
 const BACKGROUND_SUMMARIZE_DEDUPE_MS = 30000;
+const BACKGROUND_SUMMARIZE_STORAGE_LOCK_MS = 10 * 60 * 1000;
+const BACKGROUND_SUMMARIZE_ACTIVE_KEY = "summarizerActiveVideoFlows";
 const backgroundSummarizeLocks = new Map();
 
 // Release: use manifest version as the single source of truth for UI/debug reporting.
@@ -134,6 +136,10 @@ function storageLocalGet(key) {
 
 function storageLocalSet(value) {
   return callExtensionApi(extensionApi.storage.local.set, extensionApi.storage.local, value);
+}
+
+function storageLocalRemove(key) {
+  return callExtensionApi(extensionApi.storage.local.remove, extensionApi.storage.local, key);
 }
 
 async function queryTabs(queryInfo) {
@@ -4501,6 +4507,7 @@ async function startSummarizeFlowFromPage(payload) {
     bridgeApiUrl: String(flowConfig?.bridgeApiUrl || "")
   });
   try {
+    await setFlowStatus("正在发送 transcript 到主站...", false, "uploading");
     await uploadBridgePayload(bridgePayload, flowConfig);
   } catch (error) {
     attempts.push({
@@ -4533,9 +4540,9 @@ async function startSummarizeFlowFromPage(payload) {
         ok: true,
         sourceUrl
       });
-      await setFlowStatus("Opening main site...", false, "opening");
+      await setFlowStatus("正在打开主站...", false, "opening");
       await createTab({ url: await buildBridgeUrl(payloadId, sourceUrl, flowConfig) });
-      await setFlowStatus("Transcript sent. The main site is pulling it and starting summary automatically.", false, "done");
+      await setFlowStatus("主站已打开，正在自动总结。", false, "done");
     } catch (error) {
       attempts.push({
         stage: "background_open_main_site_failed",
@@ -4570,6 +4577,62 @@ async function startSummarizeFlowFromPage(payload) {
       ]
     }
   };
+}
+
+async function getActiveVideoFlowLocks() {
+  try {
+    const stored = await storageLocalGet(BACKGROUND_SUMMARIZE_ACTIVE_KEY);
+    const value = stored?.[BACKGROUND_SUMMARIZE_ACTIVE_KEY];
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (_error) {
+    return {};
+  }
+}
+
+async function tryAcquireVideoFlowLock(lockKey, sourceUrl) {
+  const normalizedKey = String(lockKey || "").trim();
+  if (!normalizedKey) {
+    return { acquired: true };
+  }
+  const now = Date.now();
+  const memoryLockValue = backgroundSummarizeLocks.get(normalizedKey) || 0;
+  if (memoryLockValue && now - memoryLockValue < BACKGROUND_SUMMARIZE_DEDUPE_MS) {
+    return { acquired: false, deduped: true, reason: "memory_lock" };
+  }
+
+  const locks = await getActiveVideoFlowLocks();
+  const nextLocks = {};
+  for (const [key, value] of Object.entries(locks)) {
+    const startedAt = Number(value?.startedAt || 0);
+    if (startedAt && now - startedAt < BACKGROUND_SUMMARIZE_STORAGE_LOCK_MS) {
+      nextLocks[key] = value;
+    }
+  }
+  const existing = nextLocks[normalizedKey];
+  if (existing?.startedAt && now - Number(existing.startedAt) < BACKGROUND_SUMMARIZE_STORAGE_LOCK_MS) {
+    return { acquired: false, deduped: true, reason: "storage_lock", existing };
+  }
+
+  nextLocks[normalizedKey] = {
+    startedAt: now,
+    sourceUrl: String(sourceUrl || "").trim()
+  };
+  backgroundSummarizeLocks.set(normalizedKey, now);
+  await storageLocalSet({ [BACKGROUND_SUMMARIZE_ACTIVE_KEY]: nextLocks });
+  return { acquired: true };
+}
+
+async function releaseVideoFlowLock(lockKey) {
+  const normalizedKey = String(lockKey || "").trim();
+  if (!normalizedKey) {
+    return;
+  }
+  backgroundSummarizeLocks.delete(normalizedKey);
+  const locks = await getActiveVideoFlowLocks();
+  if (locks[normalizedKey]) {
+    delete locks[normalizedKey];
+    await storageLocalSet({ [BACKGROUND_SUMMARIZE_ACTIVE_KEY]: locks });
+  }
 }
 
 extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -4618,34 +4681,39 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.action === "startBackgroundSummarizeFlowFromPage") {
-    const sourceUrl = String(message?.payload?.sourceUrl || "").trim();
-    const lockKey = parseYouTubeVideoId(sourceUrl) || sourceUrl;
-    const lockValue = lockKey ? backgroundSummarizeLocks.get(lockKey) : 0;
-    const now = Date.now();
-    if (lockKey && lockValue && now - lockValue < BACKGROUND_SUMMARIZE_DEDUPE_MS) {
-      sendResponse({ ok: true, started: false, deduped: true });
-      return undefined;
-    }
-    if (lockKey) {
-      backgroundSummarizeLocks.set(lockKey, now);
-    }
     (async () => {
+      let responseSent = false;
+      const reply = (payload) => {
+        if (responseSent) {
+          return;
+        }
+        responseSent = true;
+        sendResponse(payload);
+      };
+      const sourceUrl = String(message?.payload?.sourceUrl || "").trim();
+      const lockKey = parseYouTubeVideoId(sourceUrl) || sourceUrl;
+      const lockResult = await tryAcquireVideoFlowLock(lockKey, sourceUrl);
+      if (!lockResult.acquired) {
+        await setFlowStatus("同一视频已有后台任务在运行，本次不会重复打开主站。", false, "deduped");
+        reply({ ok: true, started: false, deduped: true, reason: lockResult.reason || "deduped" });
+        return;
+      }
       try {
+        reply({ ok: true, started: true });
+        await setFlowStatus("正在后台提取字幕...", false, "extracting");
         await startSummarizeFlowFromPage(message.payload || {});
       } catch (error) {
+        reply({ ok: false, started: false, error: String(error?.message || error || "background_flow_failed") });
         await setFlowStatus(
           `后台自动总结失败。${String(error?.message || error || "unknown_error")}`,
           true,
           "error"
         );
       } finally {
-        if (lockKey) {
-          backgroundSummarizeLocks.delete(lockKey);
-        }
+        await releaseVideoFlowLock(lockKey);
       }
     })();
-    sendResponse({ ok: true, started: true });
-    return undefined;
+    return true;
   }
 
   return undefined;

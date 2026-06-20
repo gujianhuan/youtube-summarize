@@ -5250,6 +5250,17 @@ FACT_CHECK_ENGLISH_QUERY_REPLACEMENTS = [
     (r"美国银行", "Bank of America"),
     (r"格雷厄姆", "Graham"),
     (r"内塔尼亚胡", "Netanyahu"),
+    (r"万斯", "Vance"),
+    (r"以色列", "Israel"),
+    (r"美伊协议|伊朗协议", "Iran deal"),
+    (r"主要公开辩护人|辩护人", "defends"),
+    (r"批评", "criticizes"),
+    (r"郑丽文", "Cheng Li-wen"),
+    (r"民众党", "Taiwan People's Party"),
+    (r"议员", "lawmakers"),
+    (r"河南密阳|密阳", "Henan Miyang"),
+    (r"红夕执法", "red evening law enforcement"),
+    (r"冷链货车", "refrigerated trucks"),
     (r"山姆店|山姆会员店", "Sam's Club"),
     (r"沃尔玛", "Walmart"),
     (r"中国监管部门|监管部门", "China regulator"),
@@ -5277,7 +5288,19 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
     ),
     (
         re.compile(r"(伊朗|iran|hormuz|霍尔木兹|核协议|nuclear deal|谈判|sanctions)", re.I),
-        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com"],
+        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com", "www.axios.com"],
+    ),
+    (
+        re.compile(r"(万斯|vance|美伊协议|iran deal|以色列|israel)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.axios.com", "apnews.com"],
+    ),
+    (
+        re.compile(r"(郑丽文|cheng li-wen|民众党|taiwan people's party|议员|lawmakers)", re.I),
+        ["www.reuters.com", "www.bloomberg.com", "www.taipeitimes.com", "focustaiwan.tw"],
+    ),
+    (
+        re.compile(r"(河南密阳|密阳|红夕执法|冷链货车|refrigerated trucks|law enforcement)", re.I),
+        ["www.chinadaily.com.cn", "english.news.cn", "www.globaltimes.cn", "www.reuters.com"],
     ),
     (
         re.compile(r"(乌克兰|ukraine|基辅|kyiv|无人机|drone|导弹|missile|rubio)", re.I),
@@ -5388,6 +5411,9 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("Trump Iran nuclear deal talks sanctions progress")
         add("Iran Strait of Hormuz reopen clear mines draft agreement")
         add("Iran oil exports 60-day nuclear talks Reuters")
+        if re.search(r"(万斯|Vance|以色列|Israel|辩护|defends|批评|criticizes)", topic_haystack, re.I):
+            add("Vance defends Iran deal criticizes Israel Reuters Axios")
+            add("Vance Iran deal Israel criticism public defender")
         if re.search(r"(亚伯拉罕协议|Abraham Accords|停火|ceasefire|沙特|Saudi|海湾|Gulf)", topic_haystack, re.I):
             add("Trump Abraham Accords ceasefire Saudi Arabia Iran Reuters")
     if re.search(r"(卢比奥|\bRubio\b)", topic_haystack, re.I):
@@ -5425,6 +5451,12 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("Sam's Club China food safety Walmart regulator summons Reuters")
         add("China regulator summons Walmart China over Sam's Club food safety issues")
         add("Sam's Club China food safety Xinhua Reuters")
+    if re.search(r"(郑丽文|Cheng Li-wen|民众党|Taiwan People's Party|议员|lawmakers)", topic_haystack, re.I):
+        add("Cheng Li-wen US visit meets 10 lawmakers Reuters")
+        add("Cheng Li-wen Taiwan People's Party US lawmakers June 2026")
+    if re.search(r"(河南密阳|密阳|红夕执法|冷链货车|refrigerated trucks)", topic_haystack, re.I):
+        add("Henan Miyang red evening law enforcement 21 refrigerated trucks 2026")
+        add("Henan red evening law enforcement refrigerated trucks China media")
     if re.search(r"[A-Za-z]{3,}", normalized):
         add(normalized)
     return candidates[:8]
@@ -5438,7 +5470,7 @@ def _score_fact_check_query(query: str) -> int:
     score = 0
     if lowered.startswith("site:"):
         score += 20
-    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|hormuz|kyiv|north korea|strait of hormuz|trump|iran|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator)\b", lowered, re.I):
+    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|vance|hormuz|kyiv|north korea|strait of hormuz|trump|iran|israel|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator|cheng li-wen|lawmakers|miyang|refrigerated trucks)\b", lowered, re.I):
         score += 10
     if re.search(r"[A-Za-z]{3,}", value):
         score += 4
@@ -6055,12 +6087,12 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "search_terms_label": "搜索词",
             "search_results_label": "搜索结果",
             "fallback_claim_intro": "系统已先整理出本条可核查说法，并附上可直接复核的候选来源线索。",
-            "fallback_conclusion": "已整理候选来源，建议继续人工查看",
-            "fallback_rationale": "本条先展示系统已汇总的搜索入口和候选来源，方便你直接点开原文自行判断，不代替用户下真假结论。",
+            "fallback_conclusion": "本轮自动检索未命中直接来源，已提供继续检索入口",
+            "fallback_rationale": "本条先展示系统已汇总的搜索入口和候选来源；如果只出现搜索入口，表示本轮自动检索没有拿到可直接引用的报道页，不代表全网不存在相关来源。",
             "fallback_pending": "建议优先核对原始报道时间、数字口径、机构原文、社媒原帖和二次转载是否存在偏差。",
             "fallback_no_links": "当前未提取到可点击来源链接。",
             "fallback_no_queries": "未生成搜索词",
-            "fallback_detail_rationale": "系统已先保留候选搜索词 `{search_text}` 与可人工复核来源，便于你继续点开原文核对；本条内容不直接作为最终定论。",
+            "fallback_detail_rationale": "系统已先保留候选搜索词 `{search_text}` 与可人工复核入口；如果没有直接报道链接，表示本轮自动检索没有命中可直接引用页面，不代表全网不存在相关来源。",
             "fallback_detail_pending": "建议继续核对原始报道、官方披露、社媒原帖、统计口径与发布时间是否一致。",
             "progress_extract_claims": "正在抽取关键声明...",
             "progress_search_sources": "正在检索外部来源...",
@@ -6084,12 +6116,12 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "search_terms_label": "Search Queries",
             "search_results_label": "Search Results",
             "fallback_claim_intro": "The system has already extracted a checkable claim and preserved candidate sources for quick review.",
-            "fallback_conclusion": "Candidate sources collected for manual review",
-            "fallback_rationale": "This draft surfaces current search leads and candidate sources so the user can open the original pages directly instead of relying on an automatic truth verdict.",
+            "fallback_conclusion": "No direct source was captured in this automated pass; search entry points are provided",
+            "fallback_rationale": "This draft surfaces current search leads and candidate sources. Search-entry-only results mean this automated pass did not capture a directly citable page; they do not prove no source exists.",
             "fallback_pending": "Prioritize checking the original report date, exact figures, issuing institution, original social post, and whether secondary reposts introduced distortions.",
             "fallback_no_links": "No clickable source links were extracted this time.",
             "fallback_no_queries": "No search queries were generated",
-            "fallback_detail_rationale": "The system preserved candidate search queries `{search_text}` and manually reviewable sources so you can open the original pages directly; this draft is not a final verdict.",
+            "fallback_detail_rationale": "The system preserved candidate search queries `{search_text}` and manually reviewable entry points. If no article link appears, this automated pass did not capture a directly citable page; it is not proof that no source exists.",
             "fallback_detail_pending": "Continue checking the original report, official disclosures, original social post, statistical methodology, and publication time for consistency.",
             "progress_extract_claims": "Extracting key claims...",
             "progress_search_sources": "Searching external sources...",
@@ -6613,13 +6645,40 @@ def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: 
             conclusion_label = "来源定位" if "来源定位" in stripped else "核查结论"
             insufficient_value = "暂未定位到直接来源" if conclusion_label == "来源定位" else "缺乏证据"
             dubious_value = "已找到相关来源" if conclusion_label == "来源定位" else "存疑"
+        search_entry_only_value = (
+            "本轮自动检索未命中直接来源，已提供继续检索入口"
+            if conclusion_label in {"来源定位", "核查结论"}
+            else "No direct source was captured in this automated pass; search entry points are provided"
+        )
         rationale_insert = _build_fact_check_hit_rationale(
             search_markdown=search_markdown,
             section_text=stripped,
             ui_locale="en" if conclusion_label == "Conclusion" else "zh",
         )
         rationale_line_pattern = r"(^-\s*(?:判断依据|依据|来源线索说明|Rationale|Source Notes)[:：]\s*)([^\n]*)"
-        if not should_soften_to_dubious or f"{conclusion_label}：" + insufficient_value not in stripped and f"{conclusion_label}: {insufficient_value}" not in stripped:
+        has_insufficient_label = (
+            f"{conclusion_label}：" + insufficient_value in stripped
+            or f"{conclusion_label}: {insufficient_value}" in stripped
+        )
+        if not should_soften_to_dubious and has_insufficient_label:
+            stripped = re.sub(
+                rf"({re.escape(conclusion_label)}[:：]\s*){re.escape(insufficient_value)}",
+                rf"\1{search_entry_only_value}",
+                stripped,
+                count=1,
+                flags=re.I,
+            )
+            if rationale_insert and re.search(rationale_line_pattern, stripped, re.I | re.M):
+                stripped = re.sub(
+                    rationale_line_pattern,
+                    lambda m: m.group(1) + rationale_insert,
+                    stripped,
+                    count=1,
+                    flags=re.I | re.M,
+                )
+            updated_sections.append(stripped)
+            continue
+        if not should_soften_to_dubious or not has_insufficient_label:
             updated_sections.append(stripped)
             continue
 

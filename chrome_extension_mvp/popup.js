@@ -25,6 +25,11 @@ const titleLabelEl = document.getElementById("titleLabel");
 const urlLabelEl = document.getElementById("urlLabel");
 const transcriptLabelEl = document.getElementById("transcriptLabel");
 const popupHintEl = document.getElementById("popupHint");
+const progressPanel = document.getElementById("progressPanel");
+const progressTitleEl = document.getElementById("progressTitle");
+const progressPercentEl = document.getElementById("progressPercent");
+const progressFillEl = document.getElementById("progressFill");
+const progressStepsEl = document.getElementById("progressSteps");
 
 const FLOW_STATUS_KEY = "summarizerFlowStatus";
 const EXTENSION_CONFIG_KEY = "summarizerExtensionConfig";
@@ -46,6 +51,7 @@ const LOCAL_BRIDGE_URL_CANDIDATES = [
 ];
 let lastExtractResponse = null;
 let autoStartTriggered = false;
+let lastProgressStage = "idle";
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
 const DEBUG_SESSION_ID = "youtube-plugin-extract";
 const popupQuery = new URLSearchParams(globalThis.location?.search || "");
@@ -388,6 +394,54 @@ function setStatus(text, isError = false) {
   statusEl.style.color = isError ? "#dc2626" : "#4b5563";
 }
 
+function stageToProgress(stage, isError = false) {
+  const normalized = String(stage || "idle").trim();
+  if (isError || normalized === "error") {
+    return { percent: 100, active: "done", title: "任务失败，请重试" };
+  }
+  if (["extracting", "background_start_extraction", "warming"].includes(normalized)) {
+    return { percent: 25, active: "extract", title: "正在后台提取字幕" };
+  }
+  if (["retrying", "uploading", "background_upload_bridge_payload"].includes(normalized)) {
+    return { percent: 58, active: "upload", title: "正在发送 transcript 到主站" };
+  }
+  if (["opening", "background_open_main_site"].includes(normalized)) {
+    return { percent: 82, active: "open", title: "正在打开主站" };
+  }
+  if (normalized === "deduped") {
+    return { percent: 82, active: "open", title: "同一视频已有后台任务在运行" };
+  }
+  if (normalized === "done") {
+    return { percent: 100, active: "done", title: "主站已打开，正在自动总结" };
+  }
+  return { percent: 12, active: "extract", title: "后台任务已启动" };
+}
+
+function updateProgress(stage, message = "", isError = false) {
+  if (!progressPanel || !progressFillEl || !progressPercentEl || !progressStepsEl) {
+    return;
+  }
+  const normalized = String(stage || "idle").trim();
+  lastProgressStage = normalized;
+  if (!normalized || normalized === "idle") {
+    progressPanel.classList.add("progress-panel-idle");
+    return;
+  }
+  const progress = stageToProgress(normalized, isError);
+  progressPanel.classList.remove("progress-panel-idle");
+  progressTitleEl.textContent = message || progress.title;
+  progressPercentEl.textContent = `${progress.percent}%`;
+  progressFillEl.style.width = `${progress.percent}%`;
+  const order = ["extract", "upload", "open", "done"];
+  const activeIndex = order.indexOf(progress.active);
+  for (const item of Array.from(progressStepsEl.querySelectorAll("li"))) {
+    const step = String(item.getAttribute("data-step") || "");
+    const stepIndex = order.indexOf(step);
+    item.classList.toggle("active", step === progress.active && !isError);
+    item.classList.toggle("done", stepIndex >= 0 && activeIndex >= 0 && stepIndex < activeIndex);
+  }
+}
+
 // #region debug-point A:popup-report
 function reportPopupDebug(hypothesisId, msg, data = {}) {
   fetch(DEBUG_SERVER_URL, {
@@ -633,10 +687,12 @@ async function loadLastFlowStatus() {
       return;
     }
     if (String(status.stage || "") === "done") {
-      setStatus(tp("popupStatusIdle"));
+      setStatus("主站已打开，正在自动总结；你可以关闭弹窗。");
+      updateProgress("done", "主站已打开，正在自动总结");
       return;
     }
     setStatus(status.message, Boolean(status.isError));
+    updateProgress(String(status.stage || "info"), String(status.message || ""), Boolean(status.isError));
   } catch (_error) {
     // Ignore storage read failures in popup.
   }
@@ -774,6 +830,7 @@ async function autoStartBackgroundSummarizeFlow() {
   autoStartTriggered = true;
   try {
     setStatus("已启动后台自动总结；弹窗关闭后任务会继续。主站打开后这里将回到待命。");
+    updateProgress("extracting", "正在后台提取字幕");
     const startResult = await sendRuntimeMessage({
       action: "startBackgroundSummarizeFlowFromPage",
       payload: {
@@ -785,11 +842,15 @@ async function autoStartBackgroundSummarizeFlow() {
       }
     });
     if (startResult?.deduped) {
-      setStatus(tp("popupStatusIdle"));
+      setStatus("同一视频已有后台任务在运行，本次不会重复打开主站。");
+      updateProgress("deduped", "同一视频已有后台任务在运行");
+      return;
     }
+    setStatus("后台任务已启动，弹窗关闭后仍会继续。");
   } catch (error) {
     autoStartTriggered = false;
     setStatus(tp("startSummarizeFlowFailed", { message: ` ${error?.message || error || "unknown_error"}` }), true);
+    updateProgress("error", "后台任务启动失败", true);
   }
 }
 
@@ -2058,16 +2119,19 @@ extensionApi.runtime.onMessage.addListener((message) => {
   }
   const payload = message.payload || {};
   if (String(payload.stage || "") === "done") {
-    setStatus(tp("popupStatusIdle"));
+    setStatus("主站已打开，正在自动总结；你可以关闭弹窗。");
+    updateProgress("done", "主站已打开，正在自动总结");
     return;
   }
   if (payload.message) {
     setStatus(String(payload.message), Boolean(payload.isError));
+    updateProgress(String(payload.stage || "info"), String(payload.message || ""), Boolean(payload.isError));
   }
 });
 
 applyPopupTranslations();
 setStatus(tp("popupStatusIdle"));
+updateProgress("idle");
 void (async () => {
   await loadLastFlowStatus();
   await loadExtensionConfig();

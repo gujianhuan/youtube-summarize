@@ -2118,6 +2118,22 @@ def _build_fact_check_search_entry_links(title: str, rationale_markdown: str = "
     ]
 
 
+def _is_fact_check_search_entry_url(url: str) -> bool:
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+        host = str(parsed.netloc or "").lower()
+        return (
+            "google." in host
+            or host in {"bing.com", "www.bing.com", "anysearch.com", "www.anysearch.com"}
+            or raw.startswith("https://anysearch.com/search")
+        )
+    except Exception:
+        return bool(re.search(r"https?://(?:www\.)?(?:google|bing|anysearch)\.", raw, re.I))
+
+
 def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = None) -> None:
     """渲染以来源链接为中心的来源分析结果。"""
     text = str(fact_check_md or "").strip()
@@ -2154,8 +2170,20 @@ def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = No
             )
         source_links = list(parsed.get("source_links") or [])
         rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
-        if not source_links:
-            source_links = _build_fact_check_search_entry_links(title, rationale_markdown)
+        has_only_search_entries = bool(source_links) and all(
+            _is_fact_check_search_entry_url(url) for _label, url in source_links
+        )
+        if not source_links or has_only_search_entries:
+            fallback_links = _build_fact_check_search_entry_links(title, rationale_markdown)
+            existing_urls = {_normalize_fact_check_source_url(url) for _label, url in source_links}
+            source_links = [
+                *source_links,
+                *[
+                    (label, url)
+                    for label, url in fallback_links
+                    if _normalize_fact_check_source_url(url) not in existing_urls
+                ],
+            ]
         _render_source_links(source_links)
         source_summary = str(parsed.get("source_summary") or "").strip()
         if source_summary and not parsed.get("source_links"):

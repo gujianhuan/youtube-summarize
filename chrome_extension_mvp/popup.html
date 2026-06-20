@@ -10,6 +10,21 @@
     <main class="wrap">
       <h1 id="popupTitle">Transcript Helper</h1>
       <p id="status" class="status">Waiting for extraction...</p>
+      <section id="progressPanel" class="progress-panel progress-panel-idle">
+        <div class="progress-head">
+          <span id="progressTitle">后台任务</span>
+          <strong id="progressPercent">0%</strong>
+        </div>
+        <div class="progress-track">
+          <div id="progressFill" class="progress-fill"></div>
+        </div>
+        <ol id="progressSteps" class="progress-steps">
+          <li data-step="extract">提取字幕</li>
+          <li data-step="upload">发送到主站</li>
+          <li data-step="open">打开主站</li>
+          <li data-step="done">开始总结</li>
+        </ol>
+      </section>
       <div class="actions">
         <button id="extractBtn">Extract</button>
         <button id="copyBtn" disabled>Copy</button>

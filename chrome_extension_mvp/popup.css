@@ -21,6 +21,66 @@ h1 {
   color: #4b5563;
 }
 
+.progress-panel {
+  margin: 0 0 12px;
+  padding: 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #eff6ff;
+}
+
+.progress-panel-idle {
+  display: none;
+}
+
+.progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #1e40af;
+  font-size: 13px;
+}
+
+.progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dbeafe;
+}
+
+.progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: #2563eb;
+  transition: width 180ms ease;
+}
+
+.progress-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.progress-steps li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-steps li.done,
+.progress-steps li.active {
+  color: #1d4ed8;
+  font-weight: 700;
+}
+
 .actions {
   display: flex;
   gap: 8px;
@@ -28,6 +88,7 @@ h1 {
 }
 
 .config-panel {
+  display: none;
   margin-bottom: 12px;
   padding: 10px;
   border-radius: 10px;
