@@ -514,6 +514,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path in {"", "/"}:
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "transcript-bridge",
+                    "message": "Bridge API is running. Use /health for status and /fetch-transcript for transcript tasks.",
+                },
+            )
+            return
+
         if parsed.path == "/health":
             _json_response(
                 self,

@@ -76,7 +76,13 @@ DEFAULT_REMOTE_TRANSCRIBE_URL = _resolve_default_remote_transcribe_url()
 
 def ensure_default_remote_transcribe_config() -> None:
     """为主站默认补齐服务端抓文本 worker 配置。"""
-    if DEFAULT_REMOTE_TRANSCRIBE_URL and not str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip():
+    current_url = str(os.environ.get("REMOTE_TRANSCRIBE_URL", "") or "").strip()
+    is_render = bool(str(os.environ.get("RENDER", "") or "").strip())
+    stale_ephemeral_worker = is_render and (
+        "trycloudflare.com" in current_url.lower()
+        or re.search(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?(?:/|$)", current_url, re.I)
+    )
+    if DEFAULT_REMOTE_TRANSCRIBE_URL and (not current_url or stale_ephemeral_worker):
         os.environ["REMOTE_TRANSCRIBE_URL"] = DEFAULT_REMOTE_TRANSCRIBE_URL
     if DEFAULT_REMOTE_TRANSCRIBE_URL and not str(os.environ.get("REMOTE_TRANSCRIBE_ENABLED", "") or "").strip():
         os.environ["REMOTE_TRANSCRIBE_ENABLED"] = "1"

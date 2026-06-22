@@ -321,7 +321,20 @@ async function getExtensionConfig() {
 
 async function resolveExtensionConfig(options = {}) {
   const config = await getExtensionConfig();
+  const forceRemote = options?.preferLocal === false;
+  if (forceRemote) {
+    return {
+      summarizerUrl: DEFAULT_SUMMARIZER_URL,
+      bridgeApiUrl: DEFAULT_BRIDGE_API_URL,
+      bridgeApiToken: DEFAULT_BRIDGE_API_TOKEN,
+      fetchWorkerUrl: "",
+      fetchWorkerToken: ""
+    };
+  }
   if (!isDefaultRemoteConfig(config)) {
+    return config;
+  }
+  if (options?.preferLocal !== true) {
     return config;
   }
   const localConfig = await resolveLocalDevelopmentConfig();
@@ -1683,7 +1696,7 @@ async function startSummarizeFlow(payload) {
   const sourceUrl = String(payload?.sourceUrl || "");
   const preferLocal = payload?.preferLocal !== undefined
     ? Boolean(payload.preferLocal)
-    : true;
+    : false;
   const flowConfig = await resolveExtensionConfig({ preferLocal });
   try {
     await setFlowStatus("正在上传 transcript...", false, "uploading");

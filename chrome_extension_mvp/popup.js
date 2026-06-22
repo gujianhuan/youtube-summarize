@@ -668,7 +668,7 @@ function parseYouTubeVideoId(url) {
 }
 
 function buildMainSiteFallbackUrl(sourceUrl, route = "server_direct") {
-  const mainUrl = normalizeMainUrl(mainUrlInput.value);
+  const mainUrl = DEFAULT_MAIN_URL;
   const target = new URL(mainUrl);
   const cleanedSourceUrl = String(sourceUrl || "").trim();
   if (cleanedSourceUrl) {
