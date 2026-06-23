@@ -1568,6 +1568,18 @@ def normalize_extension_request_result(result) -> dict | None:
     }
 
 
+def _looks_like_youtube_comments_panel_text(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    head = "\n".join(value.splitlines()[:12])
+    return (
+        bool(re.search(r"(^|\n)\s*评论\s*(\n|$)", head))
+        and bool(re.search(r"(^|\n)\s*(最热门|最新|显示精选评论|显示近期评论)", head))
+        and not bool(re.search(r"\b\d{1,2}:\d{2}\b", head))
+    )
+
+
 def normalize_extension_bridge_payload(payload: dict | None) -> dict:
     """兼容 bridge V1/V2，统一返回主站消费字段。"""
     if not isinstance(payload, dict):
@@ -1593,6 +1605,8 @@ def normalize_extension_bridge_payload(payload: dict | None) -> dict:
     diagnostics_obj = envelope.get("diagnostics") if isinstance(envelope, dict) and isinstance(envelope.get("diagnostics"), dict) else {}
 
     transcript_text = str(transcript_obj.get("text") or payload.get("transcript") or "").strip()
+    if _looks_like_youtube_comments_panel_text(transcript_text):
+        transcript_text = ""
     source_url = str(video_obj.get("url") or payload.get("sourceUrl") or payload.get("source_url") or "").strip()
     title = str(video_obj.get("title") or payload.get("title") or "").strip()
     payload_id = str(payload.get("payloadId") or payload.get("payload_id") or "").strip()

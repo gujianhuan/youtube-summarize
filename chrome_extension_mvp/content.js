@@ -2679,7 +2679,9 @@
             ...(payload && typeof payload === "object" ? payload : {}),
             requestOrigin: location.origin,
             requestPageUrl: location.href,
-            preferLocal: isLoopbackPageOrigin(location.origin)
+            preferLocal: payload?.preferLocal === false
+              ? false
+              : Boolean(payload?.preferLocal) || isLoopbackPageOrigin(location.origin)
           }
         });
         attempts.push({

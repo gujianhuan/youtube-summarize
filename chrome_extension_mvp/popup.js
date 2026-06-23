@@ -699,10 +699,19 @@ async function loadLastFlowStatus() {
 }
 
 async function getPreferredTab() {
+  const targetVideoId = parseYouTubeVideoId(popupTargetSourceUrl);
   if (Number.isInteger(popupTargetTabId) && popupTargetTabId > 0) {
     try {
       const tab = await getTab(popupTargetTabId);
       if (tab?.id) {
+        const tabUrl = String(tab.url || "");
+        if (targetVideoId && parseYouTubeVideoId(tabUrl) !== targetVideoId) {
+          reportPopupDebug("A", "popup rejected query target tab with mismatched video id", {
+            popupTargetSourceUrl,
+            popupTargetTabId,
+            tabUrl
+          });
+        } else {
         // #region debug-point A:preferred-target-tab
         reportPopupDebug("A", "popup resolved target tab from query", {
           popupTargetTabId,
@@ -712,13 +721,13 @@ async function getPreferredTab() {
         });
         // #endregion
         return tab;
+        }
       }
     } catch (_error) {
       // Fall back to the currently active tab when the injected target tab no longer exists.
     }
   }
   if (popupTargetSourceUrl) {
-    const targetVideoId = parseYouTubeVideoId(popupTargetSourceUrl);
     const tabs = await queryTabs({});
     const matchedTab = tabs.find((tab) => {
       const tabUrl = String(tab?.url || "").trim();
@@ -749,17 +758,6 @@ async function getActiveTab() {
   if (preferredTab) {
     return preferredTab;
   }
-  const focusedTabs = await queryTabs({ active: true, lastFocusedWindow: true });
-  if (focusedTabs[0]?.id) {
-    // #region debug-point A:last-focused-tab
-    reportPopupDebug("A", "popup fell back to lastFocusedWindow active tab", {
-      tabId: focusedTabs[0].id,
-      url: String(focusedTabs[0].url || ""),
-      title: String(focusedTabs[0].title || "")
-    });
-    // #endregion
-    return focusedTabs[0];
-  }
   const currentWindowTabs = await queryTabs({ active: true, currentWindow: true });
   if (currentWindowTabs[0]?.id) {
     // #region debug-point A:current-window-tab
@@ -770,6 +768,17 @@ async function getActiveTab() {
     });
     // #endregion
     return currentWindowTabs[0];
+  }
+  const focusedTabs = await queryTabs({ active: true, lastFocusedWindow: true });
+  if (focusedTabs[0]?.id) {
+    // #region debug-point A:last-focused-tab
+    reportPopupDebug("A", "popup fell back to lastFocusedWindow active tab", {
+      tabId: focusedTabs[0].id,
+      url: String(focusedTabs[0].url || ""),
+      title: String(focusedTabs[0].title || "")
+    });
+    // #endregion
+    return focusedTabs[0];
   }
   const fallbackTabs = await queryTabs({ active: true });
   // #region debug-point A:fallback-tab

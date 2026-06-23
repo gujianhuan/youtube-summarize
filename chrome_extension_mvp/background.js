@@ -4491,7 +4491,9 @@ async function startSummarizeFlowFromPage(payload) {
   const sourceUrl = String(payload?.sourceUrl || "").trim();
   const requestOrigin = String(payload?.requestOrigin || "").trim();
   const requestPageUrl = String(payload?.requestPageUrl || "").trim();
-  const preferLocal = Boolean(payload?.preferLocal) || isLoopbackUrl(requestOrigin) || isLoopbackUrl(requestPageUrl);
+  const preferLocal = payload?.preferLocal === false
+    ? false
+    : Boolean(payload?.preferLocal) || isLoopbackUrl(requestOrigin) || isLoopbackUrl(requestPageUrl);
   const openMainSite = Boolean(payload?.openMainSite);
   const attempts = [
     {
