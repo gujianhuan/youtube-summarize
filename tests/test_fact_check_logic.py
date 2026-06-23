@@ -1216,9 +1216,47 @@ def test_prepare_fact_check_queries_adds_specific_queries_for_yahoo_finance_stoc
     assert any(item.startswith("site:finance.yahoo.com ") for item in queries)
 
 
+def test_prepare_fact_check_queries_adds_japanese_sources_for_japan_poll_claim() -> None:
+    """日本民调类说法应优先补共同社/日经等日本来源。"""
+
+    queries = _prepare_fact_check_queries(
+        "日本共同社民调显示高市内阁支持率下降5.5个百分点，39岁以下群体下降13.5个百分点，女性下滑9.2个百分点。",
+        ["日本 高市 内阁 支持率 民调"],
+    )
+
+    assert any("Kyodo" in item or "共同通信" in item for item in queries)
+    assert any(item.startswith("site:english.kyodonews.net ") for item in queries)
+    assert any(item.startswith("site:asia.nikkei.com ") for item in queries)
+
+
+def test_prepare_fact_check_queries_adds_truth_social_for_trump_post_claim() -> None:
+    """Trump 发帖类说法应补 Truth Social 定向搜索。"""
+
+    queries = _prepare_fact_check_queries(
+        "川普发帖批评意大利总理梅洛尼花费数万亿美元却不保卫美国，梅洛尼未回应。",
+        ["川普 Truth Social 梅洛尼 国防开支"],
+    )
+
+    assert any("Truth Social" in item for item in queries)
+    assert any(item.startswith("site:truthsocial.com ") for item in queries)
+
+
+def test_prepare_fact_check_queries_adds_polymarket_for_starmer_resignation_claim() -> None:
+    """预测市场类说法应补 Polymarket 定向搜索。"""
+
+    queries = _prepare_fact_check_queries(
+        "英国首相斯塔默预计将辞职，预测市场Polymarket显示辞职概率达83%。",
+        ["英国首相 斯塔默 辞职 Polymarket 83%"],
+    )
+
+    assert any("Polymarket Starmer resignation odds" in item for item in queries)
+    assert any(item.startswith("site:polymarket.com ") for item in queries)
+
+
 def test_perform_web_search_drops_generic_chinese_page_when_numeric_claim_has_no_numeric_match(monkeypatch) -> None:
     """涉及具体数字的外文/财经说法，不应保留只蹭到泛地名的中文弱相关页。"""
 
+    monkeypatch.setenv("ANYSEARCH_ENABLED", "0")
     monkeypatch.setattr(
         "core_logic._find_authoritative_sources",
         lambda text: [{"label": "台湾证券交易所", "url": "https://www.twse.com.tw/en/"}],

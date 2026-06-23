@@ -3381,7 +3381,32 @@ AUTHORITATIVE_SOURCE_RULES = [
     {
         "label": "日经亚洲",
         "url": "https://asia.nikkei.com/",
-        "aliases": ["日经", "nikkei", "nikkei asia"],
+        "aliases": ["日经", "nikkei", "nikkei asia", "日本新闻", "日本民调"],
+        "query_terms": ["Nikkei Japan poll", "Nikkei Japan politics"],
+    },
+    {
+        "label": "日本时报",
+        "url": "https://www.japantimes.co.jp/",
+        "aliases": ["日本时报", "japan times", "japantimes", "日本新闻"],
+        "query_terms": ["Japan Times poll Japan politics"],
+    },
+    {
+        "label": "共同社",
+        "url": "https://english.kyodonews.net/",
+        "aliases": ["共同社", "kyodo", "kyodo news", "日本民调", "高市"],
+        "query_terms": ["Kyodo Japan Cabinet approval poll", "Kyodo Takaichi poll"],
+    },
+    {
+        "label": "Truth Social",
+        "url": "https://truthsocial.com/",
+        "aliases": ["truth social", "truthsocial", "川普发帖", "特朗普发帖", "trump post"],
+        "query_terms": ["Trump Truth Social post"],
+    },
+    {
+        "label": "Polymarket",
+        "url": "https://polymarket.com/",
+        "aliases": ["polymarket", "预测市场", "辞职概率", "辞职概率达"],
+        "query_terms": ["Polymarket UK prime minister resignation odds", "Polymarket Starmer resignation"],
     },
     {
         "label": "Axios",
@@ -3428,6 +3453,14 @@ MAJOR_MEDIA_DOMAINS = {
     "nikkei.com",
     "www.nikkei.com",
     "asia.nikkei.com",
+    "english.kyodonews.net",
+    "japantimes.co.jp",
+    "www.japantimes.co.jp",
+    "www3.nhk.or.jp",
+    "truthsocial.com",
+    "www.truthsocial.com",
+    "polymarket.com",
+    "www.polymarket.com",
     "kyivindependent.com",
     "www.kyivindependent.com",
     "ukrinform.net",
@@ -3733,7 +3766,7 @@ def _score_fact_check_hit(
         score += 12
     if ".gov" in domain or domain.startswith("gov.") or domain.endswith(".gov"):
         score += 11
-    if any(token in domain for token in ("reuters.com", "apnews.com", "bloomberg.com", "nytimes.com", "washingtonpost.com", "bbc.com", "cnn.com", "wsj.com", "ft.com")):
+    if any(token in domain for token in ("reuters.com", "apnews.com", "bloomberg.com", "nytimes.com", "washingtonpost.com", "bbc.com", "cnn.com", "wsj.com", "ft.com", "kyodonews.net", "nikkei.com", "japantimes.co.jp", "truthsocial.com", "polymarket.com")):
         score += 8
     if path.count("/") >= 2:
         score += 3
@@ -5270,6 +5303,16 @@ FACT_CHECK_ENGLISH_QUERY_REPLACEMENTS = [
     (r"清除水雷", "clear mines"),
     (r"解除封锁", "lift blockade"),
     (r"恢复.*?石油出口", "restore oil exports"),
+    (r"日本", "Japan"),
+    (r"高市", "Takaichi"),
+    (r"内阁", "cabinet"),
+    (r"支持率|民调", "approval poll"),
+    (r"发帖", "post"),
+    (r"梅洛尼", "Meloni"),
+    (r"国防开支", "defense spending"),
+    (r"英国首相", "UK prime minister"),
+    (r"斯塔默", "Starmer"),
+    (r"辞职概率|辞职", "resignation odds"),
 ]
 
 
@@ -5305,6 +5348,18 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
     (
         re.compile(r"(乌克兰|ukraine|基辅|kyiv|无人机|drone|导弹|missile|rubio)", re.I),
         ["www.reuters.com", "www.nytimes.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(日本|japan|高市|takaichi|内阁|cabinet|支持率|approval|民调|poll)", re.I),
+        ["english.kyodonews.net", "asia.nikkei.com", "www.japantimes.co.jp", "www3.nhk.or.jp"],
+    ),
+    (
+        re.compile(r"(川普|特朗普|trump|truth social|truthsocial|发帖|post|梅洛尼|meloni|nato|国防开支|defense spending)", re.I),
+        ["truthsocial.com", "www.reuters.com", "www.axios.com", "www.politico.com"],
+    ),
+    (
+        re.compile(r"(英国首相|斯塔默|starmer|辞职|resign|resignation|polymarket|预测市场|probability|odds)", re.I),
+        ["polymarket.com", "www.reuters.com", "www.bbc.com", "www.theguardian.com"],
     ),
     (
         re.compile(r"(ipo|上市|香港ipo|香港上市|宁德时代|catl|jpmorgan|bank of america)", re.I),
@@ -5424,6 +5479,19 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("Russia threatens strikes on Kyiv defence sites Reuters")
         add("Russia urges foreigners to leave Kyiv Reuters")
         add("Kyiv air defence Patriot supply Reuters")
+    if re.search(r"(日本|Japan|高市|Takaichi|内阁|cabinet|支持率|approval|民调|poll)", topic_haystack, re.I):
+        add("Japan Takaichi Cabinet approval poll Kyodo")
+        add("高市 内閣 支持率 世論調査 共同通信")
+        add("site:english.kyodonews.net Japan Cabinet approval poll Takaichi")
+        add("site:asia.nikkei.com Japan Takaichi approval poll")
+    if re.search(r"(川普|特朗普|Trump|Truth Social|truthsocial|发帖|post|梅洛尼|Meloni|国防开支|defense spending|NATO)", topic_haystack, re.I):
+        add("Trump Truth Social Meloni NATO defense spending")
+        add("site:truthsocial.com Trump Meloni NATO defense spending")
+        add("Trump attacks Meloni defense spending Truth Social")
+    if re.search(r"(英国首相|斯塔默|Starmer|辞职|resign|resignation|Polymarket|预测市场|probability|odds)", topic_haystack, re.I):
+        add("Polymarket Starmer resignation odds")
+        add("site:polymarket.com Starmer resignation")
+        add("UK prime minister Starmer resignation Polymarket 83%")
     if re.search(r"(习近平|Xi Jinping|朝鲜|North Korea)", topic_haystack, re.I):
         add("Xi Jinping may visit North Korea Reuters")
         add("Xi visit Pyongyang next week Reuters")
@@ -5470,7 +5538,7 @@ def _score_fact_check_query(query: str) -> int:
     score = 0
     if lowered.startswith("site:"):
         score += 20
-    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|vance|hormuz|kyiv|north korea|strait of hormuz|trump|iran|israel|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator|cheng li-wen|lawmakers|miyang|refrigerated trucks)\b", lowered, re.I):
+    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|vance|hormuz|kyiv|north korea|strait of hormuz|trump|iran|israel|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator|cheng li-wen|lawmakers|miyang|refrigerated trucks|takaichi|kyodo|truth social|truthsocial|polymarket|starmer)\b", lowered, re.I):
         score += 10
     if re.search(r"[A-Za-z]{3,}", value):
         score += 4
@@ -5487,6 +5555,10 @@ def _score_fact_check_query(query: str) -> int:
             "pbc.gov.cn",
             "safe.gov.cn",
             "csrc.gov.cn",
+            "english.kyodonews.net",
+            "asia.nikkei.com",
+            "truthsocial.com",
+            "polymarket.com",
         ]
     ):
         score += 7

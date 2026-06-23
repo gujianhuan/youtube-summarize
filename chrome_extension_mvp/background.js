@@ -371,6 +371,42 @@ async function buildBridgeUrl(payloadId, sourceUrl, configOverride = null) {
   return url.toString();
 }
 
+function sameYouTubeSourceUrl(left, right) {
+  const leftVideoId = parseYouTubeVideoId(left);
+  const rightVideoId = parseYouTubeVideoId(right);
+  if (leftVideoId && rightVideoId) {
+    return leftVideoId === rightVideoId;
+  }
+  return String(left || "").trim() === String(right || "").trim();
+}
+
+async function openOrFocusMainSiteTab(url, sourceUrl, configOverride = null) {
+  const targetUrl = String(url || "").trim();
+  if (!targetUrl) {
+    return null;
+  }
+  const resolvedConfig = configOverride || await resolveExtensionConfig({ preferLocal: false });
+  const mainOrigin = new URL(normalizeBaseUrl(resolvedConfig?.summarizerUrl, DEFAULT_SUMMARIZER_URL)).origin;
+  const tabs = await queryTabs({});
+  for (const tab of tabs) {
+    const tabUrl = String(tab?.url || "").trim();
+    if (!tabUrl || !tabUrl.startsWith(mainOrigin)) {
+      continue;
+    }
+    try {
+      const parsed = new URL(tabUrl);
+      const existingSourceUrl = parsed.searchParams.get("ext_source_url") || "";
+      if (sourceUrl && existingSourceUrl && !sameYouTubeSourceUrl(existingSourceUrl, sourceUrl)) {
+        continue;
+      }
+      return await updateTab(tab.id, { active: true, url: targetUrl });
+    } catch (_error) {
+      // Ignore malformed tab URLs and open a fresh tab below.
+    }
+  }
+  return createTab({ url: targetUrl });
+}
+
 async function setFlowStatus(message, isError = false, stage = "info") {
   const payload = {
     message,
@@ -1703,12 +1739,12 @@ async function startSummarizeFlow(payload) {
     const result = await uploadBridgePayload(payload, flowConfig);
     const finalPayloadId = String(result?.payload_id || payload?.payloadId || "");
     await setFlowStatus("正在打开主站...", false, "opening");
-    await createTab({ url: await buildBridgeUrl(finalPayloadId, sourceUrl, flowConfig) });
+    await openOrFocusMainSiteTab(await buildBridgeUrl(finalPayloadId, sourceUrl, flowConfig), sourceUrl, flowConfig);
     await setFlowStatus("已发送 transcript，主站正在自动拉取并开始总结。", false, "done");
   } catch (error) {
     const message = String(error?.message || "");
     try {
-      await createTab({ url: await buildBridgeUrl("", sourceUrl, flowConfig) });
+      await openOrFocusMainSiteTab(await buildBridgeUrl("", sourceUrl, flowConfig), sourceUrl, flowConfig);
     } catch (_openError) {
       // Ignore open failures here and keep the original upload error surfaced to the user.
     }
@@ -2421,20 +2457,25 @@ function normalizePluginExtractionResult(result, fallbackReason = "subtitle_pane
   }
 
   const detection = result.detection || {};
-  const hasValidTranscript = result.ok && String(result.transcript || "").trim().length > 0;
+  const transcriptText = String(result.transcript || "").trim();
+  const looksLikeCommentsPanel = /(^|\n)\s*评论\s*(\n|$)/.test(transcriptText)
+    && /(^|\n)\s*(最热门|最新|显示精选评论|显示近期评论)/.test(transcriptText)
+    && !/\b\d{1,2}:\d{2}\b/.test(transcriptText.slice(0, 800));
+  const hasValidTranscript = result.ok && transcriptText.length > 0 && !looksLikeCommentsPanel;
 
   return {
     ...result,
     ok: hasValidTranscript,
+    error: hasValidTranscript ? result.error : (looksLikeCommentsPanel ? "extracted_comments_panel_instead_of_transcript" : result.error),
     platform: String(result.platform || "youtube"),
     title: String(result.title || "").trim(),
-    transcript: String(result.transcript || "").trim(),
+    transcript: hasValidTranscript ? transcriptText : "",
     detection: {
       ...detection,
       hasText: hasValidTranscript,
       sourceType: String(detection.sourceType || (hasValidTranscript ? "transcript" : "none")),
       confidence: Number(detection.confidence || (hasValidTranscript ? 0.98 : 0)),
-      reason: String(detection.reason || fallbackReason),
+      reason: looksLikeCommentsPanel ? "comments_panel_rejected" : String(detection.reason || fallbackReason),
       canFallbackToLocal: false,
       extractionLogs: Array.isArray(detection.extractionLogs) ? detection.extractionLogs : []
     }
@@ -4554,7 +4595,7 @@ async function startSummarizeFlowFromPage(payload) {
         sourceUrl
       });
       await setFlowStatus("正在打开主站...", false, "opening");
-      await createTab({ url: await buildBridgeUrl(payloadId, sourceUrl, flowConfig) });
+      await openOrFocusMainSiteTab(await buildBridgeUrl(payloadId, sourceUrl, flowConfig), sourceUrl, flowConfig);
       await setFlowStatus("主站已打开，正在自动总结。", false, "done");
     } catch (error) {
       attempts.push({
