@@ -126,7 +126,7 @@ UI_TEXTS = {
         "video_extension_fallback": "插件抓取未接管，正在自动切换主站服务端抓取...",
         "video_extension_debug": "查看插件桥接链调试明细",
         "video_summary_title": "### 📝 AI 总结",
-        "video_summary_duration": "⏱️ **总耗时: {total:.1f}s** (文本抓取: {fetch:.1f}s | AI 生成: {summary:.1f}s)",
+        "video_summary_duration": "⏱️ **总耗时: {total:.1f}s** (文本抓取: {fetch:.1f}s | AI 生成: {summary:.1f}s{fact_check_part})",
         "video_summary_pipeline": "🤖 模型流水线：{pipeline}",
         "video_fact_check_title": "🕵️ 新闻来源导航",
         "video_fact_check_running": "🕵️ 新闻来源检索正在后台补跑，完成后会自动刷新到右侧区域。",
@@ -515,7 +515,7 @@ UI_TEXTS = {
         "video_extension_fallback": "The extension did not take over, switching to server-side site fetch...",
         "video_extension_debug": "View extension bridge debug details",
         "video_summary_title": "### 📝 AI Summary",
-        "video_summary_duration": "⏱️ **Total: {total:.1f}s** (Fetch: {fetch:.1f}s | AI: {summary:.1f}s)",
+        "video_summary_duration": "⏱️ **Total: {total:.1f}s** (Fetch: {fetch:.1f}s | AI: {summary:.1f}s{fact_check_part})",
         "video_summary_pipeline": "🤖 Model pipeline: {pipeline}",
         "video_fact_check_title": "🕵️ News Source Guide",
         "video_fact_check_running": "🕵️ Source discovery is still running in the background and will refresh automatically when ready.",
@@ -3926,6 +3926,7 @@ def start_video_fact_check_async(
     with runtime["lock"]:
         runtime["tasks"][task_id] = {
             "status": "queued",
+            "started_at": time.time(),
             "result": "",
             "error": "",
             "url": url_value,
@@ -3948,10 +3949,13 @@ def start_video_fact_check_async(
     eff_ui_locale = get_ui_locale()
 
     def _worker():
+        worker_started_at = time.time()
         with runtime["lock"]:
             task = runtime["tasks"].get(task_id) or {}
             task["status"] = "running"
             task["phase"] = "fast"
+            task["started_at"] = float(task.get("started_at") or worker_started_at)
+            started_at = float(task["started_at"])
             runtime["tasks"][task_id] = task
         try:
             print(
@@ -3975,6 +3979,7 @@ def start_video_fact_check_async(
                 runtime["tasks"][task_id] = {
                     "status": "running",
                     "phase": "deep",
+                    "started_at": started_at,
                     "result": str(fast_fact_markdown or "").strip(),
                     "result_version": "fast",
                     "error": "",
@@ -4005,9 +4010,13 @@ def start_video_fact_check_async(
                     oldest_key = next(iter(result_cache))
                     if oldest_key != cache_key:
                         result_cache.pop(oldest_key, None)
+                completed_at = time.time()
                 runtime["tasks"][task_id] = {
                     "status": "success",
                     "phase": "done",
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "duration_seconds": completed_at - started_at,
                     "result": str(fact_markdown or "").strip(),
                     "result_version": "deep",
                     "error": "",
@@ -4018,9 +4027,13 @@ def start_video_fact_check_async(
             print(f"VideoFactCheckWorker: success deep task_id={task_id} url={url_value}", flush=True)
         except Exception as exc:
             with runtime["lock"]:
+                completed_at = time.time()
                 runtime["tasks"][task_id] = {
                     "status": "error",
                     "phase": "error",
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "duration_seconds": completed_at - started_at,
                     "result": "",
                     "result_version": "",
                     "error": str(exc),
@@ -4036,6 +4049,7 @@ def start_video_fact_check_async(
 def sync_video_fact_check_state(
     *,
     summary_state_key: str = "summary_text",
+    duration_state_key: str = "summary_duration",
     state_prefix: str = "video_fact_check",
     history_entry_state_key: str = "video_history_entry_id",
 ) -> None:
@@ -4059,6 +4073,11 @@ def sync_video_fact_check_state(
     st.session_state[_fact_check_state_key(state_prefix, "note")] = str(
         task.get("note") or st.session_state.get(_fact_check_state_key(state_prefix, "note")) or ""
     ).strip()
+    fact_check_duration = task.get("duration_seconds")
+    if isinstance(fact_check_duration, (int, float)) and fact_check_duration > 0:
+        duration_info = dict(st.session_state.get(duration_state_key) or {})
+        duration_info["fact_check"] = float(fact_check_duration)
+        st.session_state[duration_state_key] = duration_info
 
     result_version = str(task.get("result_version") or ("deep" if status == "success" else "")).strip()
     applied_task_marker = f"{task_id}:{result_version or status}"
@@ -5550,6 +5569,7 @@ def _render_video_summary_panel(
 ) -> None:
     sync_video_fact_check_state(
         summary_state_key=summary_state_key,
+        duration_state_key=duration_state_key,
         state_prefix=fact_check_state_prefix,
         history_entry_state_key=history_entry_state_key,
     )
@@ -5569,8 +5589,11 @@ def _render_video_summary_panel(
             fetch_t = duration_info.get("fetch", 0)
             sum_t = duration_info.get("summary", 0)
             total_t = duration_info.get("total", 0)
+            fact_check_t = duration_info.get("fact_check")
+            fact_check_label = "Source check" if get_ui_locale() == "en" else "新闻核查"
+            fact_check_part = f" | {fact_check_label}: {float(fact_check_t):.1f}s" if isinstance(fact_check_t, (int, float)) and fact_check_t > 0 else ""
             st.markdown(
-                f'<div class="summary-section-meta">{html.escape(t("video_summary_duration", total=total_t, fetch=fetch_t, summary=sum_t))}</div>',
+                f'<div class="summary-section-meta">{html.escape(t("video_summary_duration", total=total_t, fetch=fetch_t, summary=sum_t, fact_check_part=fact_check_part))}</div>',
                 unsafe_allow_html=True,
             )
         st.markdown(

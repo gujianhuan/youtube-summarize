@@ -661,7 +661,15 @@ function parseYouTubeVideoId(url) {
     if (parsed.hostname.includes("youtu.be")) {
       return parsed.pathname.replace(/^\/+/, "").trim();
     }
-    return parsed.searchParams.get("v") || "";
+    const watchId = parsed.searchParams.get("v") || "";
+    if (watchId) {
+      return watchId;
+    }
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    if (pathParts.length >= 2 && ["shorts", "live", "embed"].includes(pathParts[0])) {
+      return pathParts[1];
+    }
+    return "";
   } catch (_error) {
     return "";
   }
@@ -1849,6 +1857,8 @@ async function extractTranscript() {
   }
   openBtn.disabled = true;
   const activeUrl = String(tab.url || "");
+  const requestedVideoId = parseYouTubeVideoId(urlInput.value.trim() || popupTargetSourceUrl);
+  const activeVideoId = parseYouTubeVideoId(activeUrl);
   const canUseMainWorld = supportsMainWorldExecution();
   // #region debug-point A:extract-start
   reportPopupDebug("A", "popup extract started", {
@@ -1859,6 +1869,35 @@ async function extractTranscript() {
     popupTargetSourceUrl
   });
   // #endregion
+
+  if (requestedVideoId && activeVideoId && requestedVideoId !== activeVideoId) {
+    lastExtractResponse = null;
+    syncActionButtons();
+    setStatus(`当前标签页视频不匹配，已停止提取，避免读取错误视频。目标: ${requestedVideoId}，当前: ${activeVideoId}`, true);
+    reportPopupDebug("A", "popup blocked mismatched active video", {
+      requestedVideoId,
+      activeVideoId,
+      activeUrl,
+      popupTargetSourceUrl,
+      urlInputValue: urlInput.value.trim()
+    });
+    return {
+      ok: false,
+      platform: "youtube",
+      title: String(tab.title || ""),
+      url: popupTargetSourceUrl || urlInput.value.trim() || activeUrl,
+      transcript: "",
+      error: "target_video_mismatch",
+      helperMessage: "当前标签页不是本次请求的视频，已停止，避免读取错误 transcript。",
+      detection: {
+        hasText: false,
+        sourceType: "unknown",
+        confidence: 0,
+        reason: "target_video_mismatch",
+        canFallbackToLocal: false
+      }
+    };
+  }
 
   if (activeUrl.includes("youtube.com") || activeUrl.includes("youtu.be")) {
     {

@@ -6159,12 +6159,12 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "search_terms_label": "搜索词",
             "search_results_label": "搜索结果",
             "fallback_claim_intro": "系统已先整理出本条可核查说法，并附上可直接复核的候选来源线索。",
-            "fallback_conclusion": "本轮自动检索未命中直接来源，已提供继续检索入口",
-            "fallback_rationale": "本条先展示系统已汇总的搜索入口和候选来源；如果只出现搜索入口，表示本轮自动检索没有拿到可直接引用的报道页，不代表全网不存在相关来源。",
+            "fallback_conclusion": "已整理候选来源线索，待确认原始出处",
+            "fallback_rationale": "本条先展示系统已汇总的候选网页、搜索入口和可继续核对的关键词；如果只出现搜索入口，表示本轮自动检索尚未抓到可直接引用正文，不代表全网不存在相关来源。",
             "fallback_pending": "建议优先核对原始报道时间、数字口径、机构原文、社媒原帖和二次转载是否存在偏差。",
             "fallback_no_links": "当前未提取到可点击来源链接。",
             "fallback_no_queries": "未生成搜索词",
-            "fallback_detail_rationale": "系统已先保留候选搜索词 `{search_text}` 与可人工复核入口；如果没有直接报道链接，表示本轮自动检索没有命中可直接引用页面，不代表全网不存在相关来源。",
+            "fallback_detail_rationale": "系统已先保留候选搜索词 `{search_text}` 与可人工复核入口；如果没有直接报道链接，表示本轮自动检索尚未抓到可直接引用正文，不代表全网不存在相关来源。",
             "fallback_detail_pending": "建议继续核对原始报道、官方披露、社媒原帖、统计口径与发布时间是否一致。",
             "progress_extract_claims": "正在抽取关键声明...",
             "progress_search_sources": "正在检索外部来源...",
@@ -6188,8 +6188,8 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "search_terms_label": "Search Queries",
             "search_results_label": "Search Results",
             "fallback_claim_intro": "The system has already extracted a checkable claim and preserved candidate sources for quick review.",
-            "fallback_conclusion": "No direct source was captured in this automated pass; search entry points are provided",
-            "fallback_rationale": "This draft surfaces current search leads and candidate sources. Search-entry-only results mean this automated pass did not capture a directly citable page; they do not prove no source exists.",
+            "fallback_conclusion": "Candidate source leads collected; original source still needs confirmation",
+            "fallback_rationale": "This draft surfaces candidate pages, search entry points, and follow-up queries. Search-entry-only results mean this automated pass has not captured directly citable page text yet; they do not prove no source exists.",
             "fallback_pending": "Prioritize checking the original report date, exact figures, issuing institution, original social post, and whether secondary reposts introduced distortions.",
             "fallback_no_links": "No clickable source links were extracted this time.",
             "fallback_no_queries": "No search queries were generated",
@@ -6718,9 +6718,9 @@ def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: 
             insufficient_value = "暂未定位到直接来源" if conclusion_label == "来源定位" else "缺乏证据"
             dubious_value = "已找到相关来源" if conclusion_label == "来源定位" else "存疑"
         search_entry_only_value = (
-            "本轮自动检索未命中直接来源，已提供继续检索入口"
+            "已整理搜索入口，待确认原始出处"
             if conclusion_label in {"来源定位", "核查结论"}
-            else "No direct source was captured in this automated pass; search entry points are provided"
+            else "Search entry points collected; original source still needs confirmation"
         )
         rationale_insert = _build_fact_check_hit_rationale(
             search_markdown=search_markdown,

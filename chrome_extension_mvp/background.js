@@ -396,6 +396,9 @@ async function openOrFocusMainSiteTab(url, sourceUrl, configOverride = null) {
     try {
       const parsed = new URL(tabUrl);
       const existingSourceUrl = parsed.searchParams.get("ext_source_url") || "";
+      if (sourceUrl && !existingSourceUrl) {
+        continue;
+      }
       if (sourceUrl && existingSourceUrl && !sameYouTubeSourceUrl(existingSourceUrl, sourceUrl)) {
         continue;
       }
