@@ -113,17 +113,17 @@ UI_TEXTS = {
         "tab_wishwall": "📝 留言板",
         "tab_settings": "🛠️ 设置",
         "hero_title": "快速获取视频总结",
-        "hero_desc": "贴入 YouTube 链接或视频 ID，系统会自动选择合适路径并生成总结。",
-        "home_path_input_title": "输入链接直连获取",
-        "home_path_input_desc": "适合直接贴视频链接。若已安装插件，主站会优先调用插件获取文本；若插件没直接拿到文本，再切到主站服务端抓取、生成总结，并补充相关新闻来源链接。",
+        "hero_desc": "贴入 YouTube 链接或视频 ID，系统会优先调用浏览器插件提取 transcript 并生成总结。",
+        "home_path_input_title": "输入链接调用插件",
+        "home_path_input_desc": "适合直接贴视频链接。主站会请求浏览器插件在目标 YouTube 页面提取文本；如果没有安装插件或没有打开目标视频页，请先打开视频页点击插件。",
         "home_path_plugin_title": "插件一键获取总结",
-        "home_path_plugin_desc": "适合在视频页直接点击插件。插件会先提取文本并启动总结；若当前页面没拿到文本，会自动把原链接交给主站继续抓取。",
+        "home_path_plugin_desc": "适合在视频页直接点击插件。插件会从当前页面提取文本、上传到 bridge，然后由主站总结和核查。",
         "video_input_label": "视频链接或 ID",
         "video_input_placeholder": "粘贴 YouTube 链接或输入 11 位视频 ID",
         "video_input_meta": "支持普通视频、Shorts、直播回放和 11 位视频 ID，直接粘贴即可。",
-        "video_auto_direct": "插件未直接拿到文本，已自动切换主站服务端抓取。",
+        "video_auto_direct": "当前链接需要浏览器插件提取 transcript，请打开目标 YouTube 视频页后点击插件。",
         "video_auto_extension": "已根据当前来源自动切换为插件抓取。",
-        "video_extension_fallback": "插件抓取未接管，正在自动切换主站服务端抓取...",
+        "video_extension_fallback": "插件抓取未接管，请打开目标 YouTube 视频页后点击插件。",
         "video_extension_debug": "查看插件桥接链调试明细",
         "video_summary_title": "### 📝 AI 总结",
         "video_summary_duration": "⏱️ **总耗时: {total:.1f}s** (文本抓取: {fetch:.1f}s | AI 生成: {summary:.1f}s{fact_check_part})",
@@ -502,17 +502,17 @@ UI_TEXTS = {
         "tab_wishwall": "📝 Board",
         "tab_settings": "🛠️ Settings",
         "hero_title": "Get a Video Summary Fast",
-        "hero_desc": "Paste a YouTube URL or video ID and the app will choose the best path automatically.",
-        "home_path_input_title": "Paste Link Directly",
-        "home_path_input_desc": "Best when you already have the video URL. If the extension is installed, the site asks the extension to fetch text first; if that does not return text, the site continues with server-side fetch, summary generation, and source discovery.",
+        "hero_desc": "Paste a YouTube URL or video ID. The app asks the browser extension to extract the transcript first.",
+        "home_path_input_title": "Paste Link, Use Extension",
+        "home_path_input_desc": "Best when you already have the video URL. The site asks the browser extension to extract text on the target YouTube page. If the extension is missing or the target page is not open, open the video page and click the extension.",
         "home_path_plugin_title": "One-Click From Extension",
-        "home_path_plugin_desc": "Best on the video page itself. The extension extracts text first and starts the summary flow; if the page still does not return text, it hands the original URL back to the main site to continue.",
+        "home_path_plugin_desc": "Best on the video page itself. The extension extracts text from the current page, uploads it to the bridge, then the main site summarizes and checks sources.",
         "video_input_label": "Video URL or ID",
         "video_input_placeholder": "Paste a YouTube URL or enter an 11-character video ID",
         "video_input_meta": "Supports regular videos, Shorts, archived livestreams, and 11-character video IDs.",
-        "video_auto_direct": "The extension did not return text directly, so the site switched to server-side fetch automatically.",
+        "video_auto_direct": "This link needs browser-extension transcript extraction. Open the target YouTube page and click the extension.",
         "video_auto_extension": "Automatically switched to extension-based extraction for this source.",
-        "video_extension_fallback": "The extension did not take over, switching to server-side site fetch...",
+        "video_extension_fallback": "The extension did not take over. Open the target YouTube page and click the extension.",
         "video_extension_debug": "View extension bridge debug details",
         "video_summary_title": "### 📝 AI Summary",
         "video_summary_duration": "⏱️ **Total: {total:.1f}s** (Fetch: {fetch:.1f}s | AI: {summary:.1f}s{fact_check_part})",
@@ -5269,7 +5269,7 @@ def choose_video_fetch_strategy(url: str) -> tuple[str, str]:
     """为输入链接选择合适的抓取路径。"""
     platform = detect_video_platform(url)
     if platform == "youtube":
-        return "extension", "已选择统一插件链路：优先通过浏览器页面提取 transcript，失败后再回退主站服务端字幕抓取。"
+        return "extension", "已选择插件优先链路：由浏览器插件在目标 YouTube 页面提取 transcript，主站不再自动走 Render 服务端抓取。"
     return "extension", "已选择插件提取：当前链接未明确识别平台，先走更通用的插件链路。"
 
 
@@ -5783,7 +5783,7 @@ def render_video_processing_tab():
     auto_fetch_route = str(st.session_state.get("video_auto_fetch_route") or "").strip()
     if auto_fetch_pending and auto_fetch_url:
         st.session_state.video_auto_fetch_pending = False
-        if auto_fetch_route in {"server_direct", "local_direct"}:
+        if auto_fetch_route in {"server_direct", "local_direct"} and admin_mode:
             st.info(t("video_auto_direct"))
             fetch_succeeded = do_video_fetch_single(auto_fetch_url, allow_extension_fallback=False)
             if fetch_succeeded:
@@ -5883,7 +5883,7 @@ def render_video_processing_tab():
         if not resolved_url:
             st.warning("请输入视频链接")
             return
-        if fetch_strategy == "server_direct":
+        if fetch_strategy == "server_direct" and admin_mode:
             st.info(fetch_strategy_message)
             fetch_succeeded = do_video_fetch_single(resolved_url, allow_extension_fallback=True)
             if fetch_succeeded:
