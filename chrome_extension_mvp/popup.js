@@ -788,15 +788,8 @@ async function getActiveTab() {
     // #endregion
     return focusedTabs[0];
   }
-  const fallbackTabs = await queryTabs({ active: true });
-  // #region debug-point A:fallback-tab
-  reportPopupDebug("A", "popup used global active tab fallback", {
-    tabId: fallbackTabs[0]?.id || null,
-    url: String(fallbackTabs[0]?.url || ""),
-    title: String(fallbackTabs[0]?.title || "")
-  });
-  // #endregion
-  return fallbackTabs[0];
+  reportPopupDebug("A", "popup did not find an active tab in the current or focused window", {});
+  return null;
 }
 
 function hydratePopupContextFromQuery() {
@@ -812,6 +805,17 @@ async function hydratePopupContextFromActiveTab() {
   const tab = await getActiveTab();
   if (!tab) {
     return null;
+  }
+  const existingVideoId = parseYouTubeVideoId(urlInput.value.trim());
+  const tabVideoId = parseYouTubeVideoId(tab.url || "");
+  if (existingVideoId && tabVideoId && existingVideoId !== tabVideoId) {
+    reportPopupDebug("A", "popup skipped active tab hydration due to video mismatch", {
+      existingUrl: urlInput.value.trim(),
+      tabUrl: String(tab.url || ""),
+      existingVideoId,
+      tabVideoId
+    });
+    return tab;
   }
   if (!urlInput.value.trim()) {
     urlInput.value = String(tab.url || "").trim();

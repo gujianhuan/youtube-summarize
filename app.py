@@ -3899,9 +3899,12 @@ def start_video_fact_check_async(
         st.session_state[_fact_check_state_key(state_prefix, "url")] = url_value
         return
 
-    max_claims = int(plan.get("recommended_claim_count") or 3)
-    max_claims = max(3, min(12, max_claims))
-    fast_claims = max(3, min(5, max_claims))
+    planned_claims = int(plan.get("recommended_claim_count") or 3)
+    max_claims = max(1, min(3, planned_claims))
+    fast_claims = max_claims
+    plan_note = str(plan.get("reason") or "").strip()
+    if planned_claims > max_claims:
+        plan_note = f"为控制等待时间，本轮先快速核查最重要的 {max_claims} 条声明；其余声明暂不自动深度补跑。"
     cache_key = _build_video_fact_check_cache_key(url_value, summary_md, transcript_value)
 
     with runtime["lock"]:
@@ -3931,7 +3934,7 @@ def start_video_fact_check_async(
             "error": "",
             "url": url_value,
             "cache_key": cache_key,
-            "note": str(plan.get("reason") or "").strip(),
+            "note": plan_note,
             "result_version": "",
         }
 
@@ -3940,7 +3943,7 @@ def start_video_fact_check_async(
     st.session_state[_fact_check_state_key(state_prefix, "error")] = ""
     st.session_state[_fact_check_state_key(state_prefix, "url")] = url_value
     st.session_state[_fact_check_state_key(state_prefix, "applied_task_id")] = ""
-    st.session_state[_fact_check_state_key(state_prefix, "note")] = str(plan.get("reason") or "").strip()
+    st.session_state[_fact_check_state_key(state_prefix, "note")] = plan_note
 
     eff_api_key = api_key
     eff_base_url = base_url
@@ -3985,7 +3988,7 @@ def start_video_fact_check_async(
                     "error": "",
                     "url": url_value,
                     "cache_key": cache_key,
-                    "note": f"快速核查已完成 {fast_claims} 条，深度核查正在后台补充到约 {max_claims} 条。",
+                    "note": f"快速核查已完成 {fast_claims} 条。",
                 }
             if max_claims <= fast_claims:
                 fact_markdown = fast_fact_markdown
@@ -4039,7 +4042,7 @@ def start_video_fact_check_async(
                     "error": str(exc),
                     "url": url_value,
                     "cache_key": cache_key,
-                    "note": str(plan.get("reason") or "").strip(),
+                    "note": plan_note,
                 }
             print(f"VideoFactCheckWorker: error task_id={task_id} url={url_value} error={exc}", flush=True)
 
@@ -5810,12 +5813,8 @@ def render_video_processing_tab():
         )
         if should_auto_local_fallback:
             st.session_state.video_extension_local_fallback_attempted = True
-            st.info("插件未直接返回文本，正在使用同一字幕抓取服务继续获取。")
             clear_video_extension_fallback_flags()
-            fetch_succeeded = do_video_fetch_single(extension_url, allow_extension_fallback=False)
-            if fetch_succeeded:
-                render_video_summary_section()
-                render_video_transcript_section()
+            st.error("插件未直接返回文本；已停止自动回退 Render 服务端抓取，避免触发 YouTube 429 限流。请在目标 YouTube 视频页直接点击插件重试。")
             return
         clear_video_extension_fallback_flags()
         if extension_message:
@@ -5893,7 +5892,7 @@ def render_video_processing_tab():
             return
         handled_by_extension, extension_message = begin_video_extension_request(
             resolved_url,
-            allow_local_fallback=True,
+            allow_local_fallback=False,
         )
         if handled_by_extension:
             st.info(fetch_strategy_message)

@@ -54,6 +54,36 @@
     });
   }
 
+  function parseYouTubeVideoId(url) {
+    try {
+      const parsed = new URL(String(url || ""));
+      const host = String(parsed.hostname || "").toLowerCase();
+      if (host.includes("youtu.be")) {
+        return parsed.pathname.replace(/^\/+/, "").split(/[/?#]/)[0].trim();
+      }
+      const watchId = parsed.searchParams.get("v") || "";
+      if (watchId) {
+        return watchId.trim();
+      }
+      const pathParts = parsed.pathname.split("/").filter(Boolean);
+      if (pathParts.length >= 2 && ["shorts", "live", "embed"].includes(pathParts[0])) {
+        return pathParts[1].trim();
+      }
+      return "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function isCurrentYouTubePageForSource(sourceUrl) {
+    const currentVideoId = parseYouTubeVideoId(location.href);
+    if (!currentVideoId) {
+      return true;
+    }
+    const targetVideoId = parseYouTubeVideoId(sourceUrl);
+    return Boolean(targetVideoId && currentVideoId === targetVideoId);
+  }
+
   function getRuntimeLastError() {
     return globalThis.chrome?.runtime?.lastError || extensionApi?.runtime?.lastError || null;
   }
@@ -2617,6 +2647,9 @@
   function handlePageFlowRequest(requestId, payload, targetWindow, receivedStage) {
     const normalizedRequestId = String(requestId || "").trim();
     if (!normalizedRequestId) {
+      return;
+    }
+    if (!isCurrentYouTubePageForSource(payload?.sourceUrl || "")) {
       return;
     }
 

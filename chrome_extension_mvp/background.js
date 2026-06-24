@@ -2290,13 +2290,7 @@ async function extractYouTubeTranscriptViaTemporaryTab(sourceUrl) {
   }
 
   let tempTab = null;
-  let previousActiveTabId = null;
   try {
-    const [previousActiveTab] = await queryTabs({
-      active: true,
-      currentWindow: true
-    });
-    previousActiveTabId = previousActiveTab?.id || null;
     tempTab = await createTab({ url: sourceUrlText, active: false });
     if (!tempTab?.id) {
       return {
@@ -2325,13 +2319,6 @@ async function extractYouTubeTranscriptViaTemporaryTab(sourceUrl) {
         // Ignore cleanup failure for temp tab.
       }
     }
-    if (previousActiveTabId) {
-      try {
-        await updateTab(previousActiveTabId, { active: true });
-      } catch (_error) {
-        // Ignore restore focus failures.
-      }
-    }
   }
 }
 
@@ -2345,22 +2332,15 @@ async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
   }
 
   let tempTab = null;
-  let previousActiveTabId = null;
   try {
     reportBackgroundDebug("F", "temp tab main world started", {
       sourceUrl: sourceUrlText,
       extensionVersion: EXTENSION_VERSION
     });
-    const [previousActiveTab] = await queryTabs({
-      active: true,
-      currentWindow: true
-    });
-    previousActiveTabId = previousActiveTab?.id || null;
     tempTab = await createTab({ url: sourceUrlText, active: false });
     reportBackgroundDebug("F", "temp tab main world created tab", {
       sourceUrl: sourceUrlText,
-      tabId: tempTab?.id || null,
-      previousActiveTabId
+      tabId: tempTab?.id || null
     });
     if (!tempTab?.id) {
       return {
@@ -2438,17 +2418,6 @@ async function extractYouTubeTranscriptViaTemporaryTabMainWorld(sourceUrl) {
         await removeTab(tempTab.id);
       } catch (_error) {
         // Ignore cleanup failure for temp tab.
-      }
-    }
-    if (previousActiveTabId) {
-      reportBackgroundDebug("F", "temp tab main world restoring focus", {
-        sourceUrl: sourceUrlText,
-        previousActiveTabId
-      });
-      try {
-        await updateTab(previousActiveTabId, { active: true });
-      } catch (_error) {
-        // Ignore restore focus failures.
       }
     }
   }
