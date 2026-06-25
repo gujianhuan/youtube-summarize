@@ -25,6 +25,9 @@ const TEMP_TAB_READY_DELAY_MS = 1500;
 const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 2;
 const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 500;
 const MAIN_WORLD_EXECUTION_TIMEOUT_MS = 8000;
+const PROGRESSIVE_FAST_STAGE_MS = 5000;
+const PROGRESSIVE_ENHANCED_STAGE_MS = 7000;
+const PROGRESSIVE_PANEL_STAGE_MS = 8000;
 const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "0.1.64";
 const EXTENSION_TOOL_VERSION = EXTENSION_VERSION;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
@@ -436,7 +439,16 @@ async function updateActionTaskStatus(status) {
   let title = "Transcript Helper：待命";
   if (isError) {
     title = `Transcript Helper：任务失败${message ? ` - ${message}` : ""}`;
-  } else if (["warming", "retrying", "uploading", "opening"].includes(stage)) {
+  } else if ([
+    "extract_fast",
+    "extract_enhanced",
+    "extract_panel",
+    "extract_background_continue",
+    "warming",
+    "retrying",
+    "uploading",
+    "opening"
+  ].includes(stage)) {
     title = `Transcript Helper：${message || "任务进行中"}`;
   } else if (stage === "done") {
     title = "Transcript Helper：已打开主站，正在自动总结";
@@ -4082,6 +4094,295 @@ function shouldForceSingleAttemptForTempTabMainWorld(sourceUrl, result) {
   return errorText === "main_world_caption_fetch_failed" || errorText === "main_world_execute_timeout";
 }
 
+async function getTabVideoId(tabId) {
+  if (!tabId) {
+    return "";
+  }
+  try {
+    const tab = await getTab(tabId);
+    return parseYouTubeVideoId(String(tab?.url || "")) || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function extractYouTubeTranscriptProgressive(sourceUrl, options = {}) {
+  const sourceUrlText = String(sourceUrl || "").trim();
+  const targetVideoId = parseYouTubeVideoId(sourceUrlText);
+  const attempts = [];
+  const allExtractionLogs = [];
+  const timings = {};
+  const canUseMainWorld = supportsMainWorldExecution();
+  const emitStatus = options?.emitStatus !== false;
+
+  const addLogs = (res, stageName) => {
+    const logs = res?.detection?.extractionLogs;
+    if (Array.isArray(logs)) {
+      allExtractionLogs.push(...logs);
+    }
+    if (res?.debug && typeof res.debug === "object") {
+      try {
+        allExtractionLogs.push(`[Progressive] ${stageName} debug: ${JSON.stringify(res.debug)}`);
+      } catch (_error) {
+        // Ignore debug serialization issues.
+      }
+    }
+    if (res?.error) {
+      allExtractionLogs.push(`[Progressive] ${stageName} failed: ${res.error}`);
+    }
+  };
+
+  const hasTranscript = (res) => Boolean(res?.ok && String(res.transcript || "").trim());
+  const attachSuccessMetadata = (result, stageName, matchedTab) => ({
+    ...result,
+    platform: "youtube",
+    title: String(result?.title || matchedTab?.title || "").trim(),
+    detection: {
+      ...(result?.detection || {}),
+      hasText: true,
+      sourceType: "transcript",
+      confidence: Number(result?.detection?.confidence || 0.99),
+      reason: String(result?.detection?.reason || stageName),
+      canFallbackToLocal: false,
+      extractionLogs: [
+        ...allExtractionLogs,
+        `[Progressive] timings=${JSON.stringify(timings)}`
+      ]
+    },
+    debug: {
+      ...((result?.debug && typeof result.debug === "object") ? result.debug : {}),
+      attempts,
+      progressiveTimings: timings
+    }
+  });
+
+  const matchedTab = await findMatchingYouTubeTab(sourceUrlText);
+  if (!matchedTab?.id) {
+    return {
+      ok: false,
+      error: "no_matching_youtube_tab",
+      helperMessage: "请先打开对应的 YouTube 视频页，再点击插件提取字幕。",
+      detection: {
+        hasText: false,
+        sourceType: "none",
+        confidence: 0,
+        reason: "no_matching_youtube_tab",
+        canFallbackToLocal: false,
+        extractionLogs: allExtractionLogs
+      },
+      debug: {
+        sourceUrl: sourceUrlText,
+        targetVideoId,
+        attempts
+      }
+    };
+  }
+
+  attempts.push({
+    stage: "matched_tab_found",
+    ok: true,
+    tabId: matchedTab.id,
+    tabUrl: String(matchedTab.url || "")
+  });
+
+  const matchedVideoId = parseYouTubeVideoId(String(matchedTab.url || ""));
+  if (targetVideoId && matchedVideoId && matchedVideoId !== targetVideoId) {
+    return {
+      ok: false,
+      error: "target_video_mismatch",
+      helperMessage: "当前 YouTube 标签页不是目标视频，已停止，避免读取错误字幕。",
+      detection: {
+        hasText: false,
+        sourceType: "none",
+        confidence: 0,
+        reason: "target_video_mismatch",
+        canFallbackToLocal: false,
+        extractionLogs: allExtractionLogs
+      },
+      debug: {
+        sourceUrl: sourceUrlText,
+        targetVideoId,
+        matchedVideoId,
+        attempts
+      }
+    };
+  }
+
+  const runStage = async (stageName, statusMessage, budgetMs, tasks) => {
+    const startedAt = Date.now();
+    if (emitStatus) {
+      await setFlowStatus(statusMessage, false, stageName);
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      let remaining = tasks.length;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        timings[stageName] = Date.now() - startedAt;
+        resolve(result);
+      };
+      const timeoutId = globalThis.setTimeout(() => finish(null), budgetMs);
+
+      const completeTask = async (task) => {
+        let raw = null;
+        let result = null;
+        let errorText = "";
+        try {
+          if (task.tabBound && targetVideoId) {
+            const beforeVideoId = await getTabVideoId(matchedTab.id);
+            if (beforeVideoId && beforeVideoId !== targetVideoId) {
+              throw new Error("target_video_changed_before_extract");
+            }
+          }
+          raw = await task.run();
+          result = task.normalize ? task.normalize(raw) : raw;
+          if (task.tabBound && targetVideoId) {
+            const afterVideoId = await getTabVideoId(matchedTab.id);
+            if (afterVideoId && afterVideoId !== targetVideoId) {
+              result = { ok: false, error: "target_video_changed_after_extract" };
+            }
+          }
+          addLogs(result || raw, task.stage);
+          errorText = String(result?.error || raw?.error || task.defaultError || "extract_failed");
+          attempts.push({
+            stage: task.stage,
+            ok: hasTranscript(result),
+            error: hasTranscript(result) ? "" : errorText,
+            reason: String(result?.detection?.reason || raw?.detection?.reason || "")
+          });
+          if (hasTranscript(result)) {
+            globalThis.clearTimeout(timeoutId);
+            finish(attachSuccessMetadata(result, task.stage, matchedTab));
+          }
+        } catch (error) {
+          errorText = String(error?.message || error || task.defaultError || "extract_failed");
+          attempts.push({ stage: task.stage, ok: false, error: errorText });
+        } finally {
+          remaining -= 1;
+          if (remaining === 0 && !settled) {
+            globalThis.clearTimeout(timeoutId);
+            finish(null);
+          }
+        }
+      };
+
+      for (const task of tasks) {
+        void completeTask(task);
+      }
+    });
+  };
+
+  const fastResult = await runStage(
+    "extract_fast",
+    "快速读取当前页面字幕轨道...",
+    PROGRESSIVE_FAST_STAGE_MS,
+    [
+      ...(canUseMainWorld ? [{
+        stage: "fast_main_world",
+        tabBound: true,
+        defaultError: "main_world_extract_failed",
+        run: () => extractYouTubeTranscriptViaMainWorldTab(matchedTab.id)
+      }] : []),
+      {
+        stage: "fast_background_caption_tracks",
+        tabBound: false,
+        defaultError: "background_extract_failed",
+        run: () => extractYouTubeTranscriptByUrl(sourceUrlText)
+      }
+    ]
+  );
+  if (fastResult) {
+    return fastResult;
+  }
+
+  let contentResult = null;
+  const enhancedResult = await runStage(
+    "extract_enhanced",
+    "读取当前页面字幕数据...",
+    PROGRESSIVE_ENHANCED_STAGE_MS,
+    [
+      {
+        stage: "enhanced_content_script",
+        tabBound: true,
+        defaultError: "content_script_extract_failed",
+        run: () => extractTranscriptViaContentScriptTab(matchedTab.id),
+        normalize: (raw) => {
+          contentResult = normalizePluginExtractionResult(raw, "content_script_extract");
+          return contentResult;
+        }
+      }
+    ]
+  );
+  if (enhancedResult) {
+    return enhancedResult;
+  }
+
+  const panelResult = await runStage(
+    "extract_panel",
+    "尝试打开 transcript 面板...",
+    PROGRESSIVE_PANEL_STAGE_MS,
+    [
+      {
+        stage: "panel_dom",
+        tabBound: true,
+        defaultError: "dom_panel_extract_failed",
+        run: () => extractYouTubeTranscriptViaDomPanelTab(matchedTab.id)
+      }
+    ]
+  );
+  if (panelResult) {
+    return panelResult;
+  }
+
+  if (emitStatus) {
+    await setFlowStatus("前台提取未完成，后台继续尝试字幕读取...", false, "extract_background_continue");
+  }
+  const slowStartedAt = Date.now();
+  const slowResult = await extractYouTubeTranscriptForPageFlow(sourceUrlText, {
+    ...options,
+    allowMatchedTabContentScript: true
+  });
+  timings.extract_background_continue = Date.now() - slowStartedAt;
+  addLogs(slowResult, "slow_background_continue");
+  attempts.push({
+    stage: "slow_background_continue",
+    ok: hasTranscript(slowResult),
+    error: hasTranscript(slowResult) ? "" : String(slowResult?.error || "slow_background_extract_failed")
+  });
+  if (hasTranscript(slowResult)) {
+    return attachSuccessMetadata(slowResult, "slow_background_continue", matchedTab);
+  }
+
+  const finalResult = slowResult || contentResult || {};
+  return {
+    ...(typeof finalResult === "object" && finalResult ? finalResult : {}),
+    ok: false,
+    error: String(finalResult?.error || "extension_progressive_extract_failed"),
+    helperMessage: "插件已尝试快速路径、页面数据和 transcript 面板，但仍未拿到字幕文本。",
+    detection: {
+      ...((finalResult?.detection && typeof finalResult.detection === "object") ? finalResult.detection : {}),
+      hasText: false,
+      sourceType: String(finalResult?.detection?.sourceType || "none"),
+      confidence: 0,
+      reason: String(finalResult?.detection?.reason || "extension_progressive_extract_failed"),
+      canFallbackToLocal: false,
+      extractionLogs: [
+        ...allExtractionLogs,
+        `[Progressive] timings=${JSON.stringify(timings)}`
+      ]
+    },
+    debug: {
+      ...((finalResult?.debug && typeof finalResult.debug === "object") ? finalResult.debug : {}),
+      sourceUrl: sourceUrlText,
+      targetVideoId,
+      matchedTabUrl: String(matchedTab?.url || ""),
+      attempts,
+      progressiveTimings: timings
+    }
+  };
+}
+
 async function extractYouTubeTranscriptForPageFlow(sourceUrl, options = {}) {
   const sourceUrlText = String(sourceUrl || "").trim();
   const allExtractionLogs = [];
@@ -4533,7 +4834,7 @@ async function startSummarizeFlowFromPage(payload) {
     stage: "background_start_extraction",
     ok: true
   });
-  const extraction = await extractYouTubeTranscriptForPageFlow(sourceUrl);
+  const extraction = await extractYouTubeTranscriptProgressive(sourceUrl, { emitStatus: true });
   if (!extraction?.ok || !String(extraction.transcript || "").trim()) {
     attempts.push({
       stage: "background_extraction_failed",
@@ -4730,7 +5031,10 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
       try {
         const sourceUrl = String(message.url || "");
-        const result = await extractYouTubeTranscriptForPageFlow(sourceUrl, message.options || {});
+        const result = await extractYouTubeTranscriptProgressive(sourceUrl, {
+          ...(message.options || {}),
+          emitStatus: false
+        });
         sendResponse(result);
       } catch (error) {
         sendResponse({
@@ -4774,7 +5078,7 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
       try {
         reply({ ok: true, started: true });
-        await setFlowStatus("正在后台提取字幕...", false, "extracting");
+        await setFlowStatus("快速读取当前页面字幕轨道...", false, "extract_fast");
         await startSummarizeFlowFromPage(message.payload || {});
       } catch (error) {
         reply({ ok: false, started: false, error: String(error?.message || error || "background_flow_failed") });

@@ -362,18 +362,6 @@ function sendRuntimeMessage(message) {
   return callExtensionApi(extensionApi.runtime.sendMessage, extensionApi.runtime, message);
 }
 
-function debuggerAttach(target, version = "1.3") {
-  return callExtensionApi(extensionApi.debugger.attach, extensionApi.debugger, target, version);
-}
-
-function debuggerDetach(target) {
-  return callExtensionApi(extensionApi.debugger.detach, extensionApi.debugger, target);
-}
-
-function debuggerSendCommand(target, method, params = {}) {
-  return callExtensionApi(extensionApi.debugger.sendCommand, extensionApi.debugger, target, method, params);
-}
-
 /**
  * 鍚屾鎻愬彇缁撴灉鐩稿叧鎸夐挳鐘舵€侊紝閬垮厤澶辫触鎬佺户缁Е鍙戞€荤粨娴佺▼銆?
  *
@@ -399,8 +387,17 @@ function stageToProgress(stage, isError = false) {
   if (isError || normalized === "error") {
     return { percent: 100, active: "done", title: "任务失败，请重试" };
   }
-  if (["extracting", "background_start_extraction", "warming"].includes(normalized)) {
-    return { percent: 25, active: "extract", title: "正在后台提取字幕" };
+  if (["extracting", "background_start_extraction", "extract_fast", "warming"].includes(normalized)) {
+    return { percent: 24, active: "extract", title: "快速读取字幕轨道" };
+  }
+  if (normalized === "extract_enhanced") {
+    return { percent: 42, active: "extract", title: "读取页面字幕数据" };
+  }
+  if (normalized === "extract_panel") {
+    return { percent: 52, active: "extract", title: "尝试 transcript 面板" };
+  }
+  if (normalized === "extract_background_continue") {
+    return { percent: 68, active: "extract", title: "后台继续尝试字幕读取" };
   }
   if (["retrying", "uploading", "background_upload_bridge_payload"].includes(normalized)) {
     return { percent: 58, active: "upload", title: "正在发送 transcript 到主站" };
@@ -851,7 +848,7 @@ async function autoStartBackgroundSummarizeFlow() {
   autoStartTriggered = true;
   try {
     setStatus("已启动后台自动总结；弹窗关闭后任务会继续。主站打开后这里将回到待命。");
-    updateProgress("extracting", "正在后台提取字幕");
+    updateProgress("extract_fast", "快速读取当前页面字幕轨道");
     const startResult = await sendRuntimeMessage({
       action: "startBackgroundSummarizeFlowFromPage",
       payload: {
@@ -1447,107 +1444,6 @@ async function extractYouTubeTranscriptViaPopupDomPanelStepped(tabId) {
   }
 }
 
-async function extractYouTubeTranscriptViaDebuggerClick(tabId) {
-  if (!tabId || !extensionApi.debugger?.attach || !extensionApi.scripting?.executeScript) {
-    return { ok: false, error: "debugger_click_unsupported" };
-  }
-  const trace = [];
-  const target = { tabId };
-  let attached = false;
-  try {
-    await runYouTubePopupDomStep(tabId, "click_more");
-    await sleep(1000);
-    const [rectResult] = await executeScript({
-      target: { tabId, frameIds: [0] },
-      func: () => {
-        const visible = (node) => {
-          if (!node) return false;
-          const rect = node.getBoundingClientRect();
-          const style = getComputedStyle(node);
-          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-        };
-        const buttons = Array.from(document.querySelectorAll("button[aria-label='内容转文字'], button[aria-label='內容轉文字']"));
-        const button = buttons.find(visible);
-        if (!button) return null;
-        const rect = button.getBoundingClientRect();
-        return {
-          x: rect.left + rect.width / 2,
-          y: rect.top + rect.height / 2,
-          width: rect.width,
-          height: rect.height
-        };
-      }
-    });
-    const rect = rectResult?.result;
-    if (!rect || !Number.isFinite(rect.x) || !Number.isFinite(rect.y)) {
-      return { ok: false, error: "debugger_click_button_not_found", debug: { trace } };
-    }
-    trace.push(`button_rect:${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)}x${Math.round(rect.height)}`);
-    try {
-      await debuggerAttach(target, "1.3");
-    } catch (attachError) {
-      return { ok: false, error: `debugger_attach_failed:${String(attachError?.message || attachError || "unknown")}`, debug: { trace } };
-    }
-    attached = true;
-    await sleep(500);
-    await debuggerSendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: rect.x,
-      y: rect.y,
-      button: "none"
-    });
-    await debuggerSendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x: rect.x,
-      y: rect.y,
-      button: "left",
-      buttons: 1,
-      clickCount: 1
-    });
-    await debuggerSendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x: rect.x,
-      y: rect.y,
-      button: "left",
-      buttons: 0,
-      clickCount: 1
-    });
-    trace.push("debugger_click_sent");
-    for (let i = 0; i < 24; i += 1) {
-      await sleep(500);
-      const extractResult = await runYouTubePopupDomStep(tabId, "extract");
-      if (extractResult?.ok && extractResult.transcript) {
-        trace.push(`extract_after_debugger_click:${i + 1}:segments=${extractResult?.segmentCount ?? ""}`);
-        return {
-          ok: true,
-          platform: "youtube",
-          transcript: String(extractResult.transcript || "").trim(),
-          detection: {
-            hasText: true,
-            sourceType: "transcript",
-            confidence: 0.99,
-            reason: "debugger_click_transcript_panel",
-            canFallbackToLocal: false,
-            extractionLogs: trace
-          },
-          debug: { source: "debugger_click_transcript_panel", trace }
-        };
-      }
-    }
-    return { ok: false, error: "debugger_click_no_transcript", debug: { trace } };
-  } catch (error) {
-    return { ok: false, error: String(error?.message || error || "debugger_click_failed"), debug: { trace } };
-  } finally {
-    if (attached) {
-      try {
-        await debuggerDetach(target);
-      } catch (_error) {
-        // Ignore detach failures.
-      }
-    }
-  }
-}
-
 async function ensureContentScript(tabId) {
   await executeScript({
     target: { tabId },
@@ -1973,24 +1869,6 @@ async function extractTranscript() {
         popupDomResponse.detection.reason = "popup_dom_panel";
         return applyExtractSuccess(popupDomResponse, activeUrl);
       }
-      const debuggerClickResult = await extractYouTubeTranscriptViaDebuggerClick(tab.id);
-      reportPopupDebug("A", "popup youtube debugger click result", {
-        activeUrl,
-        extensionVersion: EXTENSION_VERSION,
-        ok: Boolean(debuggerClickResult?.ok),
-        error: String(debuggerClickResult?.error || ""),
-        transcriptLen: String(debuggerClickResult?.transcript || "").trim().length,
-        debug: debuggerClickResult?.debug || null
-      });
-      if (debuggerClickResult?.ok && debuggerClickResult.transcript) {
-        const debuggerClickResponse = buildYouTubeBackgroundSuccessResponse({
-          title: tab.title || "",
-          url: activeUrl
-        }, debuggerClickResult, tab);
-        debuggerClickResponse.helperMessage = "已通过当前页面 transcript 面板读取文本。";
-        debuggerClickResponse.detection.reason = "debugger_click_transcript_panel";
-        return applyExtractSuccess(debuggerClickResponse, activeUrl);
-      }
       directResult = await extractYouTubeTranscriptViaBackground(activeUrl, {
         allowTemporaryTabs: false,
         allowMatchedTabContentScript: true
@@ -2034,7 +1912,6 @@ async function extractTranscript() {
             },
         debug: {
           popupDom: popupDomResult && typeof popupDomResult === "object" ? popupDomResult : null,
-          debuggerClick: debuggerClickResult && typeof debuggerClickResult === "object" ? debuggerClickResult : null,
           background: directResult?.debug && typeof directResult.debug === "object" ? directResult.debug : {}
         }
       };

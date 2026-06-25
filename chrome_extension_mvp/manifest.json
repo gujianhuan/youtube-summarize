@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Video Transcript Helper MVP",
-  "version": "0.1.84",
+  "version": "0.1.85",
   "description": "Extract transcript text from YouTube pages and send it to the summarizer site through a server bridge flow for Chrome users.",
   "permissions": [
     "activeTab",
     "scripting",
     "tabs",
-    "debugger",
     "clipboardWrite",
     "storage"
   ],
