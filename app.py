@@ -39,6 +39,7 @@ from core_logic import (
     search_channels,
     get_remote_worker_status,
     build_runtime_version_diagnostics,
+    normalize_video_url,
 )
 
 # --- 常量定义 ---
@@ -113,16 +114,16 @@ UI_TEXTS = {
         "tab_wishwall": "📝 留言板",
         "tab_settings": "🛠️ 设置",
         "hero_title": "快速获取视频总结",
-        "hero_desc": "贴入 YouTube 链接或视频 ID，系统会优先调用浏览器插件提取 transcript 并生成总结。",
-        "home_path_input_title": "输入链接调用插件",
-        "home_path_input_desc": "适合直接贴视频链接。主站会请求浏览器插件在目标 YouTube 页面提取文本；如果没有安装插件或没有打开目标视频页，请先打开视频页点击插件。",
+        "hero_desc": "打开 YouTube 视频页后点击插件，系统会从当前页面提取 transcript 并生成总结。",
+        "home_path_input_title": "输入链接打开视频页",
+        "home_path_input_desc": "适合先定位视频。主站不再远程唤起插件抓取，避免等待超时；请打开目标 YouTube 视频页后点击插件。",
         "home_path_plugin_title": "插件一键获取总结",
         "home_path_plugin_desc": "适合在视频页直接点击插件。插件会从当前页面提取文本、上传到 bridge，然后由主站总结和核查。",
         "video_input_label": "视频链接或 ID",
         "video_input_placeholder": "粘贴 YouTube 链接或输入 11 位视频 ID",
         "video_input_meta": "支持普通视频、Shorts、直播回放和 11 位视频 ID，直接粘贴即可。",
         "video_auto_direct": "当前链接需要浏览器插件提取 transcript，请打开目标 YouTube 视频页后点击插件。",
-        "video_auto_extension": "已根据当前来源自动切换为插件抓取。",
+        "video_auto_extension": "请打开目标 YouTube 视频页后点击插件，主站不再远程等待插件响应。",
         "video_extension_fallback": "插件抓取未接管，请打开目标 YouTube 视频页后点击插件。",
         "video_extension_debug": "查看插件桥接链调试明细",
         "video_summary_title": "### 📝 AI 总结",
@@ -502,16 +503,16 @@ UI_TEXTS = {
         "tab_wishwall": "📝 Board",
         "tab_settings": "🛠️ Settings",
         "hero_title": "Get a Video Summary Fast",
-        "hero_desc": "Paste a YouTube URL or video ID. The app asks the browser extension to extract the transcript first.",
-        "home_path_input_title": "Paste Link, Use Extension",
-        "home_path_input_desc": "Best when you already have the video URL. The site asks the browser extension to extract text on the target YouTube page. If the extension is missing or the target page is not open, open the video page and click the extension.",
+        "hero_desc": "Open the YouTube video page and click the extension. It extracts the transcript from the current page and sends it here for summary.",
+        "home_path_input_title": "Paste Link, Open Video",
+        "home_path_input_desc": "Best for locating the video first. The main site no longer remotely wakes the extension to avoid bridge timeouts; open the target YouTube page and click the extension.",
         "home_path_plugin_title": "One-Click From Extension",
         "home_path_plugin_desc": "Best on the video page itself. The extension extracts text from the current page, uploads it to the bridge, then the main site summarizes and checks sources.",
         "video_input_label": "Video URL or ID",
         "video_input_placeholder": "Paste a YouTube URL or enter an 11-character video ID",
         "video_input_meta": "Supports regular videos, Shorts, archived livestreams, and 11-character video IDs.",
         "video_auto_direct": "This link needs browser-extension transcript extraction. Open the target YouTube page and click the extension.",
-        "video_auto_extension": "Automatically switched to extension-based extraction for this source.",
+        "video_auto_extension": "Open the target YouTube page and click the extension. The main site no longer waits for a remote extension reply.",
         "video_extension_fallback": "The extension did not take over. Open the target YouTube page and click the extension.",
         "video_extension_debug": "View extension bridge debug details",
         "video_summary_title": "### 📝 AI Summary",
@@ -5265,12 +5266,20 @@ def detect_video_platform(url: str) -> str:
     return ""
 
 
+def build_youtube_open_url(url: str) -> str:
+    """把 YouTube 链接或 11 位视频 ID 规范化为可打开的视频页。"""
+    try:
+        return normalize_video_url(str(url or "").strip())
+    except Exception:
+        return str(url or "").strip()
+
+
 def choose_video_fetch_strategy(url: str) -> tuple[str, str]:
     """为输入链接选择合适的抓取路径。"""
     platform = detect_video_platform(url)
     if platform == "youtube":
-        return "extension", "已选择插件优先链路：由浏览器插件在目标 YouTube 页面提取 transcript，主站不再自动走 Render 服务端抓取。"
-    return "extension", "已选择插件提取：当前链接未明确识别平台，先走更通用的插件链路。"
+        return "open_video", "输入链接只用于打开目标视频页；请在 YouTube 视频页点击插件提取 transcript。"
+    return "open_video", "当前链接未明确识别平台；如需总结 YouTube 视频，请打开视频页后点击插件。"
 
 
 def clear_video_extension_fallback_flags():
@@ -5327,15 +5336,11 @@ def do_video_fetch_single(url, *, allow_extension_fallback: bool = False) -> boo
         if err:
             if allow_extension_fallback:
                 progress_bar.empty()
-                status_container.warning("主站直连失败，正在自动切换插件抓取...")
-                handled_by_extension, extension_message = begin_video_extension_request(
-                    url,
-                    allow_local_fallback=False,
-                )
-                if handled_by_extension:
-                    st.info(extension_message)
-                    st.rerun()
-                    return False
+                status_container.warning("主站直连失败。请打开目标 YouTube 视频页后点击插件，主站不再远程等待插件响应。")
+                open_url = build_youtube_open_url(url)
+                if open_url:
+                    st.link_button("打开 YouTube 视频页", open_url, use_container_width=True)
+                return False
             progress_bar.empty()
             status_container.error("❌ 抓取失败")
             st.error(err)
@@ -5362,15 +5367,11 @@ def do_video_fetch_single(url, *, allow_extension_fallback: bool = False) -> boo
         return True
     except Exception as e:
         if allow_extension_fallback:
-            status_container.warning("主站直连异常，正在自动切换插件抓取...")
-            handled_by_extension, extension_message = begin_video_extension_request(
-                url,
-                allow_local_fallback=False,
-            )
-            if handled_by_extension:
-                st.info(extension_message)
-                st.rerun()
-                return False
+            status_container.warning("主站直连异常。请打开目标 YouTube 视频页后点击插件，主站不再远程等待插件响应。")
+            open_url = build_youtube_open_url(url)
+            if open_url:
+                st.link_button("打开 YouTube 视频页", open_url, use_container_width=True)
+            return False
         status_container.error("❌ 执行异常")
         st.error(f"{e}")
         st.code(traceback.format_exc())
@@ -5790,78 +5791,22 @@ def render_video_processing_tab():
                 render_video_summary_section()
                 render_video_transcript_section()
             return
-        handled_by_extension, extension_message = begin_video_extension_request(
-            auto_fetch_url,
-            allow_local_fallback=False,
-        )
-        if handled_by_extension:
-            st.info(t("video_auto_extension"))
-            st.info(extension_message)
-            st.rerun()
-            return
-    extension_status, extension_message, extension_url = try_video_extension_first()
-    if extension_status == "waiting" and extension_message:
-        st.info(extension_message)
-    elif extension_status == "payload_ready":
-        clear_video_extension_fallback_flags()
-        st.rerun()
-    elif extension_status == "fallback":
-        should_auto_local_fallback = (
-            bool(st.session_state.get("video_extension_allow_local_fallback"))
-            and not bool(st.session_state.get("video_extension_local_fallback_attempted"))
-            and bool(extension_url)
-        )
-        if should_auto_local_fallback:
-            st.session_state.video_extension_local_fallback_attempted = True
-            clear_video_extension_fallback_flags()
-            st.error("插件未直接返回文本；已停止自动回退 Render 服务端抓取，避免触发 YouTube 429 限流。请在目标 YouTube 视频页直接点击插件重试。")
-            return
-        clear_video_extension_fallback_flags()
-        if extension_message:
-            st.error(extension_message)
-        debug_text = str(st.session_state.get("video_extension_request_debug_text") or "").strip()
-        if debug_text:
-            with st.expander(t("video_extension_debug"), expanded=False):
-                st.code(debug_text, language="json")
-        
-        # 获取当前的请求结果以提取日志
-        current_result = st.session_state.get("video_extension_request_result")
-        extraction_logs = []
-        if isinstance(current_result, dict):
-            # 尝试从不同位置提取日志
-            detection = current_result.get("detection")
-            if isinstance(detection, dict):
-                extraction_logs = detection.get("extractionLogs", [])
-            
-            if not extraction_logs:
-                debug_obj = current_result.get("debug")
-                if isinstance(debug_obj, dict):
-                    detection_inner = debug_obj.get("detection")
-                    if isinstance(detection_inner, dict):
-                        extraction_logs = detection_inner.get("extractionLogs", [])
-        
-        if isinstance(extraction_logs, list) and extraction_logs:
-            with st.expander("查看插件文本提取过程日志", expanded=True):
-                for log_line in extraction_logs:
-                    st.write(f"- {log_line}")
-
-        st.divider()
-        col_fb1, col_fb2 = st.columns([3, 1])
-        with col_fb1:
-            st.warning("💡 插件模式抓取失败。请确认插件已更新至最新版并已在当前页面启用。")
-        with col_fb2:
-            if st.button("🔄 重置状态", key="btn_reset_extension", use_container_width=True):
-                reset_video_extension_request_state(clear_result=True)
-                st.rerun()
-        
-        st.caption("提示：本项目依赖插件提取页面文稿。如果该视频没有平台字幕，插件将无法获取文本。")
+        reset_video_extension_request_state(clear_result=True)
+        st.info(t("video_auto_extension"))
+        open_url = build_youtube_open_url(auto_fetch_url)
+        if open_url:
+            st.link_button("打开 YouTube 视频页", open_url, use_container_width=True)
         return
+    if st.session_state.get("video_extension_request_pending"):
+        reset_video_extension_request_state(clear_result=True)
+        st.info("已停止主站远程等待插件响应。请打开目标 YouTube 视频页后直接点击插件。")
 
     if resolved_url:
         strategy_label = {
             "server_direct": "统一服务端字幕抓取",
             "local_direct": "统一服务端字幕抓取",
             "extension": "统一插件页面提取",
+            "open_video": "打开视频页后点击插件",
         }.get(fetch_strategy, "插件提取")
         st.caption(f"当前智能路径：`{strategy_label}`。{fetch_strategy_message}")
 
@@ -5890,15 +5835,12 @@ def render_video_processing_tab():
                 render_video_summary_section()
                 render_video_transcript_section()
             return
-        handled_by_extension, extension_message = begin_video_extension_request(
-            resolved_url,
-            allow_local_fallback=False,
-        )
-        if handled_by_extension:
-            st.info(fetch_strategy_message)
-            st.info(extension_message)
-            st.rerun()
-        st.error("未能发起插件请求，请确认扩展已在当前页面注入后重试。")
+        reset_video_extension_request_state(clear_result=True)
+        st.info(fetch_strategy_message)
+        open_url = build_youtube_open_url(resolved_url)
+        if open_url:
+            st.link_button("打开 YouTube 视频页", open_url, use_container_width=True)
+        st.warning("打开视频页后点击浏览器右上角插件。插件会从当前页面提取字幕并自动打开主站总结。")
     if summary_btn:
         if not resolved_url:
             st.warning("请输入视频链接")
