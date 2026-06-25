@@ -1534,7 +1534,7 @@ def request_extension_summarize_flow(
         action="requestExtensionSummarize",
         sourceUrl=source_url,
         requestId=request_id,
-        timeoutMs=150000,
+        timeoutMs=60000,
         height=0,
         key=component_key,
         default=None,
@@ -3900,11 +3900,11 @@ def start_video_fact_check_async(
         return
 
     planned_claims = int(plan.get("recommended_claim_count") or 3)
-    max_claims = max(1, min(3, planned_claims))
-    fast_claims = max_claims
+    max_claims = max(1, min(6, planned_claims))
+    fast_claims = min(4, max_claims)
     plan_note = str(plan.get("reason") or "").strip()
     if planned_claims > max_claims:
-        plan_note = f"为控制等待时间，本轮先快速核查最重要的 {max_claims} 条声明；其余声明暂不自动深度补跑。"
+        plan_note = f"为控制等待时间，本轮先快速核查最重要的 {fast_claims} 条声明，后台最多补充到 {max_claims} 条。"
     cache_key = _build_video_fact_check_cache_key(url_value, summary_md, transcript_value)
 
     with runtime["lock"]:

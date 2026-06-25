@@ -3488,6 +3488,7 @@ NOISY_FACT_CHECK_DOMAIN_TOKENS = (
     "facebook.com",
     "instagram.com",
     "weibo.com",
+    "apps.microsoft.com",
 )
 
 NOISY_FACT_CHECK_PATH_TOKENS = (
@@ -3677,6 +3678,8 @@ def _is_noise_fact_check_hit(item: dict) -> bool:
         return True
     if any(token in normalized_url.lower() for token in ("?s=", "?search=", "/search?", "tbm=nws", "bing.com/news/search")):
         return True
+    if any(token in snippet for token in ("没有提到", "未提到", "does not mention", "not mention")):
+        return True
     noisy_title_tokens = [
         "watch video",
         "watch live",
@@ -3710,6 +3713,9 @@ def _is_relevant_fact_check_hit(
     claim_text: str = "",
     query_text: str = "",
 ) -> bool:
+    domain = _get_fact_check_hit_domain(item)
+    if domain in MAJOR_MEDIA_DOMAINS or domain.endswith(".gov") or ".gov." in domain:
+        return True
     haystack = " ".join(
         [
             str(item.get("title") or ""),
@@ -5769,7 +5775,7 @@ def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = 
     mode = str(search_mode or "standard").strip().lower()
     is_fast_mode = mode == "fast"
     anysearch_enabled = _env_flag("ANYSEARCH_ENABLED", default=True)
-    anysearch_limit = 0 if is_fast_mode else _env_int("ANYSEARCH_MAX_CALLS_PER_CLAIM", 2, minimum=0, maximum=4)
+    anysearch_limit = 1 if is_fast_mode else _env_int("ANYSEARCH_MAX_CALLS_PER_CLAIM", 2, minimum=0, maximum=4)
     anysearch_calls = 0
     results_text = []
     global_source_links: list[str] = []

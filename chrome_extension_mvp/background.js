@@ -24,7 +24,7 @@ const TEMP_TAB_LOAD_TIMEOUT_MS = 12000;
 const TEMP_TAB_READY_DELAY_MS = 1500;
 const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 2;
 const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 500;
-const MAIN_WORLD_EXECUTION_TIMEOUT_MS = 15000;
+const MAIN_WORLD_EXECUTION_TIMEOUT_MS = 8000;
 const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "0.1.64";
 const EXTENSION_TOOL_VERSION = EXTENSION_VERSION;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
@@ -4122,6 +4122,52 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl, options = {}) {
   const attempts = [];
   let contentResult = null;
   let shouldForceTemporaryTabMainWorld = false;
+  let matchedFastContentAttempted = false;
+
+  const hasTranscript = (res) => Boolean(res?.ok && String(res.transcript || "").trim());
+  const firstFastTranscript = (tasks) => new Promise((resolve) => {
+    if (!tasks.length) {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    let remaining = tasks.length;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    for (const task of tasks) {
+      (async () => {
+        let raw = null;
+        let result = null;
+        let errorText = "";
+        try {
+          raw = await task.run();
+          result = task.normalize ? task.normalize(raw) : raw;
+          addLogs(result || raw, task.stage);
+          errorText = String(result?.error || raw?.error || task.defaultError || "extract_failed");
+          attempts.push({
+            stage: task.stage,
+            ok: hasTranscript(result),
+            error: hasTranscript(result) ? "" : errorText,
+            reason: String(result?.detection?.reason || raw?.detection?.reason || "")
+          });
+          if (hasTranscript(result)) {
+            finish({ task, result });
+          }
+        } catch (error) {
+          errorText = String(error?.message || error || task.defaultError || "extract_failed");
+          attempts.push({ stage: task.stage, ok: false, error: errorText });
+        } finally {
+          remaining -= 1;
+          if (remaining === 0 && !settled) {
+            resolve(null);
+          }
+        }
+      })();
+    }
+  });
 
   if (matchedTab?.id) {
     attempts.push({
@@ -4132,7 +4178,9 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl, options = {}) {
     });
 
     try {
-      await waitForTabComplete(matchedTab.id, 5000);
+      if (String(matchedTab.status || "") !== "complete") {
+        await waitForTabComplete(matchedTab.id, 1500);
+      }
       attempts.push({
         stage: "matched_tab_wait_complete",
         ok: true
@@ -4145,57 +4193,55 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl, options = {}) {
       });
     }
 
-    if (canUseMainWorld) {
-      const mainWorldResult = await extractYouTubeTranscriptViaMainWorldTab(matchedTab.id);
-      addLogs(mainWorldResult, "matched_tab_main_world");
-      attempts.push({
+    const fastTasks = [
+      ...(canUseMainWorld ? [{
         stage: "matched_tab_main_world",
-        ok: Boolean(mainWorldResult?.ok && String(mainWorldResult.transcript || "").trim()),
-        error: String(mainWorldResult?.error || "main_world_extract_failed")
-      });
-      if (mainWorldResult?.ok && String(mainWorldResult.transcript || "").trim()) {
-        return {
-          ...mainWorldResult,
-          platform: "youtube",
-          title: String(matchedTab.title || "").trim(),
-          detection: {
-            hasText: true,
-            sourceType: "transcript",
-            confidence: 0.99,
-            reason: "main_world_caption_fetch",
-            canFallbackToLocal: false,
-            extractionLogs: allExtractionLogs
-          }
-        };
-      }
-    } else {
-      attempts.push({
+        defaultError: "main_world_extract_failed",
+        run: () => extractYouTubeTranscriptViaMainWorldTab(matchedTab.id)
+      }] : [{
         stage: "matched_tab_main_world",
-        ok: false,
-        error: "main_world_execute_unsupported"
-      });
-    }
-
-    reportBackgroundDebug("D", "background direct extract started before panel fallback", {
-      sourceUrl: sourceUrlText
-    });
-    const earlyBackgroundResult = await extractYouTubeTranscriptByUrl(sourceUrlText);
-    addLogs(earlyBackgroundResult, "background_extract");
-    attempts.push({
-      stage: "background_extract",
-      ok: Boolean(earlyBackgroundResult?.ok && String(earlyBackgroundResult.transcript || "").trim()),
-      error: String(earlyBackgroundResult?.error || "background_extract_failed")
-    });
-    if (earlyBackgroundResult?.ok && String(earlyBackgroundResult.transcript || "").trim()) {
+        defaultError: "main_world_execute_unsupported",
+        run: async () => ({ ok: false, error: "main_world_execute_unsupported" })
+      }]),
+      {
+        stage: "background_extract",
+        defaultError: "background_extract_failed",
+        run: () => extractYouTubeTranscriptByUrl(sourceUrlText)
+      },
+      ...(allowMatchedTabContentScript ? [{
+        stage: "matched_tab_content_script_first",
+        defaultError: "content_script_extract_failed",
+        run: async () => {
+          matchedFastContentAttempted = true;
+          return extractTranscriptViaContentScriptTab(matchedTab.id);
+        },
+        normalize: (raw) => {
+          contentResult = normalizePluginExtractionResult(raw, "content_script_extract");
+          return contentResult;
+        }
+      }] : [{
+        stage: "matched_tab_content_script_first",
+        defaultError: "matched_tab_content_script_disabled",
+        run: async () => ({ ok: false, error: "matched_tab_content_script_disabled" })
+      }])
+    ];
+    const fastWinner = await firstFastTranscript(fastTasks);
+    if (fastWinner?.result) {
+      const reasonByStage = {
+        matched_tab_main_world: "main_world_caption_fetch",
+        background_extract: "background_caption_fetch",
+        matched_tab_content_script_first: String(fastWinner.result?.detection?.reason || "content_script_extract")
+      };
       return {
-        ...earlyBackgroundResult,
+        ...fastWinner.result,
         platform: "youtube",
-        title: String(matchedTab.title || "").trim(),
+        title: String(fastWinner.result.title || matchedTab.title || "").trim(),
         detection: {
+          ...(fastWinner.result.detection || {}),
           hasText: true,
           sourceType: "transcript",
           confidence: 0.99,
-          reason: "background_caption_fetch",
+          reason: reasonByStage[fastWinner.task.stage] || "fast_parallel_extract",
           canFallbackToLocal: false,
           extractionLogs: allExtractionLogs
         }
@@ -4225,7 +4271,7 @@ async function extractYouTubeTranscriptForPageFlow(sourceUrl, options = {}) {
       };
     }
 
-    if (allowMatchedTabContentScript) {
+    if (allowMatchedTabContentScript && !matchedFastContentAttempted) {
       const rawContentResult = await extractTranscriptViaContentScriptTab(matchedTab.id);
       addLogs(rawContentResult, "matched_tab_content_script_first");
       contentResult = normalizePluginExtractionResult(
