@@ -6,7 +6,7 @@
   const BROADCAST_CHANNEL_NAME = "yt-summary-broadcast-channel";
   const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
   const DEBUG_SESSION_ID = "youtube-plugin-extract";
-  const DEBUG_RUN_ID = `post-fix-${extensionApi?.runtime?.getManifest?.().version || "0.1.64"}`;
+  const DEBUG_RUN_ID = `post-fix-${extensionApi?.runtime?.getManifest?.().version || "1.1"}`;
   const TRANSCRIPT_BUTTON_PATTERNS = [
     "show transcript",
     "open transcript",

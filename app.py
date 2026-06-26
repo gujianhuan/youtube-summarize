@@ -113,12 +113,12 @@ UI_TEXTS = {
         "tab_history": "🗂️ 历史记录",
         "tab_wishwall": "📝 留言板",
         "tab_settings": "🛠️ 设置",
-        "hero_title": "快速获取视频总结",
-        "hero_desc": "打开 YouTube 视频页后点击插件，系统会从当前页面提取 transcript 并生成总结。",
-        "home_path_input_title": "输入链接打开视频页",
-        "home_path_input_desc": "适合先定位视频。主站不再远程唤起插件抓取，避免等待超时；请打开目标 YouTube 视频页后点击插件。",
-        "home_path_plugin_title": "插件一键获取总结",
-        "home_path_plugin_desc": "适合在视频页直接点击插件。插件会从当前页面提取文本、上传到 bridge，然后由主站总结和核查。",
+        "hero_title": "ClipBrief AI",
+        "hero_desc": "在 YouTube 视频页点击浏览器插件，自动提取 transcript，并回到这里生成总结和来源核查。",
+        "home_path_plugin_title": "从 YouTube 当前页开始",
+        "home_path_plugin_desc": "打开目标视频页，点击 ClipBrief AI 插件。字幕提取在你的浏览器页面内完成，主站只接收 transcript 并负责总结。",
+        "home_path_result_title": "结果会自动出现在这里",
+        "home_path_result_desc": "插件成功发送文本后，主站会自动读取 bridge payload。关闭插件弹窗不会中断后台流程。",
         "video_input_label": "视频链接或 ID",
         "video_input_placeholder": "粘贴 YouTube 链接或输入 11 位视频 ID",
         "video_input_meta": "支持普通视频、Shorts、直播回放和 11 位视频 ID，直接粘贴即可。",
@@ -502,12 +502,12 @@ UI_TEXTS = {
         "tab_history": "🗂️ History",
         "tab_wishwall": "📝 Board",
         "tab_settings": "🛠️ Settings",
-        "hero_title": "Get a Video Summary Fast",
-        "hero_desc": "Open the YouTube video page and click the extension. It extracts the transcript from the current page and sends it here for summary.",
-        "home_path_input_title": "Paste Link, Open Video",
-        "home_path_input_desc": "Best for locating the video first. The main site no longer remotely wakes the extension to avoid bridge timeouts; open the target YouTube page and click the extension.",
-        "home_path_plugin_title": "One-Click From Extension",
-        "home_path_plugin_desc": "Best on the video page itself. The extension extracts text from the current page, uploads it to the bridge, then the main site summarizes and checks sources.",
+        "hero_title": "ClipBrief AI",
+        "hero_desc": "Click the browser extension on a YouTube video page. It extracts the transcript there, then returns here for summary and source checks.",
+        "home_path_plugin_title": "Start From the Current YouTube Page",
+        "home_path_plugin_desc": "Open the target video and click the ClipBrief AI extension. Transcript extraction runs in your browser page; this site only receives the transcript and summarizes it.",
+        "home_path_result_title": "Results Appear Here Automatically",
+        "home_path_result_desc": "After the extension sends text, the site reads the bridge payload automatically. Closing the popup will not stop the background task.",
         "video_input_label": "Video URL or ID",
         "video_input_placeholder": "Paste a YouTube URL or enter an 11-character video ID",
         "video_input_meta": "Supports regular videos, Shorts, archived livestreams, and 11-character video IDs.",
@@ -2924,46 +2924,48 @@ st.markdown(
     
     /* 顶部 Hero 区域 */
     .lite-home-hero {
-        text-align: center;
-        margin: 4.5rem auto 1.2rem auto;
-        max-width: 800px;
-        padding: 2.5rem;
-        background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
-        border-radius: 32px;
-        box-shadow: 0 20px 40px rgba(0,0,0,0.05);
+        margin: 1.1rem auto 1rem auto;
+        max-width: 1040px;
+        padding: 1.7rem 1.9rem;
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 18px;
+        box-shadow: 0 18px 38px rgba(15, 23, 42, 0.12);
     }
     
     .lite-home-hero h1 {
-        font-size: 3rem !important;
-        background: linear-gradient(45deg, #FF0000, #CC0000);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
+        font-size: 2.15rem !important;
+        color: #ffffff !important;
+        margin: 0 0 0.55rem 0;
         font-weight: 800 !important;
     }
     
     .lite-home-hero p {
-        color: #666;
-        font-size: 1.2rem;
-        margin-top: 1rem;
+        color: #d1d5db;
+        font-size: 1.02rem;
+        line-height: 1.7;
+        max-width: 760px;
+        margin: 0;
     }
 
-    .lite-search-meta {
+    .lite-home-flow {
         max-width: 1040px;
-        margin: 0.45rem auto 0.7rem auto;
-        text-align: center;
-        color: #7a7a7a;
-        font-size: 0.93rem;
+        margin: 0 auto 1rem auto;
     }
 
     .lite-entry-card {
-        padding: 0.15rem 0.1rem;
+        min-height: 118px;
+        padding: 1.05rem 1rem;
+        border-radius: 14px;
+        border: 1px solid #e5e7eb;
+        background: #ffffff;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
     }
 
     .lite-entry-card-title {
-        font-size: 1rem;
+        font-size: 1.02rem;
         font-weight: 700;
-        color: #1f2937;
+        color: #111827;
         margin-bottom: 0.35rem;
     }
 
@@ -3048,29 +3050,6 @@ st.markdown(
         font-size: 0.78rem;
         font-weight: 700;
         border: 1px solid #d8ecff;
-    }
-
-    .st-key-input_url {
-        max-width: 1040px;
-        margin: 0.2rem auto 0.1rem auto;
-    }
-
-    .st-key-input_url input {
-        min-height: 4rem !important;
-        font-size: 1.02rem !important;
-        font-weight: 500 !important;
-        padding-left: 1.35rem !important;
-        padding-right: 1.35rem !important;
-        border-radius: 999px !important;
-        border: 1px solid #e8e8e8 !important;
-        background: #ffffff !important;
-        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06) !important;
-    }
-
-    .st-key-input_url input:focus {
-        border-color: #ff7d7f !important;
-        background: #ffffff !important;
-        box-shadow: 0 0 0 4px rgba(255, 125, 127, 0.1), 0 12px 28px rgba(255, 125, 127, 0.08) !important;
     }
 
     .wish-wall-shell {
@@ -3226,7 +3205,7 @@ st.markdown(
     
     .lite-home-helper {
         text-align: center;
-        margin: 0.85rem auto 0 auto;
+        margin: 0.85rem auto 1rem auto;
         max-width: 720px;
         font-size: 0.92rem;
         color: #5f6368;
@@ -3597,7 +3576,6 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
         st.session_state.video_extension_auto_summary_url = str(
             normalized_video_bridge_payload.get("source_url")
             or st.session_state.get("current_video_url")
-            or st.session_state.get("input_url")
             or ""
         ).strip()
         st.session_state.video_extension_auto_summary_fetch_duration = 0.0
@@ -3605,13 +3583,13 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
 
 def render_privacy_policy_page():
     st.title("隐私权政策")
-    st.caption("YouTube Transcript Helper / YouTube Summarizer")
+    st.caption("ClipBrief AI / YouTube Summarizer")
 
     st.markdown(
         """
 生效日期：2026 年 6 月 15 日
 
-本隐私权政策说明 YouTube Transcript Helper 浏览器扩展和 YouTube Summarizer 主站如何处理用户数据。
+本隐私权政策说明 ClipBrief AI 浏览器扩展和 YouTube Summarizer 主站如何处理用户数据。
 
 ### 我们收集或处理的数据
 
@@ -5253,7 +5231,7 @@ def get_current_video_url(url: str = "") -> str:
     remembered = remember_current_video_url(url)
     if remembered:
         return remembered
-    return str(st.session_state.get("input_url") or "").strip()
+    return ""
 
 
 def detect_video_platform(url: str) -> str:
@@ -5743,114 +5721,42 @@ def render_video_processing_tab():
         """,
         unsafe_allow_html=True,
     )
-    url = st.text_input(
-        t("video_input_label"),
-        key="input_url",
-        placeholder=t("video_input_placeholder"),
-        label_visibility="collapsed",
-    )
-    st.markdown(
-        f'<div class="lite-search-meta">{html.escape(t("video_input_meta"))}</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="lite-home-flow">', unsafe_allow_html=True)
     path_col1, path_col2 = st.columns(2, gap="large")
     with path_col1:
-        with st.container(border=True):
-            st.markdown(
-                f"""
-                <div class="lite-entry-card">
-                    <div class="lite-entry-card-title">{html.escape(t("home_path_input_title"))}</div>
-                    <p class="lite-entry-card-desc">{html.escape(t("home_path_input_desc"))}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f"""
+            <div class="lite-entry-card">
+                <div class="lite-entry-card-title">{html.escape(t("home_path_plugin_title"))}</div>
+                <p class="lite-entry-card-desc">{html.escape(t("home_path_plugin_desc"))}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     with path_col2:
-        with st.container(border=True):
-            st.markdown(
-                f"""
-                <div class="lite-entry-card">
-                    <div class="lite-entry-card-title">{html.escape(t("home_path_plugin_title"))}</div>
-                    <p class="lite-entry-card-desc">{html.escape(t("home_path_plugin_desc"))}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-    remember_current_video_url(url)
-    resolved_url = get_current_video_url(url)
-    fetch_strategy, fetch_strategy_message = choose_video_fetch_strategy(resolved_url)
+        st.markdown(
+            f"""
+            <div class="lite-entry-card">
+                <div class="lite-entry-card-title">{html.escape(t("home_path_result_title"))}</div>
+                <p class="lite-entry-card-desc">{html.escape(t("home_path_result_desc"))}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+    resolved_url = get_current_video_url("")
     auto_fetch_pending = bool(st.session_state.get("video_auto_fetch_pending"))
-    auto_fetch_url = get_current_video_url(st.session_state.get("video_auto_fetch_url") or resolved_url)
-    auto_fetch_route = str(st.session_state.get("video_auto_fetch_route") or "").strip()
-    if auto_fetch_pending and auto_fetch_url:
+    if auto_fetch_pending:
         st.session_state.video_auto_fetch_pending = False
-        if auto_fetch_route in {"server_direct", "local_direct"} and admin_mode:
-            st.info(t("video_auto_direct"))
-            fetch_succeeded = do_video_fetch_single(auto_fetch_url, allow_extension_fallback=False)
-            if fetch_succeeded:
-                render_video_summary_section()
-                render_video_transcript_section()
-            return
         reset_video_extension_request_state(clear_result=True)
-        st.info(t("video_auto_extension"))
-        open_url = build_youtube_open_url(auto_fetch_url)
-        if open_url:
-            st.link_button("打开 YouTube 视频页", open_url, use_container_width=True)
-        return
     if st.session_state.get("video_extension_request_pending"):
         reset_video_extension_request_state(clear_result=True)
         st.info("已停止主站远程等待插件响应。请打开目标 YouTube 视频页后直接点击插件。")
 
-    if resolved_url:
-        strategy_label = {
-            "server_direct": "统一服务端字幕抓取",
-            "local_direct": "统一服务端字幕抓取",
-            "extension": "统一插件页面提取",
-            "open_video": "打开视频页后点击插件",
-        }.get(fetch_strategy, "插件提取")
-        st.caption(f"当前智能路径：`{strategy_label}`。{fetch_strategy_message}")
-
-    action_spacer_left, action_main, action_spacer_right = st.columns([1.35, 1.3, 1.35])
-    with action_main:
-        fetch_btn = st.button("🚀 智能抓取并总结", type="primary", use_container_width=True, key="btn_single_fetch")
-
-    sub_spacer_left, sub_col1, sub_col2, sub_spacer_right = st.columns([1.2, 1, 1, 1.2])
-    with sub_col1:
-        summary_btn = st.button("🤖 仅重新生成总结", use_container_width=True, key="btn_single_sum")
-    with sub_col2:
-        check_btn = st.button("🔍 检测可用字幕", use_container_width=True, key="btn_single_check")
     st.markdown(
-        '<div class="lite-home-helper">也可以直接在视频页点击插件，一键获取总结。</div>',
+        '<div class="lite-home-helper">主站已关闭 YouTube 链接输入抓取；普通用户只走插件当前页提取，避免 Render IP 触发 YouTube 限流。</div>',
         unsafe_allow_html=True,
     )
-
-    if fetch_btn:
-        if not resolved_url:
-            st.warning("请输入视频链接")
-            return
-        if fetch_strategy == "server_direct" and admin_mode:
-            st.info(fetch_strategy_message)
-            fetch_succeeded = do_video_fetch_single(resolved_url, allow_extension_fallback=True)
-            if fetch_succeeded:
-                render_video_summary_section()
-                render_video_transcript_section()
-            return
-        reset_video_extension_request_state(clear_result=True)
-        st.info(fetch_strategy_message)
-        open_url = build_youtube_open_url(resolved_url)
-        if open_url:
-            st.link_button("打开 YouTube 视频页", open_url, use_container_width=True)
-        st.warning("打开视频页后点击浏览器右上角插件。插件会从当前页面提取字幕并自动打开主站总结。")
-    if summary_btn:
-        if not resolved_url:
-            st.warning("请输入视频链接")
-            return
-        do_video_summary_single(resolved_url)
-    if check_btn:
-        if not resolved_url:
-            st.warning("请输入视频链接")
-            return
-        do_video_check_single(resolved_url)
 
     render_video_summary_section()
     render_video_transcript_section()

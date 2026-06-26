@@ -33,7 +33,8 @@ const progressStepsEl = document.getElementById("progressSteps");
 
 const FLOW_STATUS_KEY = "summarizerFlowStatus";
 const EXTENSION_CONFIG_KEY = "summarizerExtensionConfig";
-const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "0.1.64";
+const LAST_TRANSCRIPT_KEY = "summarizerLastTranscript";
+const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "1.1";
 const EXTENSION_TOOL_VERSION = `browser-extension-mvp-${EXTENSION_VERSION}`;
 const DEFAULT_MAIN_URL = "https://youtube-summarize-0oms.onrender.com/";
 const DEFAULT_BRIDGE_URL = "https://youtube-summarize-bridge.onrender.com";
@@ -62,12 +63,12 @@ const POPUP_LOCALE = resolvePopupLocale();
 
 const POPUP_MESSAGES = {
   zh: {
-    popupTitle: `Transcript Helper v${EXTENSION_VERSION}`,
+    popupTitle: `ClipBrief AI v${EXTENSION_VERSION}`,
     popupStatusIdle: "待命：打开 YouTube 视频后会自动提取并发送到主站。",
     extractBtn: "提取字幕",
     copyBtn: "复制文本",
     openBtn: "一键总结",
-    configTitle: "联调配置",
+    configTitle: "服务配置",
     mainUrlLabel: "主站地址",
     mainUrlPlaceholder: "例如 http://127.0.0.1:8501/",
     bridgeUrlLabel: "Bridge 地址",
@@ -82,8 +83,8 @@ const POPUP_MESSAGES = {
     urlLabel: "来源链接",
     transcriptLabel: "提取结果",
     transcriptPlaceholder: "这里会显示提取到的字幕文本",
-    popupHint: "插件会优先直接提取文本；若当前页面拿不到，会调用同一字幕抓取服务继续获取。",
-    configSaved: "联调配置已保存。",
+    popupHint: "打开 YouTube 视频页后点击插件。插件会从当前页面提取 transcript，并发送到线上主站总结。",
+    configSaved: "服务配置已保存。",
     configReset: "已恢复默认线上配置。",
     helperNoCaptionTitle: "该视频没有开放平台字幕轨道",
     helperNoCaptionDesc: "这个视频大概率只有画面硬字幕，或作者没有对外开放 YouTube 字幕轨道，所以扩展暂时拿不到 transcript。你可以继续交给主站，由服务端抓取并进入总结流程。",
@@ -125,7 +126,7 @@ const POPUP_MESSAGES = {
     startSummarizeFlowFailed: "后台任务启动失败。{message}",
   },
   en: {
-    popupTitle: `Transcript Helper v${EXTENSION_VERSION}`,
+    popupTitle: `ClipBrief AI v${EXTENSION_VERSION}`,
     popupStatusIdle: "Ready: open a YouTube video to extract and send it to the main site automatically.",
     extractBtn: "Extract",
     copyBtn: "Copy",
@@ -145,7 +146,7 @@ const POPUP_MESSAGES = {
     urlLabel: "Source URL",
     transcriptLabel: "Transcript",
     transcriptPlaceholder: "Extracted transcript text will appear here",
-    popupHint: "The extension tries to extract page text first. If the page does not return text, it continues with the same transcript fetch service.",
+    popupHint: "Open a YouTube video and click the extension. It extracts the transcript from the current page and sends it to the online summarizer.",
     configSaved: "Debug configuration saved.",
     configReset: "Default online configuration restored.",
     helperNoCaptionTitle: "No platform caption track is available",
@@ -387,7 +388,7 @@ function stageToProgress(stage, isError = false) {
   if (isError || normalized === "error") {
     return { percent: 100, active: "done", title: "任务失败，请重试" };
   }
-  if (["extracting", "background_start_extraction", "extract_fast", "warming"].includes(normalized)) {
+  if (["extracting", "background_start_extraction", "extract_fast"].includes(normalized)) {
     return { percent: 24, active: "extract", title: "快速读取字幕轨道" };
   }
   if (normalized === "extract_enhanced") {
@@ -399,14 +400,14 @@ function stageToProgress(stage, isError = false) {
   if (normalized === "extract_background_continue") {
     return { percent: 68, active: "extract", title: "后台继续尝试字幕读取" };
   }
-  if (["retrying", "uploading", "background_upload_bridge_payload"].includes(normalized)) {
+  if (["warming", "retrying", "uploading", "background_upload_bridge_payload"].includes(normalized)) {
     return { percent: 58, active: "upload", title: "正在发送 transcript 到主站" };
   }
   if (["opening", "background_open_main_site"].includes(normalized)) {
     return { percent: 82, active: "open", title: "正在打开主站" };
   }
   if (normalized === "deduped") {
-    return { percent: 82, active: "open", title: "同一视频已有后台任务在运行" };
+    return { percent: 12, active: "extract", title: "同一视频已有后台任务在运行" };
   }
   if (normalized === "done") {
     return { percent: 100, active: "done", title: "主站已打开，正在自动总结" };
@@ -703,6 +704,42 @@ async function loadLastFlowStatus() {
   }
 }
 
+async function loadLastTranscriptForCurrentVideo() {
+  try {
+    if (transcriptOutput.value.trim()) {
+      return;
+    }
+    const result = await storageLocalGet(LAST_TRANSCRIPT_KEY);
+    const cached = result?.[LAST_TRANSCRIPT_KEY];
+    const transcript = String(cached?.transcript || "").trim();
+    if (!transcript) {
+      return;
+    }
+    const cachedVideoId = parseYouTubeVideoId(cached.sourceUrl || "");
+    const currentVideoId = parseYouTubeVideoId(urlInput.value || popupTargetSourceUrl || "");
+    if (cachedVideoId && currentVideoId && cachedVideoId !== currentVideoId) {
+      return;
+    }
+    titleInput.value = String(cached.title || titleInput.value || "");
+    urlInput.value = String(cached.sourceUrl || urlInput.value || "");
+    transcriptOutput.value = transcript;
+    lastExtractResponse = {
+      ok: true,
+      platform: cached.platform || "youtube",
+      title: titleInput.value,
+      url: urlInput.value,
+      transcript,
+      detection: cached.detection || null,
+      payloadId: cached.payloadId || ""
+    };
+    setStatus(`已获取字幕：约 ${transcript.length} 字符，正在发送到主站。`);
+    updateProgress("uploading", "已获取字幕，正在发送到主站");
+    syncActionButtons();
+  } catch (_error) {
+    // Cached transcript is only a convenience for popup reopen.
+  }
+}
+
 async function getPreferredTab() {
   const targetVideoId = parseYouTubeVideoId(popupTargetSourceUrl);
   if (Number.isInteger(popupTargetTabId) && popupTargetTabId > 0) {
@@ -860,7 +897,7 @@ async function autoStartBackgroundSummarizeFlow() {
       }
     });
     if (startResult?.deduped) {
-      setStatus("同一视频已有后台任务在运行，本次不会重复打开主站。");
+      setStatus("同一视频已有后台任务在运行，本次不会重复打开主站；若 90 秒后仍无结果，请再次点击插件。");
       updateProgress("deduped", "同一视频已有后台任务在运行");
       return;
     }
@@ -2066,9 +2103,14 @@ void (async () => {
   await loadExtensionConfig();
   hydratePopupContextFromQuery();
   await hydratePopupContextFromActiveTab();
+  await loadLastTranscriptForCurrentVideo();
   await autoStartBackgroundSummarizeFlow();
   syncActionButtons();
 })();
+
+globalThis.setInterval(() => {
+  void loadLastTranscriptForCurrentVideo();
+}, 2000);
 
 extractBtn.addEventListener("click", extractTranscript);
 

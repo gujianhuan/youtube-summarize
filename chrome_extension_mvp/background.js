@@ -27,13 +27,14 @@ const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 500;
 const MAIN_WORLD_EXECUTION_TIMEOUT_MS = 8000;
 const PROGRESSIVE_FAST_STAGE_MS = 3000;
 const PROGRESSIVE_PANEL_STAGE_MS = 30000;
-const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "0.1.64";
+const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "1.1";
 const EXTENSION_TOOL_VERSION = EXTENSION_VERSION;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
 const DEBUG_SESSION_ID = "youtube-plugin-extract";
 const BACKGROUND_SUMMARIZE_DEDUPE_MS = 30000;
-const BACKGROUND_SUMMARIZE_STORAGE_LOCK_MS = 10 * 60 * 1000;
+const BACKGROUND_SUMMARIZE_STORAGE_LOCK_MS = 90 * 1000;
 const BACKGROUND_SUMMARIZE_ACTIVE_KEY = "summarizerActiveVideoFlows";
+const LAST_TRANSCRIPT_KEY = "summarizerLastTranscript";
 const backgroundSummarizeLocks = new Map();
 
 // Release: use manifest version as the single source of truth for UI/debug reporting.
@@ -435,9 +436,9 @@ async function updateActionTaskStatus(status) {
   const stage = String(status?.stage || "info");
   const message = String(status?.message || "").trim();
   const isError = Boolean(status?.isError);
-  let title = "Transcript Helper：待命";
+  let title = "ClipBrief AI：待命";
   if (isError) {
-    title = `Transcript Helper：任务失败${message ? ` - ${message}` : ""}`;
+    title = `ClipBrief AI：任务失败${message ? ` - ${message}` : ""}`;
   } else if ([
     "extract_fast",
     "extract_enhanced",
@@ -448,9 +449,9 @@ async function updateActionTaskStatus(status) {
     "uploading",
     "opening"
   ].includes(stage)) {
-    title = `Transcript Helper：${message || "任务进行中"}`;
+    title = `ClipBrief AI：${message || "任务进行中"}`;
   } else if (stage === "done") {
-    title = "Transcript Helper：已打开主站，正在自动总结";
+    title = "ClipBrief AI：已打开主站，正在自动总结";
   }
   try {
     await callExtensionApi(extensionApi.action.setTitle, extensionApi.action, { title });
@@ -4878,6 +4879,18 @@ async function startSummarizeFlowFromPage(payload) {
     reason: String(extraction?.detection?.reason || "")
   });
   const payloadId = buildPayloadId();
+  await storageLocalSet({
+    [LAST_TRANSCRIPT_KEY]: {
+      ok: true,
+      sourceUrl,
+      title: extraction.title || "",
+      transcript,
+      platform: String(extraction?.platform || "youtube"),
+      payloadId,
+      updatedAt: Date.now(),
+      detection: extraction?.detection || null
+    }
+  });
   const envelope = buildTranscriptEnvelope(payloadId, extraction, transcript, sourceUrl, extraction.title || "");
   const bridgePayload = {
     payloadId,
