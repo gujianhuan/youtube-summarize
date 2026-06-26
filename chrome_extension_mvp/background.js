@@ -25,9 +25,8 @@ const TEMP_TAB_READY_DELAY_MS = 1500;
 const YOUTUBE_EXTRACTION_RETRY_ATTEMPTS = 2;
 const YOUTUBE_EXTRACTION_RETRY_DELAY_MS = 500;
 const MAIN_WORLD_EXECUTION_TIMEOUT_MS = 8000;
-const PROGRESSIVE_FAST_STAGE_MS = 5000;
-const PROGRESSIVE_ENHANCED_STAGE_MS = 7000;
-const PROGRESSIVE_PANEL_STAGE_MS = 8000;
+const PROGRESSIVE_FAST_STAGE_MS = 3000;
+const PROGRESSIVE_PANEL_STAGE_MS = 30000;
 const EXTENSION_VERSION = extensionApi?.runtime?.getManifest?.().version || "0.1.64";
 const EXTENSION_TOOL_VERSION = EXTENSION_VERSION;
 const DEBUG_SERVER_URL = "http://127.0.0.1:7777/event";
@@ -1988,6 +1987,7 @@ async function extractYouTubeTranscriptViaDomPanelTab(tabId) {
   try {
     const injectionPromise = executeScript({
       target: { tabId, frameIds: [0] },
+      world: "MAIN",
       func: async () => {
         const sleep = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
         const normalizeWhitespace = (text) => String(text || "")
@@ -2116,6 +2116,24 @@ async function extractYouTubeTranscriptViaDomPanelTab(tabId) {
           return transcript.length >= 40 ? transcript : "";
         };
         const findClickableByText = (patterns) => {
+          const exactSelectors = [
+            "button[aria-label*='内容转文字']",
+            "button[aria-label*='內容轉文字']",
+            "button[aria-label*='转写文稿']",
+            "button[aria-label*='轉寫文稿']",
+            "button[aria-label*='转录稿']",
+            "button[aria-label*='轉錄稿']",
+            "button[aria-label*='transcript' i]",
+            "[role='button'][aria-label*='内容转文字']",
+            "[role='button'][aria-label*='轉錄稿']",
+            "[role='button'][aria-label*='transcript' i]"
+          ];
+          for (const selector of exactSelectors) {
+            const exactNodes = querySelectorAllDeep(selector);
+            for (const node of exactNodes) {
+              if (isVisibleElement(node)) return node;
+            }
+          }
           const nodes = querySelectorAllDeep([
             "button",
             "[role='button']",
@@ -2160,6 +2178,8 @@ async function extractYouTubeTranscriptViaDomPanelTab(tabId) {
           if (nested && isVisibleElement(nested)) node = nested;
           try { node.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch (_error) {}
           try { node.focus({ preventScroll: true }); } catch (_error) {}
+          try { node.click(); } catch (_error) {}
+          await sleep(900);
           for (const eventType of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
             try {
               node.dispatchEvent(new MouseEvent(eventType, {
@@ -2170,8 +2190,7 @@ async function extractYouTubeTranscriptViaDomPanelTab(tabId) {
               }));
             } catch (_error) {}
           }
-          try { node.click(); } catch (_error) {}
-          await sleep(700);
+          await sleep(900);
           return true;
         };
         const waitForTranscript = async (attempts = 16, delayMs = 500) => {
@@ -2212,6 +2231,7 @@ async function extractYouTubeTranscriptViaDomPanelTab(tabId) {
           "逐字稿"
         ];
         const transcriptButton = findClickableByText(transcriptPatterns);
+        trace.push(`transcript_button_text=${normalizeWhitespace(transcriptButton?.innerText || transcriptButton?.textContent || transcriptButton?.getAttribute?.("aria-label") || "").slice(0, 120) || "none"}`);
         if (await clickNode(transcriptButton)) {
           trace.push("clicked_transcript_button");
           const transcript = await waitForTranscript(20, 500);
@@ -2228,12 +2248,13 @@ async function extractYouTubeTranscriptViaDomPanelTab(tabId) {
           debug: {
             trace,
             segmentCount: querySelectorAllDeep("transcript-segment-view-model, ytd-transcript-segment-renderer").length,
+            panelCount: querySelectorAllDeep("ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer[target-id*='transcript'], ytd-engagement-panel-section-list-renderer[target-id='PAmodern_transcript_view']").length,
             bodyHasContentText: normalizeWhitespace(document.body?.innerText || "").includes("内容转文字")
           }
         };
       }
     });
-    const results = await withTimeout(injectionPromise, 25000, `dom_panel_execute_timeout:${tabId}`);
+    const results = await withTimeout(injectionPromise, 12000, `dom_panel_execute_timeout:${tabId}`);
     const result = Array.isArray(results) ? results[0]?.result : null;
     if (result?.ok && String(result.transcript || "").trim()) {
       return {
@@ -3860,6 +3881,7 @@ async function extractYouTubeTranscriptViaMainWorldTab(tabId) {
             "显示字幕",
             "字幕",
             "文字稿",
+            "转写文稿",
             "转写文本",
             "内容转写",
             "内容转文字",
@@ -4297,11 +4319,17 @@ async function extractYouTubeTranscriptProgressive(sourceUrl, options = {}) {
   }
 
   let contentResult = null;
-  const enhancedResult = await runStage(
-    "extract_enhanced",
-    "读取当前页面字幕数据...",
-    PROGRESSIVE_ENHANCED_STAGE_MS,
+  const panelResult = await runStage(
+    "extract_panel",
+    "尝试读取当前页面 transcript...",
+    PROGRESSIVE_PANEL_STAGE_MS,
     [
+      {
+        stage: "panel_dom",
+        tabBound: true,
+        defaultError: "dom_panel_extract_failed",
+        run: () => extractYouTubeTranscriptViaDomPanelTab(matchedTab.id)
+      },
       {
         stage: "enhanced_content_script",
         tabBound: true,
@@ -4314,23 +4342,6 @@ async function extractYouTubeTranscriptProgressive(sourceUrl, options = {}) {
       }
     ]
   );
-  if (enhancedResult) {
-    return enhancedResult;
-  }
-
-  const panelResult = await runStage(
-    "extract_panel",
-    "尝试打开 transcript 面板...",
-    PROGRESSIVE_PANEL_STAGE_MS,
-    [
-      {
-        stage: "panel_dom",
-        tabBound: true,
-        defaultError: "dom_panel_extract_failed",
-        run: () => extractYouTubeTranscriptViaDomPanelTab(matchedTab.id)
-      }
-    ]
-  );
   if (panelResult) {
     return panelResult;
   }
@@ -4339,20 +4350,26 @@ async function extractYouTubeTranscriptProgressive(sourceUrl, options = {}) {
     await setFlowStatus("前台提取未完成，后台继续尝试字幕读取...", false, "extract_background_continue");
   }
   const slowStartedAt = Date.now();
-  const slowResult = await extractYouTubeTranscriptForPageFlow(sourceUrlText, {
-    ...options,
-    allowMatchedTabContentScript: true
-  });
-  timings.extract_background_continue = Date.now() - slowStartedAt;
-  addLogs(slowResult, "slow_background_continue");
-  attempts.push({
-    stage: "slow_background_continue",
-    ok: hasTranscript(slowResult),
-    error: hasTranscript(slowResult) ? "" : String(slowResult?.error || "slow_background_extract_failed")
-  });
-  if (hasTranscript(slowResult)) {
-    return attachSuccessMetadata(slowResult, "slow_background_continue", matchedTab);
+  let slowResult = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (emitStatus) {
+      await setFlowStatus(`后台继续尝试当前页面 transcript 面板读取 (${attempt}/3)...`, false, "extract_background_continue");
+    }
+    slowResult = await extractYouTubeTranscriptViaDomPanelTab(matchedTab.id);
+    addLogs(slowResult, "slow_current_tab_panel");
+    attempts.push({
+      stage: "slow_current_tab_panel",
+      ok: hasTranscript(slowResult),
+      attempt,
+      error: hasTranscript(slowResult) ? "" : String(slowResult?.error || "slow_current_tab_panel_failed")
+    });
+    if (hasTranscript(slowResult)) {
+      timings.extract_background_continue = Date.now() - slowStartedAt;
+      return attachSuccessMetadata(slowResult, "slow_current_tab_panel", matchedTab);
+    }
+    await sleep(1200);
   }
+  timings.extract_background_continue = Date.now() - slowStartedAt;
 
   const finalResult = slowResult || contentResult || {};
   return {
