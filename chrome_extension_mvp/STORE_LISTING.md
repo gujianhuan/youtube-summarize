@@ -7,13 +7,17 @@
 
 ## 一句话简介
 
-- 从当前 YouTube 视频页提取 transcript，并一键发送到 ClipBrief AI 生成总结和来源核查。
+- 中文：从当前 YouTube 视频页提取 transcript，并一键发送到 ClipBrief AI 生成总结和来源核查。
+- English: Extract the transcript from the current YouTube video page and send it to ClipBrief AI for summaries and source checks.
 
-## 短描述
+## Chrome 商店短描述 / Short Description
 
-- 在 YouTube 视频页提取字幕文本，并发送到 ClipBrief AI 生成摘要和来源核查。
+- 中文：在 YouTube 视频页提取字幕文本，并发送到 ClipBrief AI 生成摘要和来源核查。
+- English: Extract YouTube transcripts from the current video page and send them to ClipBrief AI for summaries and source checks.
 
-## 详细描述
+## Chrome 商店详细描述 / Detailed Description
+
+### 中文
 
 ClipBrief AI 是一个面向 YouTube 视频页面的 transcript 提取与总结扩展，适合需要快速整理视频内容、复制字幕文本、或生成摘要与来源核查的使用场景。
 
@@ -31,6 +35,25 @@ ClipBrief AI 是一个面向 YouTube 视频页面的 transcript 提取与总结�
 - 做视频摘要的用户
 - 需要整理视频字幕内容的研究者
 - 需要快速把 YouTube 文稿送入自己工具链的开发者或运营人员
+
+### English
+
+ClipBrief AI is a Chrome extension for extracting transcripts from YouTube video pages and sending them to ClipBrief AI for summaries and source checks.
+
+What it does:
+
+- Reads available YouTube transcript text from the current video page
+- Shows clearer status when extraction fails or captions are unavailable
+- Lets you copy the extracted transcript
+- Sends the transcript to the ClipBrief AI web app for summary generation
+- Keeps the background flow running even if the popup is closed
+- Officially supports Chrome
+
+Best for:
+
+- People who summarize long YouTube videos
+- Researchers who need clean transcript text
+- Operators, creators, and developers who want to move YouTube transcripts into an AI workflow
 
 ## 建议截图文案
 

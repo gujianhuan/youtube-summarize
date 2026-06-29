@@ -42,7 +42,7 @@
 ### 3.1 基本信息
 - 名称：`ClipBrief AI`
 - 英文名：`ClipBrief AI`
-- 简短描述：`在 YouTube 视频页提取字幕文本，并发送到 ClipBrief AI 生成摘要和来源核查。`
+- 简短描述：`在 YouTube 视频页提取字幕文本，并发送到 ClipBrief AI 生成摘要和来源核查。 / Extract YouTube transcripts from the current video page and send them to ClipBrief AI for summaries and source checks.`
 
 ### 3.2 详细描述
 建议直接基于 `STORE_LISTING.md` 填写，至少覆盖这些点：
@@ -52,6 +52,7 @@
 - 支持一键发送到 ClipBrief AI 主站
 - 关闭弹窗后后台流程仍可继续
 - 当前正式支持 `Chrome`
+- 如果只维护一个默认语言版本，详细描述可使用中英文双语；如后续补 `_locales` 和 localized listing，再拆成中文页和英文页。
 
 ### 3.3 分类与可见性
 - 类别建议：`Productivity`
