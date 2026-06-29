@@ -42,7 +42,7 @@
 ### 3.1 基本信息
 - 名称：`ClipBrief AI`
 - 英文名：`ClipBrief AI`
-- 简短描述：`在 YouTube 视频页提取字幕文本，并发送到 ClipBrief AI 生成摘要和来源核查。 / Extract YouTube transcripts from the current video page and send them to ClipBrief AI for summaries and source checks.`
+- 简短描述：`YouTube 字幕提取与 AI 总结 / Extract YouTube transcripts for AI summaries.`
 
 ### 3.2 详细描述
 建议直接基于 `STORE_LISTING.md` 填写，至少覆盖这些点：

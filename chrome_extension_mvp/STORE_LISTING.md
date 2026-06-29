@@ -12,8 +12,7 @@
 
 ## Chrome 商店短描述 / Short Description
 
-- 中文：在 YouTube 视频页提取字幕文本，并发送到 ClipBrief AI 生成摘要和来源核查。
-- English: Extract YouTube transcripts from the current video page and send them to ClipBrief AI for summaries and source checks.
+- YouTube 字幕提取与 AI 总结 / Extract YouTube transcripts for AI summaries.
 
 ## Chrome 商店详细描述 / Detailed Description
 
