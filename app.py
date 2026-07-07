@@ -44,11 +44,13 @@ from core_logic import (
 
 # --- 常量定义 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SUBSCRIPTIONS_FILE = os.path.join(BASE_DIR, "subscriptions.json")
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
-GUESTBOOK_FILE = os.path.join(BASE_DIR, "guestbook.json")
-FEEDBACK_FILE = os.path.join(BASE_DIR, "feedback_reports.json")
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "subscriptions.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+GUESTBOOK_FILE = os.path.join(DATA_DIR, "guestbook.json")
+FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback_reports.json")
 BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
 
