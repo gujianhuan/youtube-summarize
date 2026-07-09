@@ -53,6 +53,9 @@ GUESTBOOK_FILE = os.path.join(DATA_DIR, "guestbook.json")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback_reports.json")
 BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
+UPSTASH_REDIS_REST_URL = str(os.environ.get("UPSTASH_REDIS_REST_URL", "") or "").strip().rstrip("/")
+UPSTASH_REDIS_REST_TOKEN = str(os.environ.get("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
+GUESTBOOK_REDIS_KEY = str(os.environ.get("GUESTBOOK_REDIS_KEY", "clipbrief:guestbook:v1") or "").strip()
 
 
 def _resolve_default_bridge_api_url() -> str:
@@ -1208,11 +1211,46 @@ def add_session_history_entry(source_type, video_url, summary_text, transcript_t
     save_session_history(history)
     return entry_id
 
+def _guestbook_upstash_enabled() -> bool:
+    return bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN and GUESTBOOK_REDIS_KEY)
+
+
+def _guestbook_upstash_command(command: list):
+    if not _guestbook_upstash_enabled():
+        return None
+    try:
+        response = requests.post(
+            UPSTASH_REDIS_REST_URL,
+            headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+            json=command,
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
 def load_guestbook():
+    payload = _guestbook_upstash_command(["GET", GUESTBOOK_REDIS_KEY])
+    if isinstance(payload, dict) and payload.get("result"):
+        try:
+            data = json.loads(str(payload.get("result") or "[]"))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
     return load_json_file(GUESTBOOK_FILE, [])
 
+
 def save_guestbook(guestbook):
-    save_json_file(GUESTBOOK_FILE, guestbook)
+    data = guestbook if isinstance(guestbook, list) else []
+    if _guestbook_upstash_enabled():
+        _guestbook_upstash_command(["SET", GUESTBOOK_REDIS_KEY, json.dumps(data, ensure_ascii=False)])
+    save_json_file(GUESTBOOK_FILE, data)
 
 
 def append_guestbook_message(content: str):
