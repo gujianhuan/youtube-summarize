@@ -331,6 +331,9 @@ UI_TEXTS = {
         "wish_wall_reply_placeholder": "可以补充细节、回应建议，或者给这条留言点个赞。",
         "wish_wall_reply_submit": "回复",
         "wish_wall_reply_success": "回复已发布。",
+        "wish_wall_like": "点赞 {count}",
+        "wish_wall_like_success": "已点赞。",
+        "wish_wall_replies_title": "回复",
         "wish_wall_admin_panel": "管理员维护",
         "wish_wall_admin_edit_label": "修改留言内容",
         "wish_wall_admin_save": "保存修改",
@@ -720,6 +723,9 @@ UI_TEXTS = {
         "wish_wall_reply_placeholder": "Add details, respond to the suggestion, or simply show support.",
         "wish_wall_reply_submit": "Reply",
         "wish_wall_reply_success": "Reply posted.",
+        "wish_wall_like": "Like {count}",
+        "wish_wall_like_success": "Liked.",
+        "wish_wall_replies_title": "Replies",
         "wish_wall_admin_panel": "Admin maintenance",
         "wish_wall_admin_edit_label": "Edit message content",
         "wish_wall_admin_save": "Save changes",
@@ -1284,6 +1290,23 @@ def append_guestbook_reply(message_id: str, reply_text: str) -> bool:
                 "content": str(reply_text or "").strip(),
             }
         )
+        updated = True
+        break
+    if updated:
+        save_guestbook(guestbook)
+    return updated
+
+
+def like_guestbook_message(message_id: str) -> bool:
+    guestbook = load_guestbook()
+    updated = False
+    for item in guestbook:
+        if str(item.get("id") or "") != str(message_id or ""):
+            continue
+        try:
+            item["likes"] = int(item.get("likes") or 0) + 1
+        except Exception:
+            item["likes"] = 1
         updated = True
         break
     if updated:
@@ -3151,6 +3174,26 @@ st.markdown(
     .wish-note-reply-count {
         color: #666;
         font-size: 0.83rem;
+    }
+
+    .wish-note-reply {
+        padding: 0.65rem 0.75rem;
+        margin: 0.45rem 0;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid rgba(15, 23, 42, 0.08);
+    }
+
+    .wish-note-reply-meta {
+        color: #15803d;
+        font-size: 0.78rem;
+        margin-bottom: 0.25rem;
+    }
+
+    .wish-note-reply-body {
+        color: #374151;
+        line-height: 1.55;
+        word-break: break-word;
     }
 
     .lite-settings-card {
@@ -5029,6 +5072,10 @@ def render_wish_wall_page(task_logs, task_runs, task_run_items):
         replies = msg.get("replies")
         if not isinstance(replies, list):
             replies = []
+        try:
+            likes = int(msg.get("likes") or 0)
+        except Exception:
+            likes = 0
         note_class = note_colors[idx % len(note_colors)]
         timestamp_text = str(msg.get("timestamp") or "")[:16].replace("T", " ")
         content_html = html.escape(str(msg.get("content") or "").strip() or t("wish_wall_blank_message")).replace("\n", "<br/>")
@@ -5046,27 +5093,41 @@ def render_wish_wall_page(task_logs, task_runs, task_run_items):
                 """,
                 unsafe_allow_html=True,
             )
-            with st.expander(t("wish_wall_view_reply"), expanded=False):
-                if replies:
-                    for reply in replies:
-                        reply_time = str(reply.get("timestamp") or "")[:16].replace("T", " ")
-                        st.markdown(f"**{t('wish_wall_reply_label')}** `{reply_time}`")
-                        st.write(str(reply.get("content") or ""))
-                else:
-                    st.caption(t("wish_wall_no_reply"))
-
-                with st.form(f"wish_reply_form_{msg.get('id')}", clear_on_submit=True):
-                    reply_text = st.text_area(
-                        t("wish_wall_reply_input"),
-                        height=90,
-                        placeholder=t("wish_wall_reply_placeholder"),
-                        key=f"wish_reply_text_{msg.get('id')}",
+            if replies:
+                st.markdown(f"**{t('wish_wall_replies_title')}**")
+                for reply in replies:
+                    reply_time = str(reply.get("timestamp") or "")[:16].replace("T", " ")
+                    reply_html = html.escape(str(reply.get("content") or "")).replace("\n", "<br/>")
+                    st.markdown(
+                        f"""
+                        <div class="wish-note-reply">
+                            <div class="wish-note-reply-meta">{html.escape(reply_time)}</div>
+                            <div class="wish-note-reply-body">{reply_html}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
                     )
-                    reply_submitted = st.form_submit_button(t("wish_wall_reply_submit"))
-                    if reply_submitted and reply_text.strip():
-                        append_guestbook_reply(str(msg.get("id") or ""), reply_text.strip())
-                        st.success(t("wish_wall_reply_success"))
-                        st.rerun()
+            else:
+                st.caption(t("wish_wall_no_reply"))
+
+            like_col, _ = st.columns([1, 2])
+            if like_col.button(t("wish_wall_like", count=likes), key=f"wish_like_{msg.get('id')}", use_container_width=True):
+                like_guestbook_message(str(msg.get("id") or ""))
+                st.success(t("wish_wall_like_success"))
+                st.rerun()
+
+            with st.form(f"wish_reply_form_{msg.get('id')}", clear_on_submit=True):
+                reply_text = st.text_area(
+                    t("wish_wall_reply_input"),
+                    height=90,
+                    placeholder=t("wish_wall_reply_placeholder"),
+                    key=f"wish_reply_text_{msg.get('id')}",
+                )
+                reply_submitted = st.form_submit_button(t("wish_wall_reply_submit"))
+                if reply_submitted and reply_text.strip():
+                    append_guestbook_reply(str(msg.get("id") or ""), reply_text.strip())
+                    st.success(t("wish_wall_reply_success"))
+                    st.rerun()
 
             if admin_mode:
                 with st.expander(t("wish_wall_admin_panel"), expanded=False):
