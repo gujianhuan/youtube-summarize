@@ -349,12 +349,10 @@ UI_TEXTS = {
         "lite_settings_advanced_caption": "当前运行流水线：`{pipeline}`。适合需要自定义 Key、接口地址或模型的用户。",
         "lite_settings_api_key_help": "填写后将优先使用你自己的 Key，且不受每日免费次数限制。",
         "lite_settings_summary_model": "总结模型",
-        "lite_settings_summary_model_help": "建议填写 deepseek-ai/DeepSeek-V4-Flash",
+        "lite_settings_summary_model_help": "填写供应商提供的模型 ID；NVIDIA NIM 可使用其模型目录中的完整 ID。",
         "lite_settings_fact_model": "新闻核查模型",
-        "lite_settings_fact_model_help": "建议填写 deepseek-ai/DeepSeek-V4-Flash",
-        "lite_settings_use_defaults": "一键切到 DeepSeek-V4-Flash",
+        "lite_settings_fact_model_help": "可与总结模型相同，也可以填写更适合检索核查的模型 ID。",
         "lite_settings_save_models": "保存模型设置",
-        "lite_settings_use_defaults_success": "已切换到 DeepSeek-V4-Flash。",
         "lite_settings_save_success": "模型设置已保存。",
         "lite_settings_diag_manage": "诊断与任务管理",
         "lite_settings_diag_manage_caption": "以下内容主要用于排查问题和维护站点，普通用户一般不需要展开。",
@@ -741,12 +739,10 @@ UI_TEXTS = {
         "lite_settings_advanced_caption": "Current pipeline: `{pipeline}`. Best for users who need custom keys, endpoints, or models.",
         "lite_settings_api_key_help": "If provided, your own API key is used first and daily free limits no longer apply.",
         "lite_settings_summary_model": "Summary Model",
-        "lite_settings_summary_model_help": "Recommended: deepseek-ai/DeepSeek-V4-Flash",
+        "lite_settings_summary_model_help": "Enter the model ID from your provider. For NVIDIA NIM, use the full model ID from its model catalog.",
         "lite_settings_fact_model": "Fact Check Model",
-        "lite_settings_fact_model_help": "Recommended: deepseek-ai/DeepSeek-V4-Flash",
-        "lite_settings_use_defaults": "Switch to DeepSeek-V4-Flash",
+        "lite_settings_fact_model_help": "Can match the summary model, or use another model better suited for source checking.",
         "lite_settings_save_models": "Save Model Settings",
-        "lite_settings_use_defaults_success": "Switched to DeepSeek-V4-Flash.",
         "lite_settings_save_success": "Model settings saved.",
         "lite_settings_diag_manage": "Diagnostics and Task Management",
         "lite_settings_diag_manage_caption": "The content below is mainly for troubleshooting and site maintenance. Most users do not need to expand it.",
@@ -3129,10 +3125,10 @@ st.markdown(
     }
 
     .wish-note {
-        min-height: 220px;
+        min-height: 160px;
         padding: 1rem 1rem 0.85rem 1rem;
-        border-radius: 18px;
-        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+        border-radius: 14px;
+        box-shadow: 0 10px 22px rgba(15, 23, 42, 0.07);
         margin-bottom: 1rem;
         border: 1px solid rgba(0, 0, 0, 0.05);
     }
@@ -3194,6 +3190,10 @@ st.markdown(
         color: #374151;
         line-height: 1.55;
         word-break: break-word;
+    }
+
+    .wish-wall-shell [data-testid="stForm"] {
+        border-radius: 14px;
     }
 
     .lite-settings-card {
@@ -5066,93 +5066,95 @@ def render_wish_wall_page(task_logs, task_runs, task_run_items):
         return
 
     note_colors = ["wish-note-yellow", "wish-note-pink", "wish-note-blue", "wish-note-green"]
-    wall_columns = st.columns(3)
-    for idx, msg in enumerate(guestbook):
-        col = wall_columns[idx % 3]
-        replies = msg.get("replies")
-        if not isinstance(replies, list):
-            replies = []
-        try:
-            likes = int(msg.get("likes") or 0)
-        except Exception:
-            likes = 0
-        note_class = note_colors[idx % len(note_colors)]
-        timestamp_text = str(msg.get("timestamp") or "")[:16].replace("T", " ")
-        content_html = html.escape(str(msg.get("content") or "").strip() or t("wish_wall_blank_message")).replace("\n", "<br/>")
-        with col:
-            st.markdown(
-                f"""
-                <div class="wish-note {note_class}">
-                    <div class="wish-note-head">
-                        <span>{html.escape(t("wish_wall_note_prefix"))} #{len(guestbook) - idx}</span>
-                        <span>{timestamp_text}</span>
-                    </div>
-                    <div class="wish-note-body">{content_html}</div>
-                    <div class="wish-note-reply-count">{html.escape(t("wish_wall_reply_count", count=len(replies)))}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if replies:
-                st.markdown(f"**{t('wish_wall_replies_title')}**")
-                for reply in replies:
-                    reply_time = str(reply.get("timestamp") or "")[:16].replace("T", " ")
-                    reply_html = html.escape(str(reply.get("content") or "")).replace("\n", "<br/>")
-                    st.markdown(
-                        f"""
-                        <div class="wish-note-reply">
-                            <div class="wish-note-reply-meta">{html.escape(reply_time)}</div>
-                            <div class="wish-note-reply-body">{reply_html}</div>
+    for row_start in range(0, len(guestbook), 3):
+        wall_columns = st.columns(3)
+        for offset, msg in enumerate(guestbook[row_start:row_start + 3]):
+            idx = row_start + offset
+            col = wall_columns[offset]
+            replies = msg.get("replies")
+            if not isinstance(replies, list):
+                replies = []
+            try:
+                likes = int(msg.get("likes") or 0)
+            except Exception:
+                likes = 0
+            note_class = note_colors[idx % len(note_colors)]
+            timestamp_text = str(msg.get("timestamp") or "")[:16].replace("T", " ")
+            content_html = html.escape(str(msg.get("content") or "").strip() or t("wish_wall_blank_message")).replace("\n", "<br/>")
+            with col:
+                st.markdown(
+                    f"""
+                    <div class="wish-note {note_class}">
+                        <div class="wish-note-head">
+                            <span>{html.escape(t("wish_wall_note_prefix"))} #{len(guestbook) - idx}</span>
+                            <span>{timestamp_text}</span>
                         </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.caption(t("wish_wall_no_reply"))
-
-            like_col, _ = st.columns([1, 2])
-            if like_col.button(t("wish_wall_like", count=likes), key=f"wish_like_{msg.get('id')}", use_container_width=True):
-                like_guestbook_message(str(msg.get("id") or ""))
-                st.success(t("wish_wall_like_success"))
-                st.rerun()
-
-            with st.form(f"wish_reply_form_{msg.get('id')}", clear_on_submit=True):
-                reply_text = st.text_area(
-                    t("wish_wall_reply_input"),
-                    height=90,
-                    placeholder=t("wish_wall_reply_placeholder"),
-                    key=f"wish_reply_text_{msg.get('id')}",
+                        <div class="wish-note-body">{content_html}</div>
+                        <div class="wish-note-reply-count">{html.escape(t("wish_wall_reply_count", count=len(replies)))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                reply_submitted = st.form_submit_button(t("wish_wall_reply_submit"))
-                if reply_submitted and reply_text.strip():
-                    append_guestbook_reply(str(msg.get("id") or ""), reply_text.strip())
-                    st.success(t("wish_wall_reply_success"))
+                if replies:
+                    st.markdown(f"**{t('wish_wall_replies_title')}**")
+                    for reply in replies:
+                        reply_time = str(reply.get("timestamp") or "")[:16].replace("T", " ")
+                        reply_html = html.escape(str(reply.get("content") or "")).replace("\n", "<br/>")
+                        st.markdown(
+                            f"""
+                            <div class="wish-note-reply">
+                                <div class="wish-note-reply-meta">{html.escape(reply_time)}</div>
+                                <div class="wish-note-reply-body">{reply_html}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.caption(t("wish_wall_no_reply"))
+
+                like_col, _ = st.columns([1, 2])
+                if like_col.button(t("wish_wall_like", count=likes), key=f"wish_like_{msg.get('id')}"):
+                    like_guestbook_message(str(msg.get("id") or ""))
+                    st.success(t("wish_wall_like_success"))
                     st.rerun()
 
-            if admin_mode:
-                with st.expander(t("wish_wall_admin_panel"), expanded=False):
-                    with st.form(f"wish_admin_form_{msg.get('id')}"):
-                        edited_content = st.text_area(
-                            t("wish_wall_admin_edit_label"),
-                            value=str(msg.get("content") or ""),
-                            height=120,
-                            key=f"wish_admin_edit_{msg.get('id')}",
-                        )
-                        save_col, delete_col = st.columns(2)
-                        save_clicked = save_col.form_submit_button(t("wish_wall_admin_save"), use_container_width=True)
-                        delete_clicked = delete_col.form_submit_button(
-                            t("wish_wall_admin_delete"),
-                            use_container_width=True,
-                            help=t("wish_wall_admin_delete_help"),
-                        )
-                        if save_clicked:
-                            update_guestbook_message(str(msg.get("id") or ""), edited_content)
-                            st.success(t("wish_wall_admin_save_success"))
-                            st.rerun()
-                        if delete_clicked:
-                            delete_guestbook_message(str(msg.get("id") or ""))
-                            st.success(t("wish_wall_admin_delete_success"))
-                            st.rerun()
+                with st.form(f"wish_reply_form_{msg.get('id')}", clear_on_submit=True):
+                    reply_text = st.text_area(
+                        t("wish_wall_reply_input"),
+                        height=90,
+                        placeholder=t("wish_wall_reply_placeholder"),
+                        key=f"wish_reply_text_{msg.get('id')}",
+                    )
+                    reply_submitted = st.form_submit_button(t("wish_wall_reply_submit"))
+                    if reply_submitted and reply_text.strip():
+                        append_guestbook_reply(str(msg.get("id") or ""), reply_text.strip())
+                        st.success(t("wish_wall_reply_success"))
+                        st.rerun()
+
+                if admin_mode:
+                    with st.expander(t("wish_wall_admin_panel"), expanded=False):
+                        with st.form(f"wish_admin_form_{msg.get('id')}"):
+                            edited_content = st.text_area(
+                                t("wish_wall_admin_edit_label"),
+                                value=str(msg.get("content") or ""),
+                                height=120,
+                                key=f"wish_admin_edit_{msg.get('id')}",
+                            )
+                            save_col, delete_col = st.columns(2)
+                            save_clicked = save_col.form_submit_button(t("wish_wall_admin_save"), use_container_width=True)
+                            delete_clicked = delete_col.form_submit_button(
+                                t("wish_wall_admin_delete"),
+                                use_container_width=True,
+                                help=t("wish_wall_admin_delete_help"),
+                            )
+                            if save_clicked:
+                                update_guestbook_message(str(msg.get("id") or ""), edited_content)
+                                st.success(t("wish_wall_admin_save_success"))
+                                st.rerun()
+                            if delete_clicked:
+                                delete_guestbook_message(str(msg.get("id") or ""))
+                                st.success(t("wish_wall_admin_delete_success"))
+                                st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -7556,31 +7558,7 @@ def render_lite_settings_page(current_bg_task_id, current_bg_task_status, task_s
                 value=str(st.session_state.settings.get("fact_check_model") or DEFAULT_FACT_CHECK_MODEL),
                 help=t("lite_settings_fact_model_help"),
             )
-            use_deepseek_defaults = st.form_submit_button(t("lite_settings_use_defaults"))
             save_model_settings = st.form_submit_button(t("lite_settings_save_models"), type="primary")
-
-        if use_deepseek_defaults:
-            updated_settings = dict(st.session_state.settings or {})
-            updated_settings["base_url"] = str(base_url_value or "").strip() or "https://api.siliconflow.cn/v1"
-            updated_settings["model"] = DEFAULT_SUMMARY_MODEL
-            updated_settings["summary_model"] = DEFAULT_SUMMARY_MODEL
-            updated_settings["fact_check_model"] = DEFAULT_FACT_CHECK_MODEL
-            st.session_state.settings = updated_settings
-            st.session_state.base_url = updated_settings["base_url"]
-            st.session_state.model = DEFAULT_SUMMARY_MODEL
-            st.session_state.summary_model = DEFAULT_SUMMARY_MODEL
-            st.session_state.fact_check_model = DEFAULT_FACT_CHECK_MODEL
-            st.session_state.last_saved_settings.update(
-                {
-                    "base_url": updated_settings["base_url"],
-                    "model": DEFAULT_SUMMARY_MODEL,
-                    "summary_model": DEFAULT_SUMMARY_MODEL,
-                    "fact_check_model": DEFAULT_FACT_CHECK_MODEL,
-                }
-            )
-            save_settings(updated_settings)
-            st.success(t("lite_settings_use_defaults_success"))
-            st.rerun()
 
         if save_model_settings:
             updated_settings = dict(st.session_state.settings or {})
