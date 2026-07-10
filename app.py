@@ -331,7 +331,7 @@ UI_TEXTS = {
         "wish_wall_reply_placeholder": "可以补充细节、回应建议，或者给这条留言点个赞。",
         "wish_wall_reply_submit": "回复",
         "wish_wall_reply_success": "回复已发布。",
-        "wish_wall_like": "点赞 {count}",
+        "wish_wall_like": "\u2661 {count}",
         "wish_wall_like_success": "已点赞。",
         "wish_wall_replies_title": "回复",
         "wish_wall_admin_panel": "管理员维护",
@@ -721,7 +721,7 @@ UI_TEXTS = {
         "wish_wall_reply_placeholder": "Add details, respond to the suggestion, or simply show support.",
         "wish_wall_reply_submit": "Reply",
         "wish_wall_reply_success": "Reply posted.",
-        "wish_wall_like": "Like {count}",
+        "wish_wall_like": "\u2661 {count}",
         "wish_wall_like_success": "Liked.",
         "wish_wall_replies_title": "Replies",
         "wish_wall_admin_panel": "Admin maintenance",
@@ -3120,24 +3120,37 @@ st.markdown(
 
     .wish-wall-shell {
         margin-top: 0.8rem;
+        padding-bottom: 1.5rem;
     }
 
     .wish-wall-intro {
-        padding: 1rem 1.1rem;
-        border-radius: 18px;
-        background: linear-gradient(180deg, #fffef7 0%, #fff9eb 100%);
-        border: 1px solid #f3e8c8;
-        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
-        margin-bottom: 1rem;
+        padding: 0.9rem 1.05rem;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #fffdf5 0%, #fff7df 100%);
+        border: 1px solid #f0e2bb;
+        box-shadow: 0 8px 18px rgba(15, 23, 42, 0.035);
+        margin-bottom: 0.85rem;
+        color: #5b4a1f;
+    }
+
+    .wish-wall-shell [data-testid="column"] {
+        display: flex;
+        align-items: stretch;
+    }
+
+    .wish-wall-shell [data-testid="column"] > div {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
     }
 
     .wish-note {
-        min-height: 160px;
-        padding: 1rem 1rem 0.85rem 1rem;
-        border-radius: 14px;
-        box-shadow: 0 10px 22px rgba(15, 23, 42, 0.07);
-        margin-bottom: 1rem;
-        border: 1px solid rgba(0, 0, 0, 0.05);
+        min-height: 132px;
+        padding: 0.9rem 0.95rem 0.7rem 0.95rem;
+        border-radius: 12px;
+        box-shadow: 0 7px 16px rgba(15, 23, 42, 0.055);
+        margin-bottom: 0.7rem;
+        border: 1px solid rgba(0, 0, 0, 0.045);
     }
 
     .wish-note-yellow {
@@ -3180,9 +3193,9 @@ st.markdown(
     }
 
     .wish-note-reply {
-        padding: 0.65rem 0.75rem;
-        margin: 0.45rem 0;
-        border-radius: 12px;
+        padding: 0.55rem 0.7rem;
+        margin: 0.35rem 0;
+        border-radius: 10px;
         background: rgba(255, 255, 255, 0.72);
         border: 1px solid rgba(15, 23, 42, 0.08);
     }
@@ -3200,7 +3213,58 @@ st.markdown(
     }
 
     .wish-wall-shell [data-testid="stForm"] {
-        border-radius: 14px;
+        border-radius: 12px;
+        border-color: #e8ebf0;
+        background: rgba(255, 255, 255, 0.72);
+        padding: 0.7rem 0.75rem;
+    }
+
+    .wish-wall-shell [data-testid="stButton"] {
+        margin-top: auto;
+        margin-bottom: 0.5rem;
+    }
+
+    .wish-wall-shell [data-testid="stButton"] button {
+        width: auto !important;
+        min-height: 2rem !important;
+        padding: 0.2rem 0.75rem !important;
+        border-radius: 999px !important;
+        border: 1px solid rgba(190, 24, 93, 0.18) !important;
+        background: rgba(255, 255, 255, 0.74) !important;
+        color: #be185d !important;
+        font-size: 0.84rem !important;
+        font-weight: 700 !important;
+        box-shadow: 0 2px 6px rgba(190, 24, 93, 0.08) !important;
+    }
+
+    .wish-wall-shell [data-testid="stButton"] button:hover {
+        border-color: rgba(190, 24, 93, 0.35) !important;
+        background: #fff1f6 !important;
+        color: #9d174d !important;
+    }
+
+    .wish-wall-shell [data-testid="stButton"] {
+        margin-top: auto;
+        margin-bottom: 0.5rem;
+    }
+
+    .wish-wall-shell [data-testid="stButton"] button {
+        width: auto !important;
+        min-height: 2rem !important;
+        padding: 0.2rem 0.75rem !important;
+        border-radius: 999px !important;
+        border: 1px solid rgba(190, 24, 93, 0.18) !important;
+        background: rgba(255, 255, 255, 0.74) !important;
+        color: #be185d !important;
+        font-size: 0.84rem !important;
+        font-weight: 700 !important;
+        box-shadow: 0 2px 6px rgba(190, 24, 93, 0.08) !important;
+    }
+
+    .wish-wall-shell [data-testid="stButton"] button:hover {
+        border-color: rgba(190, 24, 93, 0.35) !important;
+        background: #fff1f6 !important;
+        color: #9d174d !important;
     }
 
     .lite-settings-card {
