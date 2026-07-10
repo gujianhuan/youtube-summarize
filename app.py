@@ -99,8 +99,8 @@ def ensure_default_remote_transcribe_config() -> None:
 ensure_default_remote_transcribe_config()
 LEGACY_DEFAULT_SUMMARY_MODEL = "Pro/MiniMaxAI/MiniMax-M2.5"
 LEGACY_DEFAULT_FACT_CHECK_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-DEFAULT_SUMMARY_MODEL = "deepseek-ai/deepseek-v4-pro"
-DEFAULT_FACT_CHECK_MODEL = "deepseek-ai/deepseek-v4-pro"
+DEFAULT_SUMMARY_MODEL = "deepseek-ai/deepseek-v4-flash"
+DEFAULT_FACT_CHECK_MODEL = "deepseek-ai/deepseek-v4-flash"
 UI_DEFAULT_LOCALE = "zh"
 UI_TEXTS = {
     "zh": {
@@ -3452,6 +3452,7 @@ if "available_models" not in st.session_state:
         "gpt-3.5-turbo",
         "gpt-4o",
         "gpt-4-turbo",
+        "deepseek-ai/deepseek-v4-flash",
         "deepseek-ai/deepseek-v4-pro",
         "deepseek-ai/DeepSeek-V4-Flash",
         "deepseek-chat",

@@ -7446,6 +7446,13 @@ def _extract_completion_content(raw_resp) -> str:
     return ""
 
 
+def _omit_json_response_format(model: str, base_url: str) -> bool:
+    return (
+        "integrate.api.nvidia.com" in str(base_url or "").lower()
+        and str(model or "").strip().lower() == "deepseek-ai/deepseek-v4-flash"
+    )
+
+
 def _extract_summary_markdown(raw_text: str) -> str:
     payload = _parse_summary_payload(raw_text)
     if isinstance(payload, dict):
@@ -7460,17 +7467,19 @@ def _extract_summary_markdown(raw_text: str) -> str:
     return str(raw_text or "").strip()
 
 
-def _summarize_document_passage(client, model: str, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
-    response = client.chat.completions.create(
-        model=model.strip() or "gpt-3.5-turbo",
-        messages=[
+def _summarize_document_passage(client, model: str, system_prompt: str, user_prompt: str, max_tokens: int, base_url: str = "") -> str:
+    request_kwargs = {
+        "model": model.strip() or "gpt-3.5-turbo",
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }
+    if not _omit_json_response_format(model, base_url):
+        request_kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**request_kwargs)
     content = _extract_completion_content(response)
     if not content:
         raise RuntimeError("模型未返回有效总结内容。")
@@ -7529,6 +7538,7 @@ def summarize_document_text(
             direct_system_prompt,
             prompt,
             max_tokens=2200,
+            base_url=base_url,
         )
         if callable(progress_callback):
             progress_callback(100, "Document summary completed." if _is_english_output_locale(ui_locale) else "文档总结完成。")
@@ -7586,6 +7596,7 @@ def summarize_document_text(
             ),
             chunk_prompt,
             max_tokens=1000,
+            base_url=base_url,
         )
         chunk_summaries.append(
             (
@@ -7634,6 +7645,7 @@ def summarize_document_text(
         direct_system_prompt,
         merge_prompt,
         max_tokens=2500,
+        base_url=base_url,
     )
     if callable(progress_callback):
         progress_callback(100, "Long document summary completed." if _is_english_output_locale(ui_locale) else "长文档总结完成。")
@@ -8633,17 +8645,19 @@ def summarize_text(
         for candidate_model in summary_model_candidates:
             active_summary_model = candidate_model
             try:
-                response = client.chat.completions.create(
-                    model=candidate_model,
-                    messages=[
+                request_kwargs = {
+                    "model": candidate_model,
+                    "messages": [
                         {"role": "system", "content": _build_video_summary_system_prompt(ui_locale)},
                         {"role": "user", "content": prompt},
                     ],
-                    temperature=0.2,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"},
-                    stream=stream,
-                )
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                    "stream": stream,
+                }
+                if not _omit_json_response_format(candidate_model, base_url):
+                    request_kwargs["response_format"] = {"type": "json_object"}
+                response = client.chat.completions.create(**request_kwargs)
                 break
             except Exception as summary_exc:
                 summary_errors.append(f"{candidate_model}: {summary_exc}")
@@ -8671,9 +8685,9 @@ def summarize_text(
         if not normalized_payload:
             try:
                 repair_prompt = _build_video_summary_repair_prompt(content_str, ui_locale=ui_locale)
-                repair_resp = client.chat.completions.create(
-                    model=active_summary_model,
-                    messages=[
+                repair_kwargs = {
+                    "model": active_summary_model,
+                    "messages": [
                         {
                             "role": "system",
                             "content": (
@@ -8684,10 +8698,12 @@ def summarize_text(
                         },
                         {"role": "user", "content": repair_prompt},
                     ],
-                    response_format={"type": "json_object"},
-                    max_tokens=min(2200, max_tokens),
-                    temperature=0.1,
-                )
+                    "max_tokens": min(2200, max_tokens),
+                    "temperature": 0.1,
+                }
+                if not _omit_json_response_format(active_summary_model, base_url):
+                    repair_kwargs["response_format"] = {"type": "json_object"}
+                repair_resp = client.chat.completions.create(**repair_kwargs)
                 repair_content = _extract_completion_content(repair_resp)
                 normalized_payload = _normalize_summary_payload(_parse_summary_payload(repair_content), ui_locale=ui_locale)
             except Exception as repair_exc:
