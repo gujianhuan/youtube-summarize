@@ -1087,13 +1087,20 @@ def _looks_like_siliconflow_base_url(base_url_value: str) -> bool:
     return "siliconflow" in lowered
 
 
-def _remap_siliconflow_legacy_model(model_value: str, fallback_value: str) -> str:
+def _looks_like_nvidia_nim_base_url(base_url_value: str) -> bool:
+    lowered = str(base_url_value or "").strip().lower()
+    return "integrate.api.nvidia.com" in lowered
+
+
+def _remap_provider_legacy_model(model_value: str, fallback_value: str) -> str:
     model_text = str(model_value or "").strip()
     if not model_text:
         return str(fallback_value or "").strip()
     legacy_map = {
         LEGACY_DEFAULT_SUMMARY_MODEL: DEFAULT_SUMMARY_MODEL,
         LEGACY_DEFAULT_FACT_CHECK_MODEL: DEFAULT_FACT_CHECK_MODEL,
+        "deepseek-ai/DeepSeek-V4-Flash": DEFAULT_SUMMARY_MODEL,
+        "deepseek-ai/deepseek-v4-pro": DEFAULT_SUMMARY_MODEL,
     }
     return legacy_map.get(model_text, model_text)
 
@@ -1109,7 +1116,7 @@ def resolve_pipeline_models(
     legacy_model = str(settings_dict.get("model") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
     default_summary_model = legacy_model
     default_fact_check_model = legacy_model
-    if _looks_like_siliconflow_base_url(base_url_value):
+    if _looks_like_siliconflow_base_url(base_url_value) or _looks_like_nvidia_nim_base_url(base_url_value):
         default_summary_model = DEFAULT_SUMMARY_MODEL
         default_fact_check_model = DEFAULT_FACT_CHECK_MODEL
 
@@ -1124,17 +1131,17 @@ def resolve_pipeline_models(
         or str(settings_dict.get("fact_check_model") or "").strip()
         or default_fact_check_model
     )
-    if _looks_like_siliconflow_base_url(base_url_value):
-        summary_model = _remap_siliconflow_legacy_model(summary_model, DEFAULT_SUMMARY_MODEL)
-        fact_check_model = _remap_siliconflow_legacy_model(fact_check_model, DEFAULT_FACT_CHECK_MODEL)
+    if _looks_like_siliconflow_base_url(base_url_value) or _looks_like_nvidia_nim_base_url(base_url_value):
+        summary_model = _remap_provider_legacy_model(summary_model, DEFAULT_SUMMARY_MODEL)
+        fact_check_model = _remap_provider_legacy_model(fact_check_model, DEFAULT_FACT_CHECK_MODEL)
     return summary_model, fact_check_model
 
 
 def normalize_persisted_pipeline_settings(settings_dict: dict | None = None) -> dict:
-    """把 SiliconFlow 下的历史默认模型名归一为当前默认值，避免显示与实际运行不一致。"""
+    """把供应商历史默认模型名归一为当前默认值，避免显示与实际运行不一致。"""
     settings_dict = dict(settings_dict or {})
     base_url_value = str(settings_dict.get("base_url") or "").strip()
-    if not _looks_like_siliconflow_base_url(base_url_value):
+    if not (_looks_like_siliconflow_base_url(base_url_value) or _looks_like_nvidia_nim_base_url(base_url_value)):
         return settings_dict
 
     normalized_summary, normalized_fact_check = resolve_pipeline_models(
