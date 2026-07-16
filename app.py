@@ -55,7 +55,16 @@ BRIDGE_COMPONENT_DIR = os.path.join(BASE_DIR, "bridge_component")
 BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
 UPSTASH_REDIS_REST_URL = str(os.environ.get("UPSTASH_REDIS_REST_URL", "") or "").strip().rstrip("/")
 UPSTASH_REDIS_REST_TOKEN = str(os.environ.get("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
-GUESTBOOK_REDIS_KEY = str(os.environ.get("GUESTBOOK_REDIS_KEY", "clipbrief:guestbook:v1") or "").strip()
+GUESTBOOK_REDIS_KEY = str(os.environ.get("GUESTBOOK_REDIS_KEY", "clipbrief:guestbook:v2") or "").strip()
+DEFAULT_GUESTBOOK = [
+    {
+        "id": "clipbrief-welcome",
+        "timestamp": "2026-07-16T00:00:00",
+        "content": "欢迎使用 ClipBrief AI，欢迎分享你的使用感受和改进建议。",
+        "likes": 0,
+        "replies": [],
+    }
+]
 
 
 def _resolve_default_bridge_api_url() -> str:
@@ -1252,7 +1261,7 @@ def load_guestbook():
                 return data
         except Exception:
             pass
-    return load_json_file(GUESTBOOK_FILE, [])
+    return load_json_file(GUESTBOOK_FILE, DEFAULT_GUESTBOOK)
 
 
 def save_guestbook(guestbook):
@@ -5928,11 +5937,6 @@ def render_video_processing_tab():
     if st.session_state.get("video_extension_request_pending"):
         reset_video_extension_request_state(clear_result=True)
         st.info("已停止主站远程等待插件响应。请打开目标 YouTube 视频页后直接点击插件。")
-
-    st.markdown(
-        '<div class="lite-home-helper">主站已关闭 YouTube 链接输入抓取；普通用户只走插件当前页提取，避免 Render IP 触发 YouTube 限流。</div>',
-        unsafe_allow_html=True,
-    )
 
     render_video_summary_section()
     render_video_transcript_section()
