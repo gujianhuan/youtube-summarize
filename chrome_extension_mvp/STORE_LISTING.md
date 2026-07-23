@@ -2,71 +2,69 @@
 
 ## 扩展名称建议
 
-- 中文名：ClipBrief AI
+- 中文名：ClipBrief AI - YouTube 视频中文总结
 - 英文名：ClipBrief AI
 
 ## 一句话简介
 
-- 中文：从当前 YouTube 视频页提取 transcript，并一键发送到 ClipBrief AI 生成总结和来源核查。
+- 中文：把 YouTube 长视频变成中文核心要点和来源核查。
 - English: Extract the transcript from the current YouTube video page and send it to ClipBrief AI for summaries and source checks.
 
 ## Chrome 商店短描述 / Short Description
 
-- YouTube 字幕提取与 AI 总结 / Extract YouTube transcripts for AI summaries.
+- YouTube 视频中文总结与来源核查 / Turn YouTube videos into concise, source-aware briefs.
 
 ## Chrome 商店详细描述 / Detailed Description
 
 ### 中文
 
-ClipBrief AI 是一个面向 YouTube 视频页面的 transcript 提取与总结扩展，适合需要快速整理视频内容、复制字幕文本、或生成摘要与来源核查的使用场景。
+ClipBrief AI 帮你把 YouTube 长视频整理成可读的中文核心结论和来源核查，适合跟踪海外 AI、产品、创业和商业内容的人。
 
 主要能力：
 
-- 自动尝试读取 YouTube 页面可用字幕
-- 提取失败时提供更清晰的状态提示
-- 支持复制文本
-- 支持一键发送到 ClipBrief AI 主站
+- 在当前 YouTube 页面一键读取可用字幕
+- 生成结构化中文要点，先读结论再决定是否看完整视频
+- 对需要确认的说法单独提供来源核查入口
+- 支持复制 transcript 和可分享的结果摘要
 - 关闭弹窗后后台流程仍可继续
-- 当前正式支持 Chrome
 
 适合人群：
 
-- 做视频摘要的用户
-- 需要整理视频字幕内容的研究者
-- 需要快速把 YouTube 文稿送入自己工具链的开发者或运营人员
+- 跟踪海外 AI、产品和商业视频的人
+- 需要把长访谈快速变成中文决策笔记的人
+- 需要整理视频字幕并保留来源线索的研究者、开发者和运营人员
 
 ### English
 
-ClipBrief AI is a Chrome extension for extracting transcripts from YouTube video pages and sending them to ClipBrief AI for summaries and source checks.
+ClipBrief AI turns long YouTube videos into concise, source-aware briefs. It is built for people who follow AI, product, startup, and business conversations.
 
 What it does:
 
 - Reads available YouTube transcript text from the current video page
-- Shows clearer status when extraction fails or captions are unavailable
-- Lets you copy the extracted transcript
-- Sends the transcript to the ClipBrief AI web app for summary generation
+- Produces structured takeaways so you can decide what deserves your time
+- Separates source checks from the main brief when claims need verification
+- Lets you copy the transcript and a share-ready result
 - Keeps the background flow running even if the popup is closed
-- Officially supports Chrome
 
 Best for:
 
-- People who summarize long YouTube videos
-- Researchers who need clean transcript text
-- Operators, creators, and developers who want to move YouTube transcripts into an AI workflow
+- People tracking AI, product, startup, and business conversations
+- Researchers who need a readable brief with source cues
+- Operators, creators, and developers who turn video research into decisions
 
 ## 建议截图文案
 
 - 截图 1：插件弹窗首页
-  - 文案：一键提取 YouTube 字幕
+  - 文案：一键把 YouTube 长视频变成中文要点
 
 - 截图 2：提取成功状态
   - 文案：提取后可直接复制或一键总结
 
 - 截图 3：后台发送状态
-  - 文案：关闭弹窗也不影响发送到主站
+  - 文案：字幕已发送，正在生成可读结论
 
 - 截图 4：主站总结页
-  - 文案：字幕自动发送到总结主站
+  - 文案：核心结论与来源核查分开阅读
 
 ## 隐私说明建议
 

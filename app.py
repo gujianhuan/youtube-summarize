@@ -56,6 +56,9 @@ BRIDGE_STORAGE_PREFIX = "yt_summary_bridge:"
 UPSTASH_REDIS_REST_URL = str(os.environ.get("UPSTASH_REDIS_REST_URL", "") or "").strip().rstrip("/")
 UPSTASH_REDIS_REST_TOKEN = str(os.environ.get("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
 GUESTBOOK_REDIS_KEY = str(os.environ.get("GUESTBOOK_REDIS_KEY", "clipbrief:guestbook:v2") or "").strip()
+GROWTH_METRICS_REDIS_KEY = str(os.environ.get("GROWTH_METRICS_REDIS_KEY", "clipbrief:growth:v1") or "").strip()
+GROWTH_METRICS_FILE = os.path.join(DATA_DIR, "growth_metrics.json")
+CHROME_WEB_STORE_URL = "https://chromewebstore.google.com/detail/youtube-transcript-helper/mhfokbdjfongbblejjgafmkmnnepocej"
 DEFAULT_GUESTBOOK = [
     {
         "id": "clipbrief-welcome",
@@ -1269,6 +1272,86 @@ def save_guestbook(guestbook):
     if _guestbook_upstash_enabled():
         _guestbook_upstash_command(["SET", GUESTBOOK_REDIS_KEY, json.dumps(data, ensure_ascii=False)])
     save_json_file(GUESTBOOK_FILE, data)
+
+
+def _growth_source() -> str:
+    source = str(st.query_params.get("utm_source", "") or "direct").strip().lower()
+    return source if re.fullmatch(r"[a-z0-9_-]{1,32}", source) else "direct"
+
+
+def record_growth_event(event: str) -> None:
+    """Count anonymous funnel events without storing user identity or content."""
+    event_name = str(event or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,48}", event_name):
+        return
+    session_key = f"growth_event_{event_name}"
+    if st.session_state.get(session_key):
+        return
+    st.session_state[session_key] = True
+    source = _growth_source()
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN and GROWTH_METRICS_REDIS_KEY:
+        try:
+            for field in (event_name, f"{event_name}:{source}"):
+                requests.post(
+                    UPSTASH_REDIS_REST_URL,
+                    headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+                    json=["HINCRBY", GROWTH_METRICS_REDIS_KEY, field, 1],
+                    timeout=4,
+                ).raise_for_status()
+            return
+        except Exception:
+            pass
+    metrics = load_json_file(GROWTH_METRICS_FILE, {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    for field in (event_name, f"{event_name}:{source}"):
+        metrics[field] = int(metrics.get(field) or 0) + 1
+    save_json_file(GROWTH_METRICS_FILE, metrics)
+
+
+def load_growth_metrics() -> dict:
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN and GROWTH_METRICS_REDIS_KEY:
+        try:
+            response = requests.post(
+                UPSTASH_REDIS_REST_URL,
+                headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+                json=["HGETALL", GROWTH_METRICS_REDIS_KEY],
+                timeout=4,
+            )
+            response.raise_for_status()
+            result = response.json().get("result") or {}
+            if isinstance(result, dict):
+                return {str(key): int(value or 0) for key, value in result.items()}
+        except Exception:
+            pass
+    metrics = load_json_file(GROWTH_METRICS_FILE, {})
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def render_growth_metrics() -> None:
+    metrics = load_growth_metrics()
+    st.caption("仅统计匿名事件，不记录用户身份、视频链接或字幕内容。渠道归因使用 URL 中的 `utm_source`。")
+    labels = [
+        ("主页访问", "home_view"),
+        ("结果预览", "sample_view"),
+        ("开始使用", "sample_to_product"),
+        ("扩展提取成功", "extension_transcript_received"),
+        ("总结完成", "summary_completed"),
+    ]
+    columns = st.columns(len(labels))
+    for column, (label, key) in zip(columns, labels):
+        column.metric(label, int(metrics.get(key) or 0))
+
+
+def build_share_text(summary_text: str, source_url: str = "") -> str:
+    summary_md, _fact_check_md = _parse_summary_for_ui(summary_text)
+    excerpt = (summary_md or str(summary_text or "")).strip()
+    if len(excerpt) > 3000:
+        excerpt = f"{excerpt[:3000].rstrip()}\n\n（完整内容见 ClipBrief AI）"
+    footer = "\n\n由 ClipBrief AI 整理：把 YouTube 长视频变成可读的中文要点。"
+    if source_url:
+        footer = f"\n\n原视频：{source_url}{footer}"
+    return f"{excerpt}{footer}".strip()
 
 
 def append_guestbook_message(content: str):
@@ -3373,6 +3456,44 @@ st.markdown(
         font-size: 0.92rem;
         color: #5f6368;
     }
+
+    .growth-sample-shell {
+        max-width: 920px;
+        margin: 1.25rem auto 2rem;
+    }
+
+    .growth-sample-hero {
+        padding: 2.1rem 2rem;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        background: #111827;
+        color: #f9fafb;
+        margin-bottom: 0.9rem;
+    }
+
+    .growth-sample-hero h1 {
+        margin: 0.25rem 0 0.65rem;
+        color: #ffffff !important;
+        font-size: 2.05rem !important;
+    }
+
+    .growth-sample-hero p {
+        max-width: 700px;
+        margin: 0;
+        color: #d1d5db;
+        line-height: 1.7;
+    }
+
+    .growth-eyebrow {
+        color: #fca5a5 !important;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+    }
+
+    .growth-sample-actions {
+        margin-top: 1rem;
+    }
     
     @media (max-width: 900px) {
         .block-container {
@@ -3677,6 +3798,7 @@ if ext_payload_id and st.session_state.manual_last_payload_id != ext_payload_id 
 
 if ext_payload_id and ext_transcript and st.session_state.manual_last_payload_id != ext_payload_id:
     st.session_state.last_transcript_acquisition_path = "extension_bridge_payload"
+    record_growth_event("extension_transcript_received")
     st.session_state.manual_source_url = ext_source_url
     st.session_state.manual_transcript_text = ext_transcript
     st.session_state.manual_summary_text = ""
@@ -3708,6 +3830,7 @@ if video_extension_payload_id and video_extension_payload_id != video_extension_
     video_bridge_transcript = str(normalized_video_bridge_payload.get("transcript_text") or "").strip()
     if video_bridge_transcript:
         st.session_state.last_transcript_acquisition_path = "extension_bridge_payload"
+        record_growth_event("extension_transcript_received")
         st.session_state.video_fact_check_task_id = ""
         st.session_state.video_fact_check_status = "idle"
         st.session_state.video_fact_check_error = ""
@@ -3783,6 +3906,7 @@ def render_privacy_policy_page():
 - 将 transcript 发送到总结服务，用于生成摘要、要点整理和事实核查
 - 展示任务状态、处理结果和错误提示
 - 改善扩展和主站的稳定性与用户体验
+- 记录不包含身份或内容的匿名产品漏斗计数，例如公开样例页浏览和首次总结完成
 
 ### 数据共享
 
@@ -3828,6 +3952,60 @@ def render_privacy_policy_page():
 
 if page_param in {"privacy", "privacy-policy"}:
     render_privacy_policy_page()
+    st.stop()
+
+
+def render_public_sample_page():
+    record_growth_event("sample_view")
+    st.markdown("<div class='growth-sample-shell'>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class='growth-sample-hero'>
+          <p class='growth-eyebrow'>CLIPBRIEF AI / RESULT PREVIEW</p>
+          <h1>先读完核心结论，再决定要不要看完视频</h1>
+          <p>这是一份结构化结果预览：把一段长视频整理成可转发的中文要点，并将需要核查的说法单独标出来。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption("此页展示报告结构与表达方式，不对应某一条实时视频结论。推广时请替换为当天真实生成的报告。")
+    with st.container(border=True):
+        st.markdown("### 示例报告：海外 AI 产品访谈")
+        st.markdown(
+            """
+**一句话结论**：真正值得持续跟踪的不是模型参数，而是产品是否把 AI 放进高频、可验证的工作流。
+
+**3 个值得带走的判断**
+
+1. 用户不为“更聪明的模型”付费，而为更少的重复操作和更快的决策付费。
+2. 先解决一个具体场景，比同时服务所有看视频的人更容易获得复用和转介绍。
+3. 访谈中的数据、市场规模和竞争判断需要保留来源，不能直接当成事实引用。
+
+**下一步行动**
+
+- 只选择一个视频主题连续追踪两周，例如海外 AI 产品、创业或商业访谈。
+- 把每次结果沉淀成可分享摘要，而不是只留在个人浏览记录里。
+- 对关键数字和结论保留原视频链接及外部来源核查。
+
+**来源核查提示**
+
+访谈嘉宾的个人判断与可验证事实应分开阅读；需要决策时，优先点击来源再确认。
+            """
+        )
+    st.markdown("<div class='growth-sample-actions'>", unsafe_allow_html=True)
+    col_try, col_store = st.columns(2)
+    with col_try:
+        if st.button("用我的视频生成总结", type="primary", use_container_width=True, key="sample_try_video"):
+            record_growth_event("sample_to_product")
+            st.query_params.clear()
+            st.rerun()
+    with col_store:
+        st.link_button("安装 Chrome 扩展", CHROME_WEB_STORE_URL, use_container_width=True)
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+
+if page_param in {"sample", "example", "demo"}:
+    render_public_sample_page()
     st.stop()
 
 # --- 主界面 ---
@@ -5359,6 +5537,7 @@ def do_video_summary_single(
         f"duration={sum_duration:.2f}"
     , flush=True)
     st.session_state[summary_state_key] = summary
+    record_growth_event("summary_completed")
     if not manual:
         _update_current_processing_task(
             url=str(url or "").strip(),
@@ -5832,6 +6011,12 @@ def render_video_summary_section(
 
     _render_video_summary_fragment()
 
+    render_copy_to_clipboard_button(
+        "复制可分享摘要",
+        build_share_text(summary_value, st.session_state.get("current_video_url") or ""),
+        f"share_{summary_state_key}",
+    )
+
     # 当前模式已关闭音频下载/Whisper 转写兜底，不再展示相关脚注。
 
 
@@ -5866,6 +6051,12 @@ def render_manual_video_summary_section(
 
     _render_manual_video_summary_fragment()
 
+    render_copy_to_clipboard_button(
+        "复制可分享摘要",
+        build_share_text(summary_value, st.session_state.get("manual_source_url") or ""),
+        f"share_{summary_state_key}",
+    )
+
 
 def render_video_transcript_section():
     """
@@ -5897,11 +6088,12 @@ def render_video_processing_tab():
     """
     渲染视频处理入口，包括抓取字幕、异步处理、字幕检测和结果展示。
     """
+    record_growth_event("home_view")
     st.markdown(
         f"""
         <div class="lite-home-hero">
             <h1>{html.escape(t("hero_title"))}</h1>
-            <p>{html.escape(t("hero_desc"))}</p>
+            <p>把一段 YouTube 长视频整理成中文核心结论和来源核查，先读结果，再决定是否投入时间看完整内容。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -5912,18 +6104,19 @@ def render_video_processing_tab():
         st.markdown(
             f"""
             <div class="lite-entry-card">
-                <div class="lite-entry-card-title">{html.escape(t("home_path_plugin_title"))}</div>
-                <p class="lite-entry-card-desc">{html.escape(t("home_path_plugin_desc"))}</p>
+                <div class="lite-entry-card-title">看一份真实结果应该长什么样</div>
+                <p class="lite-entry-card-desc">先看结构化中文要点、行动建议和来源核查的呈现方式，再决定是否安装。</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        st.link_button("查看结果预览", "?page=sample", use_container_width=True)
     with path_col2:
         st.markdown(
             f"""
             <div class="lite-entry-card">
-                <div class="lite-entry-card-title">{html.escape(t("home_path_result_title"))}</div>
-                <p class="lite-entry-card-desc">{html.escape(t("home_path_result_desc"))}</p>
+                <div class="lite-entry-card-title">从当前 YouTube 视频开始</div>
+                <p class="lite-entry-card-desc">打开目标视频后点击 ClipBrief AI 扩展，成功提取字幕后会自动回到这里生成总结。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -7670,6 +7863,9 @@ def render_lite_settings_page(current_bg_task_id, current_bg_task_status, task_s
             st.rerun()
 
     if is_admin_user():
+        with st.expander("增长漏斗", expanded=False):
+            render_growth_metrics()
+
         with st.expander(t("lite_settings_diag_manage"), expanded=False):
             st.caption(t("lite_settings_diag_manage_caption"))
             render_settings_diagnostics_page(
