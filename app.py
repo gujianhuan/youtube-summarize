@@ -6093,7 +6093,7 @@ def render_video_processing_tab():
         f"""
         <div class="lite-home-hero">
             <h1>{html.escape(t("hero_title"))}</h1>
-            <p>把一段 YouTube 长视频整理成中文核心结论和来源核查，先读结果，再决定是否投入时间看完整内容。</p>
+            <p style="max-width: 720px;">把一段 YouTube 长视频整理成中文核心结论和来源核查，先读结果，再决定是否投入时间看完整内容。</p>
         </div>
         """,
         unsafe_allow_html=True,
