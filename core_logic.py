@@ -3414,6 +3414,12 @@ AUTHORITATIVE_SOURCE_RULES = [
         "aliases": ["axios"],
     },
     {
+        "label": "半岛电视台",
+        "url": "https://www.aljazeera.com/",
+        "aliases": ["半岛电视台", "半島電視台", "al jazeera", "aljazeera"],
+        "query_terms": ["Al Jazeera Iran Strait of Hormuz"],
+    },
+    {
         "label": "CNBC",
         "url": "https://www.cnbc.com/",
         "aliases": ["cnbc"],
@@ -4368,57 +4374,64 @@ def _fetch_bing_news_results(query: str, proxy_url: str = None, max_items: int =
     return items
 
 
+def _google_news_feed_urls(query: str) -> list[str]:
+    query_text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query_text:
+        return []
+    locales = [("en-US", "US", "US:en")]
+    if re.search(r"[\u4e00-\u9fff]", query_text):
+        locales.insert(0, ("zh-TW", "TW", "TW:zh-Hant"))
+    return [
+        f"https://news.google.com/rss/search?q={quote(query_text)}&hl={hl}&gl={gl}&ceid={ceid}"
+        for hl, gl, ceid in locales
+    ]
+
+
 def _fetch_google_news_results(query: str, proxy_url: str = None, max_items: int = 4) -> list[dict]:
     query_text = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query_text or max_items <= 0:
         return []
 
-    feed_url = f"https://news.google.com/rss/search?q={quote(query_text)}&hl=en-US&gl=US&ceid=US:en"
-    try:
-        import xml.etree.ElementTree as ET
-
-        response = requests.get(
-            feed_url,
-            headers=_build_article_headers(feed_url),
-            **_build_requests_kwargs(proxy_url, timeout_seconds=6.0),
-        )
-        response.raise_for_status()
-        root = ET.fromstring(response.text)
-    except Exception:
-        return []
-
     items: list[dict] = []
     seen_urls: set[str] = set()
-    for item in root.findall(".//item"):
-        title = _strip_html_tags(item.findtext("title", default=""))
-        link = _decode_google_news_url(str(item.findtext("link", default="") or "").strip(), proxy_url=proxy_url)
-        description = _strip_html_tags(item.findtext("description", default=""))
-        pub_date = _strip_html_tags(item.findtext("pubDate", default=""))
-        source_name = ""
+    for feed_url in _google_news_feed_urls(query_text):
+        try:
+            import xml.etree.ElementTree as ET
 
-        source_node = item.find("source")
-        if source_node is not None:
-            source_name = _strip_html_tags(source_node.text or "")
-            source_url = str(source_node.get("url") or "").strip()
-        else:
-            source_url = ""
-
-        normalized_link = _normalize_fact_check_source_url(link)
-        if not title or not link or not normalized_link or normalized_link in seen_urls:
+            response = requests.get(
+                feed_url,
+                headers=_build_article_headers(feed_url),
+                **_build_requests_kwargs(proxy_url, timeout_seconds=6.0),
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+        except Exception:
             continue
-        seen_urls.add(normalized_link)
-        items.append(
-            {
-                "title": title,
-                "url": link,
-                "source": source_name,
-                "source_url": source_url,
-                "snippet": description,
-                "published_at": pub_date,
-            }
-        )
-        if len(items) >= max_items:
-            break
+
+        for item in root.findall(".//item"):
+            title = _strip_html_tags(item.findtext("title", default=""))
+            link = _decode_google_news_url(str(item.findtext("link", default="") or "").strip(), proxy_url=proxy_url)
+            description = _strip_html_tags(item.findtext("description", default=""))
+            pub_date = _strip_html_tags(item.findtext("pubDate", default=""))
+            source_node = item.find("source")
+            source_name = _strip_html_tags(source_node.text or "") if source_node is not None else ""
+            source_url = str(source_node.get("url") or "").strip() if source_node is not None else ""
+            normalized_link = _normalize_fact_check_source_url(link)
+            if not title or not link or not normalized_link or normalized_link in seen_urls:
+                continue
+            seen_urls.add(normalized_link)
+            items.append(
+                {
+                    "title": title,
+                    "url": link,
+                    "source": source_name,
+                    "source_url": source_url,
+                    "snippet": description,
+                    "published_at": pub_date,
+                }
+            )
+            if len(items) >= max_items:
+                return items
     return items
 
 
@@ -5359,7 +5372,11 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
     ),
     (
         re.compile(r"(伊朗|iran|hormuz|霍尔木兹|核协议|nuclear deal|谈判|sanctions)", re.I),
-        ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com", "www.axios.com"],
+        ["www.reuters.com", "www.bloomberg.com", "www.aljazeera.com", "www.wsj.com", "www.ft.com", "www.axios.com"],
+    ),
+    (
+        re.compile(r"(台湾|台灣|苯并芘|苯並芘|色拉油|沙拉油|钨业|鎢業|仲钨酸铵|仲鎢酸銨)", re.I),
+        ["www.cna.com.tw", "www.fda.gov.tw", "udn.com", "www.ltn.com.tw"],
     ),
     (
         re.compile(r"(万斯|vance|美伊协议|iran deal|以色列|israel)", re.I),
@@ -5382,7 +5399,7 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
         ["english.kyodonews.net", "asia.nikkei.com", "www.japantimes.co.jp", "www3.nhk.or.jp"],
     ),
     (
-        re.compile(r"(川普|特朗普|trump|truth social|truthsocial|发帖|post|梅洛尼|meloni|nato|国防开支|defense spending)", re.I),
+        re.compile(r"(truth social|truthsocial|发帖|post|梅洛尼|meloni|nato|国防开支|defense spending)", re.I),
         ["truthsocial.com", "www.reuters.com", "www.axios.com", "www.politico.com"],
     ),
     (
@@ -5494,6 +5511,10 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("Trump Iran nuclear deal talks sanctions progress")
         add("Iran Strait of Hormuz reopen clear mines draft agreement")
         add("Iran oil exports 60-day nuclear talks Reuters")
+        if re.search(r"(阿曼|Oman|油价|oil|停止攻击|停火|ceasefire|航运|shipping)", topic_haystack, re.I):
+            add("Trump Iran Oman talks Strait of Hormuz oil prices July 2026 Reuters")
+            add("Iran Oman technical talks Strait of Hormuz July 2026 Al Jazeera")
+            add("site:www.aljazeera.com Iran Oman Strait of Hormuz talks July 2026")
         if re.search(r"(万斯|Vance|以色列|Israel|辩护|defends|批评|criticizes)", topic_haystack, re.I):
             add("Vance defends Iran deal criticizes Israel Reuters Axios")
             add("Vance Iran deal Israel criticism public defender")
@@ -5512,7 +5533,7 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("高市 内閣 支持率 世論調査 共同通信")
         add("site:english.kyodonews.net Japan Cabinet approval poll Takaichi")
         add("site:asia.nikkei.com Japan Takaichi approval poll")
-    if re.search(r"(川普|特朗普|Trump|Truth Social|truthsocial|发帖|post|梅洛尼|Meloni|国防开支|defense spending|NATO)", topic_haystack, re.I):
+    if re.search(r"(Truth Social|truthsocial|发帖|post|梅洛尼|Meloni|国防开支|defense spending|NATO)", topic_haystack, re.I):
         add("Trump Truth Social Meloni NATO defense spending")
         add("site:truthsocial.com Trump Meloni NATO defense spending")
         add("Trump attacks Meloni defense spending Truth Social")
@@ -5547,6 +5568,13 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("Sam's Club China food safety Walmart regulator summons Reuters")
         add("China regulator summons Walmart China over Sam's Club food safety issues")
         add("Sam's Club China food safety Xinhua Reuters")
+    if re.search(r"(台湾|台灣|苯并芘|苯並芘|色拉油|沙拉油|中粮油脂|中糧油脂)", topic_haystack, re.I):
+        add("台灣 沙拉油 苯並芘 超標 2026")
+        add("site:www.fda.gov.tw 苯並芘 沙拉油")
+        add("site:www.cna.com.tw 苯並芘 食用油")
+    if re.search(r"(京远钨业|京遠鎢業|仲钨酸铵|仲鎢酸銨|钨业|鎢業|tungsten)", topic_haystack, re.I):
+        add("台灣 京遠鎢業 仲鎢酸銨 2026")
+        add("site:www.cna.com.tw 京遠鎢業")
     if re.search(r"(郑丽文|Cheng Li-wen|民众党|Taiwan People's Party|议员|lawmakers)", topic_haystack, re.I):
         add("Cheng Li-wen US visit meets 10 lawmakers Reuters")
         add("Cheng Li-wen Taiwan People's Party US lawmakers June 2026")

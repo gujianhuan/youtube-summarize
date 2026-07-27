@@ -10,6 +10,7 @@ from core_logic import (
     _extract_fact_check_source_links,
     _fetch_bing_web_results,
     _fetch_google_news_results,
+    _google_news_feed_urls,
     _find_authoritative_sources,
     _normalize_fact_check_claim,
     _normalize_fact_check_conclusions_with_sources,
@@ -397,6 +398,33 @@ def test_fetch_google_news_results_keeps_source_url_from_feed(monkeypatch) -> No
     assert items
     assert items[0]["source"] == "Reuters"
     assert items[0]["source_url"] == "https://www.reuters.com"
+
+
+def test_google_news_feed_urls_adds_taiwan_locale_for_chinese_queries() -> None:
+    """中文新闻先查台湾语区，避免只使用美国索引漏掉本地报道。"""
+
+    urls = _google_news_feed_urls("台灣 沙拉油 苯並芘 超標")
+
+    assert "hl=zh-TW&gl=TW&ceid=TW:zh-Hant" in urls[0]
+    assert any("hl=en-US&gl=US&ceid=US:en" in url for url in urls)
+
+
+def test_prepare_fact_check_queries_adds_video_news_source_paths() -> None:
+    """伊朗航运与台湾本地事件应生成贴题的媒体和官方站点查询。"""
+
+    iran_queries = _prepare_fact_check_queries(
+        "特朗普停止攻击伊朗后，伊朗与阿曼举行霍尔木兹海峡技术会谈，油价下跌。",
+        [],
+    )
+    taiwan_queries = _prepare_fact_check_queries(
+        "台湾色拉油检出苯并芘超标，京远钨业生产仲钨酸铵。",
+        [],
+    )
+
+    assert any("Iran Oman technical talks Strait of Hormuz" in query for query in iran_queries)
+    assert any(query.startswith("site:www.aljazeera.com ") for query in iran_queries)
+    assert any(query.startswith("site:www.fda.gov.tw ") for query in taiwan_queries)
+    assert any(query.startswith("site:www.cna.com.tw ") for query in taiwan_queries)
 
 
 def test_recover_syndicated_fact_check_hit_uses_google_news_title_for_exact_site_search(monkeypatch) -> None:
