@@ -14,7 +14,7 @@ import uuid
 import calendar
 import requests
 from datetime import datetime, timedelta, time as dt_time
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from rate_limiter import RateLimiter
 from core_logic import (
     get_effective_proxy,
@@ -40,6 +40,7 @@ from core_logic import (
     get_remote_worker_status,
     build_runtime_version_diagnostics,
     normalize_video_url,
+    _is_fact_check_verifiable_source_url,
 )
 
 # --- 常量定义 ---
@@ -2244,6 +2245,8 @@ def _render_source_links(source_links: list[tuple[str, str]]) -> None:
     seen: set[str] = set()
     for label, url in source_links:
         raw_url = str(url or "").strip()
+        if not _is_fact_check_verifiable_source_url(raw_url):
+            continue
         normalized = _normalize_fact_check_source_url(raw_url)
         if not raw_url or normalized in seen:
             continue
@@ -2255,62 +2258,6 @@ def _render_source_links(source_links: list[tuple[str, str]]) -> None:
     _render_fact_check_label(t("fact_check_label_sources"))
     source_lines = [f"- [{label}]({url})" for label, url in deduped[:12]]
     st.markdown("\n".join(source_lines))
-
-
-def _build_fact_check_search_entry_links(title: str, rationale_markdown: str = "") -> list[tuple[str, str]]:
-    query_candidates: list[str] = []
-    title_value = re.sub(r"\s+", " ", str(title or "")).strip()
-    if title_value and title_value != "来源分析":
-        query_candidates.append(title_value)
-
-    rationale_text = str(rationale_markdown or "")
-    inline_terms = re.findall(r"`([^`]{6,160})`", rationale_text)
-    for term in inline_terms:
-        cleaned = re.sub(r"\s+", " ", str(term or "")).strip()
-        if cleaned:
-            query_candidates.append(cleaned)
-
-    query = ""
-    seen: set[str] = set()
-    merged_terms: list[str] = []
-    for candidate in query_candidates:
-        normalized = re.sub(r"\s+", " ", candidate).strip()
-        lowered = normalized.lower()
-        if not normalized or lowered in seen:
-            continue
-        seen.add(lowered)
-        merged_terms.append(normalized)
-        if len(merged_terms) >= 2:
-            break
-    if merged_terms:
-        query = " ".join(merged_terms)
-    if not query:
-        return []
-
-    encoded = quote(query[:240])
-    return [
-        ("Google 新闻搜索", f"https://www.google.com/search?tbm=nws&q={encoded}"),
-        ("Google 网页搜索", f"https://www.google.com/search?q={encoded}"),
-        ("Bing 新闻搜索", f"https://www.bing.com/news/search?q={encoded}"),
-        ("Bing 网页搜索", f"https://www.bing.com/search?q={encoded}"),
-        ("AnySearch", f"https://anysearch.com/search?q={encoded}"),
-    ]
-
-
-def _is_fact_check_search_entry_url(url: str) -> bool:
-    raw = str(url or "").strip()
-    if not raw:
-        return False
-    try:
-        parsed = urlsplit(raw)
-        host = str(parsed.netloc or "").lower()
-        return (
-            "google." in host
-            or host in {"bing.com", "www.bing.com", "anysearch.com", "www.anysearch.com"}
-            or raw.startswith("https://anysearch.com/search")
-        )
-    except Exception:
-        return bool(re.search(r"https?://(?:www\.)?(?:google|bing|anysearch)\.", raw, re.I))
 
 
 def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = None) -> None:
@@ -2342,27 +2289,19 @@ def render_fact_check_content(fact_check_md: str, *, fact_title: str | None = No
             f"<div class='fact-check-item-title'>{idx}. {html.escape(title)}</div>",
             unsafe_allow_html=True,
         )
+        source_links = [
+            (label, url)
+            for label, url in list(parsed.get("source_links") or [])
+            if _is_fact_check_verifiable_source_url(url)
+        ]
+        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
+        if not source_links:
+            conclusion = "未找到可验证原始出处" if not str(conclusion or "").startswith("No ") else "No Verifiable Original Source Found"
         if conclusion:
             st.markdown(
                 f"<div class='fact-check-status-chip'>{html.escape(conclusion)}</div>",
                 unsafe_allow_html=True,
             )
-        source_links = list(parsed.get("source_links") or [])
-        rationale_markdown = str(parsed.get("rationale_markdown") or "").strip()
-        has_only_search_entries = bool(source_links) and all(
-            _is_fact_check_search_entry_url(url) for _label, url in source_links
-        )
-        if not source_links or has_only_search_entries:
-            fallback_links = _build_fact_check_search_entry_links(title, rationale_markdown)
-            existing_urls = {_normalize_fact_check_source_url(url) for _label, url in source_links}
-            source_links = [
-                *source_links,
-                *[
-                    (label, url)
-                    for label, url in fallback_links
-                    if _normalize_fact_check_source_url(url) not in existing_urls
-                ],
-            ]
         _render_source_links(source_links)
         source_summary = str(parsed.get("source_summary") or "").strip()
         if source_summary and not parsed.get("source_links"):

@@ -3987,6 +3987,28 @@ def _dedupe_fact_check_source_links(source_links: list[tuple[str, str]]) -> list
     return deduped
 
 
+def _is_fact_check_verifiable_source_url(url: str) -> bool:
+    """只接受可直达具体内容的页面，拒绝搜索入口、首页和主题目录。"""
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    domain = str(parsed.netloc or "").lower()
+    if parsed.scheme not in {"http", "https"} or not domain:
+        return False
+    if any(token in domain for token in ("google.", "bing.", "anysearch.")):
+        return False
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(path_segments) < 2:
+        return False
+    lowered_path = "/".join(path_segments).lower()
+    if any(token in lowered_path for token in ("live-updates", "/video/", "/videos/", "/podcast/", "/podcasts/")):
+        return False
+    if path_segments[-1].lower() in {"index", "index.html", "index.htm", "search"}:
+        return False
+    return True
+
+
 def _strip_html_tags(text: str) -> str:
     value = re.sub(r"<[^>]+>", " ", str(text or ""))
     value = re.sub(r"\s+", " ", value).strip()
@@ -6164,13 +6186,13 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "source_links_label": "来源链接",
             "search_terms_label": "搜索词",
             "search_results_label": "搜索结果",
-            "fallback_claim_intro": "系统已先整理出本条可核查说法，并附上可直接复核的候选来源线索。",
-            "fallback_conclusion": "已整理候选来源线索，待确认原始出处",
-            "fallback_rationale": "本条先展示系统已汇总的候选网页、搜索入口和可继续核对的关键词；如果只出现搜索入口，表示本轮自动检索尚未抓到可直接引用正文，不代表全网不存在相关来源。",
-            "fallback_pending": "建议优先核对原始报道时间、数字口径、机构原文、社媒原帖和二次转载是否存在偏差。",
-            "fallback_no_links": "当前未提取到可点击来源链接。",
+            "fallback_claim_intro": "系统已提取出本条可核查说法，并检索可能的原始出处。",
+            "fallback_conclusion": "未找到可验证原始出处",
+            "fallback_rationale": "本轮未找到可直达具体报道、公告、原帖或数据页的链接；搜索入口、站点首页和主题目录不作为来源。",
+            "fallback_pending": "可继续核对原始报道时间、数字口径、机构原文、社媒原帖和二次转载是否存在偏差。",
+            "fallback_no_links": "未找到可验证原始出处。",
             "fallback_no_queries": "未生成搜索词",
-            "fallback_detail_rationale": "系统已先保留候选搜索词 `{search_text}` 与可人工复核入口；如果没有直接报道链接，表示本轮自动检索尚未抓到可直接引用正文，不代表全网不存在相关来源。",
+            "fallback_detail_rationale": "本轮未找到可直达具体内容页的来源；搜索词 `{search_text}` 仅用于内部检索，不作为来源展示。",
             "fallback_detail_pending": "建议继续核对原始报道、官方披露、社媒原帖、统计口径与发布时间是否一致。",
             "progress_extract_claims": "正在抽取关键声明...",
             "progress_search_sources": "正在检索外部来源...",
@@ -6193,13 +6215,13 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "source_links_label": "Source Links",
             "search_terms_label": "Search Queries",
             "search_results_label": "Search Results",
-            "fallback_claim_intro": "The system has already extracted a checkable claim and preserved candidate sources for quick review.",
-            "fallback_conclusion": "Candidate source leads collected; original source still needs confirmation",
-            "fallback_rationale": "This draft surfaces candidate pages, search entry points, and follow-up queries. Search-entry-only results mean this automated pass has not captured directly citable page text yet; they do not prove no source exists.",
+            "fallback_claim_intro": "The system extracted a checkable claim and searched for its original source.",
+            "fallback_conclusion": "No Verifiable Original Source Found",
+            "fallback_rationale": "This pass did not find a direct link to a specific report, release, post, or data page. Search entries, site homepages, and topic indexes are not treated as sources.",
             "fallback_pending": "Prioritize checking the original report date, exact figures, issuing institution, original social post, and whether secondary reposts introduced distortions.",
-            "fallback_no_links": "No clickable source links were extracted this time.",
+            "fallback_no_links": "No verifiable original source was found.",
             "fallback_no_queries": "No search queries were generated",
-            "fallback_detail_rationale": "The system preserved candidate search queries `{search_text}` and manually reviewable entry points. If no article link appears, this automated pass did not capture a directly citable page; it is not proof that no source exists.",
+            "fallback_detail_rationale": "This pass found no direct link to a specific content page. The query `{search_text}` is for internal retrieval only and is not shown as a source.",
             "fallback_detail_pending": "Continue checking the original report, official disclosures, original social post, statistical methodology, and publication time for consistency.",
             "progress_extract_claims": "Extracting key claims...",
             "progress_search_sources": "Searching external sources...",
@@ -6378,13 +6400,10 @@ def _extract_markdown_links(markdown_text: str) -> list[tuple[str, str]]:
 
 
 def _extract_fact_check_source_links(markdown_text: str) -> list[tuple[str, str]]:
-    """仅保留实际可核查的外部来源，过滤搜索引擎结果页链接。"""
+    """仅保留可直达具体内容页的外部来源。"""
     filtered: list[tuple[str, str]] = []
     for label, url in _extract_markdown_links(markdown_text):
-        domain = str(urlparse(url).netloc or "").lower()
-        if not domain:
-            continue
-        if any(token in domain for token in ("google.", "bing.")):
+        if not _is_fact_check_verifiable_source_url(url):
             continue
         filtered.append((label, url))
     return _dedupe_fact_check_source_links(filtered)
@@ -6723,25 +6742,43 @@ def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: 
             conclusion_label = "来源定位" if "来源定位" in stripped else "核查结论"
             insufficient_value = "暂未定位到直接来源" if conclusion_label == "来源定位" else "缺乏证据"
             dubious_value = "已找到相关来源" if conclusion_label == "来源定位" else "存疑"
-        search_entry_only_value = (
-            "已整理搜索入口，待确认原始出处"
-            if conclusion_label in {"来源定位", "核查结论"}
-            else "Search entry points collected; original source still needs confirmation"
-        )
+        found_source_value = "已找到可验证出处" if conclusion_label in {"来源定位", "核查结论"} else "Verifiable Source Located"
+        not_found_value = "未找到可验证原始出处" if conclusion_label in {"来源定位", "核查结论"} else "No Verifiable Original Source Found"
         rationale_insert = _build_fact_check_hit_rationale(
             search_markdown=search_markdown,
             section_text=stripped,
-            ui_locale="en" if conclusion_label == "Conclusion" else "zh",
+            ui_locale="en" if conclusion_label in {"Conclusion", "Source Status"} else "zh",
         )
         rationale_line_pattern = r"(^-\s*(?:判断依据|依据|来源线索说明|Rationale|Source Notes)[:：]\s*)([^\n]*)"
-        has_insufficient_label = (
-            f"{conclusion_label}：" + insufficient_value in stripped
-            or f"{conclusion_label}: {insufficient_value}" in stripped
-        )
+        conclusion_pattern = rf"({re.escape(conclusion_label)}[:：]\s*)[^\n]*"
+        if re.search(conclusion_pattern, stripped, flags=re.I):
+            stripped = re.sub(
+                conclusion_pattern,
+                rf"\1{found_source_value if candidate_link_count else not_found_value}",
+                stripped,
+                count=1,
+                flags=re.I,
+            )
+        if candidate_link_count and rationale_insert:
+            if re.search(rationale_line_pattern, stripped, re.I | re.M):
+                stripped = re.sub(
+                    rationale_line_pattern,
+                    lambda m: f"{m.group(1)}{rationale_insert}",
+                    stripped,
+                    count=1,
+                    flags=re.I | re.M,
+                )
+            else:
+                stripped = stripped.rstrip() + (
+                    f"\n- {'Source Notes' if conclusion_label == 'Conclusion' else '来源线索说明'}: {rationale_insert}"
+                )
+            updated_sections.append(stripped)
+            continue
+        has_insufficient_label = False
         if not should_soften_to_dubious and has_insufficient_label:
             stripped = re.sub(
                 rf"({re.escape(conclusion_label)}[:：]\s*){re.escape(insufficient_value)}",
-                rf"\1{search_entry_only_value}",
+                rf"\1{not_found_value}",
                 stripped,
                 count=1,
                 flags=re.I,
@@ -6875,13 +6912,16 @@ def _render_fact_check_claim_sections(
         search_md = str(item.get("search_markdown") or "")
         links = _extract_fact_check_source_links(search_md)
         source_text = "；".join(f"[{label}]({url})" for label, url in links[:5]) if links else _fact_check_text(ui_locale, "fallback_no_links")
+        conclusion = (
+            "Verifiable Source Located" if _is_english_output_locale(ui_locale) else "已找到可验证出处"
+        ) if links else _fact_check_text(ui_locale, "fallback_conclusion")
         search_text = " | ".join(str(query).strip() for query in query_list if str(query).strip()) or _fact_check_text(ui_locale, "fallback_no_queries")
         rendered_sections.append(
             "\n".join(
                 [
                     f"### {item_label}{item_index}",
                     f"- {claim_label}: {claim}",
-                    f"- {conclusion_label}: {_fact_check_text(ui_locale, 'fallback_conclusion')}",
+                    f"- {conclusion_label}: {conclusion}",
                     f"- {rationale_label}: {_fact_check_text(ui_locale, 'fallback_detail_rationale').format(search_text=search_text)}",
                     f"- {pending_label}: {_fact_check_text(ui_locale, 'fallback_detail_pending')}",
                     f"- {sources_label}: {source_text}",
@@ -8321,13 +8361,13 @@ def fact_check_document_claims(
                 "- Use this structure for every item:\n"
                 "### Item 1\n"
                 "- Claim: ...\n"
-                "- Source Status: Direct Source Located / Related Coverage Located / No Direct Source Yet\n"
+                "- Source Status: Verifiable Source Located / No Verifiable Original Source Found\n"
                 "- Source Notes:\n"
                 "  - Located source pages: ...\n"
                 "  - Why these pages are likely relevant to the claim: ...\n"
                 "  - What still needs manual follow-up, if any: ...\n"
                 "- Suggested Follow-ups: ...\n"
-                "- Source Links: provide 2-4 external links in Markdown, such as [Reuters](https://...)\n"
+                "- Source Links: list only direct links to specific articles, releases, posts, or data pages in Markdown, such as [Reuters](https://...). Never cite search pages, homepages, or topic indexes.\n"
                 "- If the original text contains multiple distinct claims, split them into separate items instead of merging several numbers or events into one.\n"
                 "- If a claim involves figures, dates, institutions, or rankings, explain as specifically as possible whether each element matches.\n"
                 "- The task here is source discovery, not truth judgment. Focus on locating the most likely origin or report page for the claim.\n"
@@ -8339,7 +8379,7 @@ def fact_check_document_claims(
                 "- If the search context only says that no directly citable report was captured this round, phrase it as an automated retrieval miss rather than exaggerating it into `no mainstream or official coverage exists`.\n"
                 "- When citing institutions, government departments, media outlets, or official sites in the rationale, prefer linking to the official or outlet page rather than naming it without a link.\n"
                 "- Never treat the document itself as a source.\n"
-                "- Even if search results are limited, list the candidate sources you do have instead of leaving the section empty.\n"
+                "- If no specific content page was found, write `No Verifiable Original Source Found` and leave Source Links empty.\n"
                 "- Avoid truth-verdict language. If you found a likely source page, say so directly instead of judging whether the claim is true.\n"
                 "- Return Markdown only, not JSON.\n\n"
                 f"Document summary:\n{summary_excerpt}\n\n"
@@ -8353,13 +8393,13 @@ def fact_check_document_claims(
                 "- 每条都使用下面结构：\n"
                 "### 条目1\n"
                 "- 关键声明：...\n"
-                "- 来源定位：已找到直接来源 / 已找到相关来源 / 暂未定位到直接来源\n"
+                "- 来源定位：已找到可验证出处 / 未找到可验证原始出处\n"
                 "- 来源线索说明：\n"
                 "  - 已命中的来源网页：...\n"
                 "  - 这些网页为什么像是这条新闻的出处或报道页：...\n"
                 "  - 如果还有待人工确认的点，再补充说明：...\n"
                 "- 建议继续查看：...\n"
-                "- 来源出处：给出 2-4 个外部来源链接，格式如 [新华社](https://...)\n"
+                "- 来源出处：只给出能直达具体报道、公告、原帖或数据页的外部链接，格式如 [新华社](https://...)；严禁把搜索页、站点首页或主题目录当作来源。\n"
                 "- 如果原文包含多条不同声明，请分别成条输出，不要把多个数字或多个事件揉成一条。\n"
                 "- 如果一条声明涉及数字、时间、机构、排名，请尽量分别说明这些要素是否匹配。\n"
                 "- 这一步的目标是定位来源网页，不是判断真伪。请优先回答“这条说法最像来自哪些网页”。\n"
@@ -8371,7 +8411,7 @@ def fact_check_document_claims(
                 "- 如果搜索上下文只写了“当前未抓到可直接引用的候选报道”，只能表述为“本轮自动检索暂未命中可直接引用来源”，不要夸大成“没有任何主流媒体或官方机构报道”。\n"
                 "- 如果判断依据里提到具体机构、政府部门、媒体名或官网名，优先附上该机构/媒体的官网或栏目页链接，不要只写机构名称。\n"
                 "- 禁止把文档本身当来源。\n"
-                "- 如果搜索结果不足，也要写明目前查到的候选来源，不要空着。\n"
+                "- 如果没有具体内容页，必须写“未找到可验证原始出处”，且来源出处留空。\n"
                 "- 避免使用真假裁决式表述；只要找到了像出处的网页，就直接说明已找到哪些来源链接。\n"
                 "- 只返回 Markdown，不要 JSON。\n\n"
                 f"文档总结：\n{summary_excerpt}\n\n"

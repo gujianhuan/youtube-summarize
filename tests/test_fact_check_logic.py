@@ -91,8 +91,8 @@ def test_enrich_fact_check_softens_absolute_negative_wording_when_sources_exist(
         {
             "claim": "布伦特原油价格达到120美元",
             "search_markdown": (
-                "- [路透社](https://www.reuters.com/)\n"
-                "- [彭博社](https://www.bloomberg.com/)"
+                    "- [路透社](https://www.reuters.com/world/energy/oil-prices-2026-04-01/)\n"
+                    "- [彭博社](https://www.bloomberg.com/news/articles/2026-04-01/oil-prices)"
             ),
         }
     ]
@@ -113,19 +113,19 @@ def test_build_fact_check_fallback_markdown_keeps_more_detail() -> None:
                 "claim": "台湾股市总市值达到4.47万亿美元，超越加拿大成为全球第六大股市。",
                 "queries": ["台湾股市 4.47万亿美元 加拿大 第六大股市"],
                 "search_markdown": (
-                    "- [台湾证券交易所](https://www.twse.com.tw/en/)\n"
-                    "- [彭博社](https://www.bloomberg.com/)\n"
-                    "- [路透社](https://www.reuters.com/)\n"
-                    "- [美丽岛电子报](https://www.my-formosa.com/)"
+                    "- [台湾证券交易所公告](https://www.twse.com.tw/en/page/announcement.html)\n"
+                    "- [彭博社报道](https://www.bloomberg.com/news/articles/2026-04-01/taiwan-stocks)\n"
+                    "- [路透社报道](https://www.reuters.com/world/asia-pacific/taiwan-stocks-2026-04-01/)\n"
+                    "- [美丽岛电子报报道](https://www.my-formosa.com/article/123456)"
                 ),
             }
         ]
     )
 
     assert "### 条目1" in fallback
-    assert "待补充核查点" in fallback
-    assert "https://www.twse.com.tw/en/" in fallback
-    assert "https://www.bloomberg.com/" in fallback
+    assert "已找到可验证出处" in fallback
+    assert "https://www.twse.com.tw/en/page/announcement.html" in fallback
+    assert "https://www.bloomberg.com/news/articles/2026-04-01/taiwan-stocks" in fallback
 
 
 def test_dedupe_fact_check_source_links_normalizes_trailing_slashes() -> None:
@@ -175,21 +175,21 @@ def test_enrich_fact_check_dedupes_repeated_links_from_search_markdown() -> None
         {
             "claim": "台湾股市总市值达到4.47万亿美元",
             "search_markdown": (
-                "- [路透社](https://www.reuters.com/)\n"
-                "- [路透社](https://www.reuters.com)\n"
-                "- [台湾证券交易所](https://www.twse.com.tw/en/)\n"
+                    "- [路透社](https://www.reuters.com/world/asia-pacific/taiwan-stocks/)\n"
+                    "- [路透社](https://www.reuters.com/world/asia-pacific/taiwan-stocks)\n"
+                    "- [台湾证券交易所](https://www.twse.com.tw/en/page/announcement.html)\n"
             ),
         }
     ]
 
     enriched = _enrich_fact_check_items_with_claim_sources(fact_md, claim_sources)
 
-    assert enriched.count("https://www.reuters.com/") == 1
-    assert "https://www.twse.com.tw/en/" in enriched
+    assert enriched.count("https://www.reuters.com/world/asia-pacific/taiwan-stocks/") == 1
+    assert "https://www.twse.com.tw/en/page/announcement.html" in enriched
 
 
 def test_extract_fact_check_source_links_filters_out_search_engine_pages() -> None:
-    """来源列表应只保留实际报道/官网，不应混入 Google/Bing 搜索页。"""
+    """来源列表只保留具体内容页，不应混入搜索页或站点首页。"""
 
     links = _extract_fact_check_source_links(
         "### 搜索关键字: 台湾股市 4.47万亿美元\n"
@@ -203,9 +203,27 @@ def test_extract_fact_check_source_links_filters_out_search_engine_pages() -> No
     )
 
     assert ("Reuters story", "https://www.reuters.com/world/example") in links
-    assert ("台湾证券交易所", "https://www.twse.com.tw/en/") in links
+    assert ("台湾证券交易所", "https://www.twse.com.tw/en/") not in links
     assert all("google." not in url.lower() for _, url in links)
     assert all("bing." not in url.lower() for _, url in links)
+
+
+def test_extract_fact_check_source_links_rejects_generic_source_pages() -> None:
+    """Reuters 首页与 Fed 议题页不能被误标为原始出处。"""
+
+    links = _extract_fact_check_source_links(
+        "- [Reuters 首页](https://www.reuters.com/)\n"
+        "- [Reuters 直播专题](https://www.reuters.com/world/live-updates/fed-meeting-2026-07-27/)\n"
+        "- [Fed 货币政策](https://www.federalreserve.gov/monetarypolicy.htm)\n"
+        "- [Reuters 原文](https://www.reuters.com/world/us/fed-rates-2026-07-27/)\n"
+        "- [Fed 公告](https://www.federalreserve.gov/newsevents/pressreleases/monetary20260727a.htm)\n"
+    )
+
+    assert ("Reuters 原文", "https://www.reuters.com/world/us/fed-rates-2026-07-27/") in links
+    assert ("Fed 公告", "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260727a.htm") in links
+    assert all("reuters.com/" not in url or url.count("/") > 3 for _, url in links)
+    assert all("live-updates" not in url for _, url in links)
+    assert all("monetarypolicy.htm" not in url for _, url in links)
 
 
 def test_perform_web_search_includes_candidate_news_hits(monkeypatch) -> None:
@@ -1327,7 +1345,7 @@ def test_normalize_fact_check_conclusion_turns_lack_of_evidence_into_dubious_whe
 
     normalized = _normalize_fact_check_conclusions_with_sources(fact_md, claim_sources)
 
-    assert "核查结论：存疑" in normalized
+    assert "核查结论：已找到可验证出处" in normalized
     assert "核查结论：缺乏证据" not in normalized
     assert "与该说法对应的新闻报道" in normalized
     assert "台湾股市总市值超加拿大 成为全球第六大股市" in normalized
@@ -1359,7 +1377,7 @@ def test_normalize_fact_check_conclusion_turns_web_hits_into_dubious() -> None:
 
     normalized = _normalize_fact_check_conclusions_with_sources(fact_md, claim_sources)
 
-    assert "核查结论：存疑" in normalized
+    assert "核查结论：已找到可验证出处" in normalized
     assert "核查结论：缺乏证据" not in normalized
     assert "官网/机构页面" in normalized
     assert "Official statement" in normalized
@@ -1378,7 +1396,7 @@ def test_normalize_fact_check_conclusion_turns_dynamic_claim_into_dubious_with_p
 
     normalized = _normalize_fact_check_conclusions_with_sources(fact_md, [{"search_markdown": ""}])
 
-    assert "核查结论：存疑" in normalized
+    assert "核查结论：未找到可验证原始出处" in normalized
     assert "核查结论：缺乏证据" not in normalized
     assert "台湾证券交易所" in normalized
 
@@ -1405,7 +1423,7 @@ def test_normalize_fact_check_conclusion_replaces_generic_exchange_template() ->
 
     normalized = _normalize_fact_check_conclusions_with_sources(fact_md, claim_sources)
 
-    assert "核查结论：存疑" in normalized
+    assert "核查结论：已找到可验证出处" in normalized
     assert "Official statement" in normalized
     assert "交易所公告" not in normalized
     assert "原始统计口径" not in normalized
@@ -1427,8 +1445,8 @@ def test_build_fact_check_fallback_markdown_supports_english_locale() -> None:
 
     assert "### Item1" in fallback
     assert "- Claim:" in fallback
-    assert "- Conclusion:" in fallback
-    assert "- Sources:" in fallback
+    assert "- Source Status:" in fallback
+    assert "- Source Links:" in fallback
 
 
 def test_parse_fact_check_section_supports_english_labels() -> None:
@@ -1485,8 +1503,8 @@ def test_ensure_fact_check_item_coverage_appends_missing_claim_sections() -> Non
     assert completed.count("### 条目") == 5
     assert "- 新闻/声明： 声明4" not in completed
     assert "- 新闻/声明： 声明5" not in completed
-    assert "- 新闻/声明：声明4" in completed
-    assert "- 新闻/声明：声明5" in completed
+    assert "- 新闻/声明: 声明4" in completed
+    assert "- 新闻/声明: 声明5" in completed
 
 
 def test_build_heuristic_claim_items_prefers_specific_summary_claims() -> None:
