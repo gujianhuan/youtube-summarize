@@ -8067,6 +8067,8 @@ def extract_key_claims(
         "- 如果原文句子过长，请改写成完整但更短的独立陈述，保留主体、动作和关键数字/时间。\n"
         "- 每条 queries 最多给 2 个：1 个尽量精确，1 个尽量放宽。\n"
         "- 如果声明涉及外国人物、政府部门、城市、组织或国际事件，至少有 1 个 query 使用英文或原文名称，不要只给中文译名。\n"
+        "- 原文明确写出报道媒体、通讯社、电视台、官网或政府机构时，必须把该名称保留在至少 1 个 query 中；若能确定官网域名，优先给 `site:域名 事件关键词`。不得凭空猜测来源。\n"
+        "- 原文明确归因于华尔街日报、金融时报、路透、彭博、新华社、央视、财新等媒体时，claim 中也要保留该归因，避免后续把相关报道误判为原始出处。\n"
         "- 如果声明里有日期，queries 不要都死扣完整日期；至少保留 1 个去掉具体日期的宽松版本，避免搜不到。\n"
         "- 只返回 JSON，对象格式如下：\n"
         "{\n"
@@ -8177,13 +8179,30 @@ def _build_fact_check_excerpt(text: str, max_chars: int = 7000) -> str:
     cleaned = clean_document_text(text or "")
     if len(cleaned) <= max_chars:
         return cleaned
-    head_chars = max(2500, int(max_chars * 0.72))
-    tail_chars = max(800, max_chars - head_chars - 40)
-    return (
-        cleaned[:head_chars].rstrip()
-        + "\n...(中间内容省略)...\n"
-        + cleaned[-tail_chars:].lstrip()
-    )
+    # 长视频常按新闻段落推进；只保留首尾会漏掉中段所有可核查事件。
+    chunk_count = 5
+    separator = "\n...(其他片段省略)...\n"
+    chunk_chars = max(600, (max_chars - len(separator) * (chunk_count - 1)) // chunk_count)
+    last_start = max(0, len(cleaned) - chunk_chars)
+    source_positions = [
+        match.start()
+        for match in re.finditer(
+            r"华尔街日报|金融时报|路透社|彭博社|新华社|中央电视台|央视|财新|美联社|半岛电视台|"
+            r"Reuters|Bloomberg|Financial Times|Wall Street Journal|Associated Press|CNN|BBC",
+            cleaned,
+            re.I,
+        )
+    ]
+    if source_positions:
+        selected_positions = [
+            source_positions[round((len(source_positions) - 1) * index / (chunk_count - 1))]
+            for index in range(chunk_count)
+        ]
+        starts = [min(last_start, max(0, position - chunk_chars // 3)) for position in selected_positions]
+    else:
+        starts = [round(last_start * index / (chunk_count - 1)) for index in range(chunk_count)]
+    chunks = [cleaned[start:start + chunk_chars].strip() for start in starts]
+    return separator.join(chunk for chunk in chunks if chunk)
 
 
 def decide_video_fact_check_plan(text: str, summary_markdown: str) -> dict:

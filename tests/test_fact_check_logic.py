@@ -10,6 +10,7 @@ from core_logic import (
     _extract_fact_check_source_links,
     _fetch_bing_web_results,
     _fetch_google_news_results,
+    _build_fact_check_excerpt,
     _google_news_feed_urls,
     _find_authoritative_sources,
     _normalize_fact_check_claim,
@@ -407,6 +408,29 @@ def test_google_news_feed_urls_adds_taiwan_locale_for_chinese_queries() -> None:
 
     assert "hl=zh-TW&gl=TW&ceid=TW:zh-Hant" in urls[0]
     assert any("hl=en-US&gl=US&ceid=US:en" in url for url in urls)
+
+
+def test_build_fact_check_excerpt_covers_middle_of_long_video() -> None:
+    """长视频核查节选应覆盖中段，不能只给模型首尾字幕。"""
+
+    text = "开头新闻。" + "A" * 3000 + "中段独家报道：携程被处罚。" + "B" * 3000 + "结尾新闻。"
+
+    excerpt = _build_fact_check_excerpt(text, max_chars=2000)
+
+    assert "开头新闻。" in excerpt
+    assert "中段独家报道：携程被处罚。" in excerpt
+    assert "结尾新闻。" in excerpt
+
+
+def test_build_fact_check_excerpt_prioritizes_named_source_contexts() -> None:
+    """长视频明确点名媒体时，应优先把对应段落送给声明抽取模型。"""
+
+    text = "开头。" + "A" * 3500 + "财新报道：方星海被调查。" + "B" * 3500 + "金融时报称：伊朗政策需要调整。" + "C" * 3500
+
+    excerpt = _build_fact_check_excerpt(text, max_chars=2000)
+
+    assert "财新报道：方星海被调查。" in excerpt
+    assert "金融时报称：伊朗政策需要调整。" in excerpt
 
 
 def test_prepare_fact_check_queries_adds_video_news_source_paths() -> None:
