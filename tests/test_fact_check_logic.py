@@ -1193,6 +1193,46 @@ def test_prepare_fact_check_queries_adds_major_media_site_queries_for_market_cla
     assert any(item.startswith("site:www.ft.com ") for item in queries)
 
 
+def test_prepare_fact_check_queries_splits_sk_hynix_adr_claim_into_source_paths() -> None:
+    """跨市场价格差应落到公司、ADR 机制和报道页，而不是整段中文评论。"""
+
+    queries = _prepare_fact_check_queries(
+        "SK海力士在韩国和美国上市，美国股价比韩国高16%-51%，因韩国限制单向转换。",
+        [],
+    )
+
+    assert "SK Hynix ADR premium Korea shares Wall Street Journal" in queries
+    assert "SK Hynix ADR one-way conversion Korea shares" in queries
+    assert any(item.startswith("site:www.wsj.com SK Hynix ADR") for item in queries)
+
+
+def test_prepare_fact_check_queries_adds_samr_path_for_ctrip_penalty() -> None:
+    """行政处罚应优先查询监管机关的具体公告。"""
+
+    queries = _prepare_fact_check_queries(
+        "国家市场监管总局对携程作出反垄断行政处罚，没收违法所得并处以罚款。",
+        [],
+    )
+
+    assert "Ctrip antitrust fine SAMR administrative penalty" in queries
+    assert any(item.startswith("site:www.samr.gov.cn 携程 反垄断") for item in queries)
+
+
+def test_prepare_fact_check_queries_adds_direct_source_paths_for_named_outlet_and_bio() -> None:
+    """已点名媒体或机构履历时，优先检索该媒体原文或官方简介。"""
+
+    ft_queries = _prepare_fact_check_queries(
+        "金融时报认为特朗普应该通过战争推翻伊朗政权。",
+        [],
+    )
+    bio_queries = _prepare_fact_check_queries("方星海拥有斯坦福大学经济学博士学位。", [])
+
+    assert "Financial Times Trump Iran war regime change opinion" in ft_queries
+    assert any(item.startswith("site:www.ft.com Financial Times Trump Iran") for item in ft_queries)
+    assert "Fang Xinghai Stanford University PhD biography" in bio_queries
+    assert any(item.startswith("site:www.csrc.gov.cn 方星海") for item in bio_queries)
+
+
 def test_prepare_fact_check_queries_does_not_nest_site_prefix() -> None:
     """已带 site: 的查询不应再被重复包成 site:site:。"""
 
@@ -1378,6 +1418,24 @@ def test_normalize_fact_check_conclusion_turns_lack_of_evidence_into_dubious_whe
     assert "与该说法对应的新闻报道" in normalized
     assert "台湾股市总市值超加拿大 成为全球第六大股市" in normalized
     assert "交易所公告" not in normalized
+
+
+def test_named_source_claim_is_not_marked_as_original_when_only_other_outlet_hits() -> None:
+    """明确点名媒体时，相关报道不能被误标为该媒体原始出处。"""
+
+    fact_md = (
+        "### 条目1\n"
+        "- 新闻/声明：金融时报认为特朗普应通过战争推翻伊朗政权。\n"
+        "- 核查结论：缺乏证据\n"
+    )
+    claim_sources = [{
+        "claim": "金融时报认为特朗普应通过战争推翻伊朗政权。",
+        "search_markdown": "- [Reuters](https://www.reuters.com/world/middle-east/example-story-2026-07-27/)",
+    }]
+
+    normalized = _normalize_fact_check_conclusions_with_sources(fact_md, claim_sources)
+
+    assert "核查结论：已找到相关来源，原始出处未定位" in normalized
 
 
 def test_normalize_fact_check_conclusion_turns_web_hits_into_dubious() -> None:

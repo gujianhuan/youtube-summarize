@@ -5303,6 +5303,11 @@ def _extract_year_tokens(text: str) -> list[str]:
 
 
 FACT_CHECK_ENGLISH_QUERY_REPLACEMENTS = [
+    (r"SK海力士|SK hynix|海力士", "SK Hynix"),
+    (r"存托凭证|ADR", "ADR"),
+    (r"单向转换", "one-way conversion"),
+    (r"国家市场监管总局", "SAMR"),
+    (r"携程", "Ctrip"),
     (r"川普|特朗普", "Trump"),
     (r"卢比奥", "Rubio"),
     (r"习近平", "Xi Jinping"),
@@ -5363,7 +5368,7 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
         ["finance.yahoo.com", "www.reuters.com", "www.bloomberg.com", "www.wsj.com"],
     ),
     (
-        re.compile(r"(山姆店|山姆会员店|sam's club|sams club|沃尔玛|walmart|食品安全|food safety|市场监管|regulator|约谈|summons)", re.I),
+        re.compile(r"(山姆店|山姆会员店|sam's club|sams club|沃尔玛|walmart|食品安全|food safety)", re.I),
         ["www.reuters.com", "english.news.cn", "www.chinadaily.com.cn", "www.marketwatch.com"],
     ),
     (
@@ -5409,6 +5414,14 @@ FACT_CHECK_MAJOR_MEDIA_SITE_RULES = [
     (
         re.compile(r"(ipo|上市|香港ipo|香港上市|宁德时代|catl|jpmorgan|bank of america)", re.I),
         ["www.reuters.com", "www.bloomberg.com", "www.wsj.com", "www.ft.com"],
+    ),
+    (
+        re.compile(r"(sk海力士|sk hynix|海力士|adr|存托凭证|单向转换)", re.I),
+        ["www.wsj.com", "www.reuters.com", "www.bloomberg.com", "biz.heraldcorp.com"],
+    ),
+    (
+        re.compile(r"(携程|ctrip|市场监管总局|samr|反垄断|垄断处罚)", re.I),
+        ["www.samr.gov.cn", "www.gov.cn", "www.reuters.com", "www.caixin.com"],
     ),
     (
         re.compile(r"(mlf|中国央行|人民银行|pboc|people's bank of china|净利差|银行资金成本)", re.I),
@@ -5549,6 +5562,21 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
         add("CATL Hong Kong IPO JPMorgan Bank of America Reuters")
         add("House CCP committee CATL Hong Kong IPO")
         add("HKEX CATL Hong Kong listing filing")
+    if re.search(r"(SK海力士|SK Hynix|海力士|存托凭证|ADR|单向转换)", topic_haystack, re.I):
+        add("SK Hynix ADR premium Korea shares Wall Street Journal")
+        add("SK Hynix ADR one-way conversion Korea shares")
+        add("site:www.wsj.com SK Hynix ADR Korean shares premium")
+        add("site:biz.heraldcorp.com SK hynix ADR premium domestic shares")
+    if re.search(r"(携程|Ctrip|市场监管总局|SAMR|反垄断)", topic_haystack, re.I):
+        add("Ctrip antitrust fine SAMR administrative penalty")
+        add("site:www.samr.gov.cn 携程 反垄断 行政处罚")
+        add("site:www.gov.cn 携程 反垄断 处罚")
+    if re.search(r"(方星海|Fang Xinghai)", topic_haystack, re.I):
+        add("Fang Xinghai Stanford University PhD biography")
+        add("site:www.csrc.gov.cn 方星海 斯坦福 博士")
+    if re.search(r"(金融时报|Financial Times|FT)" , topic_haystack, re.I) and re.search(r"(伊朗|Iran|川普|特朗普|Trump)", topic_haystack, re.I):
+        add("Financial Times Trump Iran war regime change opinion")
+        add("site:www.ft.com Financial Times Trump Iran war regime change")
     if re.search(r"(MLF|中期借贷便利|中国央行|人民银行|PBOC|People's Bank of China)", topic_haystack, re.I):
         add("PBOC cuts one-year MLF rate to 1.45% Reuters")
         add("People's Bank of China one-year MLF 1.45% Bloomberg")
@@ -5564,7 +5592,7 @@ def _generate_fact_check_english_queries(claim: str) -> list[str]:
     if re.search(r"(雅虎财经|Yahoo Finance|沃尔玛|Walmart|Realty Income|菲利普莫里斯|Philip Morris)", topic_haystack, re.I):
         add("Yahoo Finance three blue-chip stocks Walmart Realty Income Philip Morris")
         add("Walmart Realty Income Philip Morris defensive stocks Yahoo Finance")
-    if re.search(r"(山姆店|山姆会员店|Sam's Club|Walmart|沃尔玛|食品安全|市场监管|约谈|summons)", topic_haystack, re.I):
+    if re.search(r"(山姆店|山姆会员店|Sam's Club|Walmart|沃尔玛|食品安全)", topic_haystack, re.I):
         add("Sam's Club China food safety Walmart regulator summons Reuters")
         add("China regulator summons Walmart China over Sam's Club food safety issues")
         add("Sam's Club China food safety Xinhua Reuters")
@@ -5594,7 +5622,7 @@ def _score_fact_check_query(query: str) -> int:
     score = 0
     if lowered.startswith("site:"):
         score += 20
-    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|rubio|netanyahu|vance|hormuz|kyiv|north korea|strait of hormuz|trump|iran|israel|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator|cheng li-wen|lawmakers|miyang|refrigerated trucks|takaichi|kyodo|truth social|truthsocial|polymarket|starmer)\b", lowered, re.I):
+    if re.search(r"\b(?:pce|gdp|cpi|pmi|bea|rbnz|rba|ecb|eurostat|destatis|insee|istat|statcan|boj|meti|hkex|catl|sk hynix|adr|samr|ctrip|rubio|netanyahu|vance|hormuz|kyiv|north korea|strait of hormuz|trump|iran|israel|axios|state department|xi|jpmorgan|walmart|sam's club|sams club|food safety|regulator|cheng li-wen|lawmakers|miyang|refrigerated trucks|takaichi|kyodo|truth social|truthsocial|polymarket|starmer)\b", lowered, re.I):
         score += 10
     if re.search(r"[A-Za-z]{3,}", value):
         score += 4
@@ -5624,6 +5652,10 @@ def _score_fact_check_query(query: str) -> int:
         re.I,
     ):
         score += 5
+    if "financial times" in lowered:
+        score += 10
+    if "samr.gov.cn" in lowered or "gov.cn" in lowered:
+        score += 10
     if "kyivindependent.com" in lowered or re.search(r"\bkyiv independent\b", lowered, re.I):
         score += 6
     if re.search(r"\brubio\b", lowered, re.I) and re.search(r"\bukraine\b", lowered, re.I):
@@ -5738,7 +5770,7 @@ def _prepare_fact_check_queries(claim: str, queries: list[str] | None) -> list[s
                     if query_term:
                         add_query(f"site:{domain} {query_term}")
 
-    if len(candidates) <= 12:
+    if len(candidates) <= 20:
         return candidates
 
     general_queries = [item for item in candidates if not item.lower().startswith("site:")]
@@ -5747,16 +5779,16 @@ def _prepare_fact_check_queries(claim: str, queries: list[str] | None) -> list[s
     site_queries.sort(key=lambda item: (-_score_fact_check_query(item), candidates.index(item)))
 
     selected: list[str] = []
-    reserved_site_slots = min(4, len(site_queries))
-    selected.extend(general_queries[: max(0, 12 - reserved_site_slots)])
+    reserved_site_slots = min(8, len(site_queries))
+    selected.extend(general_queries[: max(0, 20 - reserved_site_slots)])
     selected.extend(site_queries[:reserved_site_slots])
     for item in candidates:
-        if len(selected) >= 12:
+        if len(selected) >= 20:
             break
         if item in selected:
             continue
         selected.append(item)
-    return selected[:12]
+    return selected[:20]
 
 
 def _select_fact_check_queries(queries: list[str], max_queries: int = 4) -> list[str]:
@@ -6220,8 +6252,8 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "fallback_pending": "可继续核对原始报道时间、数字口径、机构原文、社媒原帖和二次转载是否存在偏差。",
             "fallback_no_links": "未找到可验证原始出处。",
             "fallback_no_queries": "未生成搜索词",
-            "fallback_detail_rationale": "本轮未找到可直达具体内容页的来源；搜索词 `{search_text}` 仅用于内部检索，不作为来源展示。",
-            "fallback_detail_pending": "建议继续核对原始报道、官方披露、社媒原帖、统计口径与发布时间是否一致。",
+            "fallback_detail_rationale": "本轮未命中具体内容页。",
+            "fallback_detail_pending": "可继续核对原始报道、官方披露或原帖。",
             "progress_extract_claims": "正在抽取关键声明...",
             "progress_search_sources": "正在检索外部来源...",
             "progress_generate_fact_check": "正在整理逐条来源结果...",
@@ -6249,8 +6281,8 @@ def _fact_check_text(ui_locale: str | None, key: str) -> str:
             "fallback_pending": "Prioritize checking the original report date, exact figures, issuing institution, original social post, and whether secondary reposts introduced distortions.",
             "fallback_no_links": "No verifiable original source was found.",
             "fallback_no_queries": "No search queries were generated",
-            "fallback_detail_rationale": "This pass found no direct link to a specific content page. The query `{search_text}` is for internal retrieval only and is not shown as a source.",
-            "fallback_detail_pending": "Continue checking the original report, official disclosures, original social post, statistical methodology, and publication time for consistency.",
+            "fallback_detail_rationale": "This pass did not locate a specific content page.",
+            "fallback_detail_pending": "Check the original report, official release, or post.",
             "progress_extract_claims": "Extracting key claims...",
             "progress_search_sources": "Searching external sources...",
             "progress_generate_fact_check": "Organizing itemized source results...",
@@ -6686,6 +6718,23 @@ def _enrich_fact_check_items_with_claim_sources(fact_md: str, claim_sources: lis
     return "\n\n".join(updated_sections)
 
 
+FACT_CHECK_NAMED_SOURCE_DOMAINS = (
+    (("华尔街日报", "wall street journal", "wsj"), ("wsj.com",)),
+    (("金融时报", "financial times"), ("ft.com",)),
+    (("路透", "reuters"), ("reuters.com",)),
+    (("国家市场监管总局", "samr"), ("samr.gov.cn",)),
+)
+
+
+def _claim_named_source_is_linked(claim: str, links: list[tuple[str, str]]) -> bool:
+    text = str(claim or "").lower()
+    link_domains = " ".join(urlparse(url).netloc.lower() for _, url in links)
+    for aliases, domains in FACT_CHECK_NAMED_SOURCE_DOMAINS:
+        if any(alias in text for alias in aliases):
+            return any(domain in link_domains for domain in domains)
+    return True
+
+
 def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: list[dict] | None) -> str:
     """有候选网页时，避免把“已找到对应页面”的场景误写成统一的空泛结论。
 
@@ -6770,7 +6819,11 @@ def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: 
             conclusion_label = "来源定位" if "来源定位" in stripped else "核查结论"
             insufficient_value = "暂未定位到直接来源" if conclusion_label == "来源定位" else "缺乏证据"
             dubious_value = "已找到相关来源" if conclusion_label == "来源定位" else "存疑"
+        claim_text = str(current_sources.get("claim") or "")
+        source_links = _extract_fact_check_source_links(search_markdown) + section_source_links
+        direct_named_source = _claim_named_source_is_linked(claim_text, source_links)
         found_source_value = "已找到可验证出处" if conclusion_label in {"来源定位", "核查结论"} else "Verifiable Source Located"
+        related_source_value = "已找到相关来源，原始出处未定位" if conclusion_label in {"来源定位", "核查结论"} else "Related Coverage Located; Original Source Not Located"
         not_found_value = "未找到可验证原始出处" if conclusion_label in {"来源定位", "核查结论"} else "No Verifiable Original Source Found"
         rationale_insert = _build_fact_check_hit_rationale(
             search_markdown=search_markdown,
@@ -6782,7 +6835,7 @@ def _normalize_fact_check_conclusions_with_sources(fact_md: str, claim_sources: 
         if re.search(conclusion_pattern, stripped, flags=re.I):
             stripped = re.sub(
                 conclusion_pattern,
-                rf"\1{found_source_value if candidate_link_count else not_found_value}",
+                rf"\1{(found_source_value if direct_named_source else related_source_value) if candidate_link_count else not_found_value}",
                 stripped,
                 count=1,
                 flags=re.I,
