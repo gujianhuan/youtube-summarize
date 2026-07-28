@@ -1063,6 +1063,69 @@ def test_perform_web_search_falls_back_to_google_news_hits(monkeypatch) -> None:
     assert "来源：Bloomberg" in rendered
 
 
+def test_perform_web_search_uses_ddgs_when_primary_engines_miss(monkeypatch) -> None:
+    """主引擎没有具体文章时，DDGS 应补入同样经过筛选的直链。"""
+
+    monkeypatch.setenv("DDGS_ENABLED", "1")
+    monkeypatch.setattr("core_logic._fetch_bing_news_results", lambda query, proxy_url=None, max_items=4: [])
+    monkeypatch.setattr("core_logic._fetch_google_news_results", lambda query, proxy_url=None, max_items=4: [])
+    monkeypatch.setattr("core_logic._fetch_bing_web_results", lambda query, proxy_url=None, max_items=4: [])
+    monkeypatch.setattr("core_logic._fetch_anysearch_results", lambda query, proxy_url=None, max_items=3: [])
+    monkeypatch.setattr(
+        "core_logic._recover_syndicated_fact_check_hits",
+        lambda items, **kwargs: items,
+    )
+    monkeypatch.setattr(
+        "core_logic._fetch_ddgs_news_results",
+        lambda query, proxy_url=None, max_items=4: [
+            {
+                "title": "China's Xi may visit North Korea as early as next week, Yonhap reports",
+                "url": "https://www.reuters.com/world/asia-pacific/chinas-xi-may-visit-north-korea-2026-05-21/",
+                "source": "Reuters",
+                "snippet": "Chinese President Xi Jinping may visit North Korea as early as next week.",
+                "published_at": "2026-05-21T00:00:00Z",
+            }
+        ],
+    )
+
+    rendered = perform_web_search(
+        ["Xi Jinping may visit North Korea Reuters"],
+        claim_text="习近平可能访问朝鲜，影响地缘政治和东亚资本市场",
+    )
+
+    assert "DDGS 补强命中的候选来源" in rendered
+    assert "https://www.reuters.com/world/asia-pacific/chinas-xi-may-visit-north-korea-2026-05-21/" in rendered
+
+
+def test_perform_web_search_rejects_irrelevant_ddgs_result(monkeypatch) -> None:
+    """DDGS 的泛主题文章不能因为聚合来源而绕过相关性过滤。"""
+
+    monkeypatch.setattr("core_logic._fetch_bing_news_results", lambda query, proxy_url=None, max_items=4: [])
+    monkeypatch.setattr("core_logic._fetch_google_news_results", lambda query, proxy_url=None, max_items=4: [])
+    monkeypatch.setattr("core_logic._fetch_bing_web_results", lambda query, proxy_url=None, max_items=4: [])
+    monkeypatch.setattr("core_logic._fetch_anysearch_results", lambda query, proxy_url=None, max_items=3: [])
+    monkeypatch.setattr(
+        "core_logic._fetch_ddgs_news_results",
+        lambda query, proxy_url=None, max_items=4: [
+            {
+                "title": "A general profile of Marco Rubio",
+                "url": "https://example.com/politics/marco-rubio-profile",
+                "source": "Example News",
+                "snippet": "A general overview of the secretary of state.",
+                "published_at": "2026-05-21T00:00:00Z",
+            }
+        ],
+    )
+
+    rendered = perform_web_search(
+        ["Rubio Ukraine talks no progress Reuters"],
+        claim_text="美国国务卿卢比奥宣布美国退出乌克兰战争调解，称谈判无成果",
+    )
+
+    assert "DDGS 补强命中的候选来源" not in rendered
+    assert "marco-rubio-profile" not in rendered
+
+
 def test_perform_web_search_falls_back_to_bing_web_hits_when_news_misses(monkeypatch) -> None:
     """新闻 RSS 没命中时，仍应继续吸收普通网页搜索结果。"""
 

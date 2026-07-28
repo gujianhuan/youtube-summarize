@@ -11,6 +11,7 @@ pypdf
 python-docx
 python-pptx
 beautifulsoup4
+ddgs==9.14.4
 PyMuPDF
 rapidocr_onnxruntime
 numpy

@@ -4435,6 +4435,49 @@ def _fetch_google_news_results(query: str, proxy_url: str = None, max_items: int
     return items
 
 
+def _fetch_ddgs_news_results(query: str, proxy_url: str = None, max_items: int = 4) -> list[dict]:
+    """用独立聚合后端补足 Bing/Google RSS 的索引盲区。"""
+    query_text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query_text or max_items <= 0:
+        return []
+    try:
+        from ddgs import DDGS
+
+        client = DDGS(proxy=proxy_url) if proxy_url else DDGS()
+        raw_results = client.news(query_text, max_results=max(1, min(6, max_items)))
+    except Exception:
+        return []
+
+    required_domains = _extract_fact_check_site_query_domains(query_text)
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+    for raw in raw_results or []:
+        if not isinstance(raw, dict):
+            continue
+        title = _strip_html_tags(str(raw.get("title") or "").strip())
+        url = str(raw.get("url") or raw.get("link") or "").strip()
+        normalized_url = _normalize_fact_check_source_url(url)
+        if not title or not normalized_url or normalized_url in seen_urls:
+            continue
+        candidate = {
+            "title": title,
+            "url": url,
+            "source": _strip_html_tags(str(raw.get("source") or "").strip()),
+            "snippet": _strip_html_tags(str(raw.get("body") or raw.get("snippet") or "").strip()),
+            "published_at": str(raw.get("date") or raw.get("published_at") or "").strip(),
+            "provider": "DDGS",
+        }
+        if required_domains and not any(
+            _fact_check_hit_matches_domain(candidate, domain) for domain in required_domains
+        ):
+            continue
+        seen_urls.add(normalized_url)
+        items.append(candidate)
+        if len(items) >= max_items:
+            break
+    return items
+
+
 def _fetch_bing_web_results(query: str, proxy_url: str = None, max_items: int = 4) -> list[dict]:
     query_text = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query_text or max_items <= 0:
@@ -4912,6 +4955,7 @@ def _recover_reuters_direct_article_hit(
     query_text: str = "",
     snippet: str = "",
     proxy_url: str = None,
+    allow_slug_guess: bool = True,
 ) -> dict | None:
     clean_title = re.sub(r"\s+", " ", str(title or "")).strip(" -|")
     title_variants = _build_reuters_title_variants(
@@ -4932,6 +4976,7 @@ def _recover_reuters_direct_article_hit(
     )
     candidate_records: list[dict] = []
     seen_urls: set[str] = set()
+    non_article_candidate_urls: set[str] = set()
     candidate_slugs: list[str] = []
     seen_slugs: set[str] = set()
     for variant in title_variants[:4]:
@@ -5007,6 +5052,7 @@ def _recover_reuters_direct_article_hit(
         if canonical_domain and "reuters.com" not in canonical_domain:
             continue
         if not _is_probable_reuters_article_url(canonical_url):
+            non_article_candidate_urls.add(candidate_url)
             continue
         matched_tokens = [token for token in title_tokens[:12] if token in metadata_text]
         if len(matched_tokens) < max(4, min(6, len(title_tokens[:12]))):
@@ -5024,10 +5070,12 @@ def _recover_reuters_direct_article_hit(
         }
 
     evidence_text = clean_document_text(" ".join([clean_title, claim_text, query_text, snippet])).lower()
-    if re.search(r"\breuters\b", " ".join([clean_title, query_text, snippet]), re.I):
+    if allow_slug_guess and re.search(r"\breuters\b", " ".join([clean_title, query_text, snippet]), re.I):
         best_guess: tuple[int, dict, list[str]] | None = None
         for candidate_record in candidate_records[:8]:
             candidate_url = str(candidate_record.get("url") or "").strip()
+            if candidate_url in non_article_candidate_urls:
+                continue
             if not _is_probable_reuters_article_url(candidate_url):
                 continue
             candidate_slug = (urlparse(candidate_url).path or "").strip("/").split("/")[-1]
@@ -5183,20 +5231,6 @@ def _recover_syndicated_fact_check_hit(
                 return dict(direct_hits[0])
         return None
 
-    if primary_domain in {"www.reuters.com", "reuters.com"}:
-        recovered_direct = _recover_reuters_direct_article_hit(
-            title=title,
-            published_at=published_at,
-            claim_text=claim_text,
-            query_text=query_text,
-            snippet=snippet,
-            proxy_url=proxy_url,
-        )
-        if recovered_direct:
-            recovered_direct["recovered_from_source"] = source_name
-            recovered_direct["recovered_from_url"] = url
-            return recovered_direct
-
     for recovery_query in query_candidates[:2]:
         site_hits = _fetch_bing_web_results(recovery_query, proxy_url=proxy_url, max_items=5)
         site_hits = [hit for hit in site_hits if _fact_check_hit_matches_domain(hit, primary_domain)]
@@ -5234,6 +5268,19 @@ def _recover_syndicated_fact_check_hit(
         recovered["recovered_from_source"] = source_name
         recovered["recovered_from_url"] = url
         return recovered
+    if primary_domain in {"www.reuters.com", "reuters.com"}:
+        recovered_direct = _recover_reuters_direct_article_hit(
+            title=title,
+            published_at=published_at,
+            claim_text=claim_text,
+            query_text=query_text,
+            snippet=snippet,
+            proxy_url=proxy_url,
+        )
+        if recovered_direct:
+            recovered_direct["recovered_from_source"] = source_name
+            recovered_direct["recovered_from_url"] = url
+            return recovered_direct
     return None
 
 
@@ -5815,7 +5862,7 @@ def _select_fact_check_queries(queries: list[str], max_queries: int = 4) -> list
     site_queries.sort(key=lambda item: (-_score_fact_check_query(item), normalized_queries.index(item)))
     selected: list[str] = []
 
-    preferred_site_limit = min(3 if max_queries >= 4 else 1, len(site_queries))
+    preferred_site_limit = min(2 if max_queries >= 4 else 1, len(site_queries))
     preferred_general_limit = min(len(general_queries), max_queries - preferred_site_limit)
     selected.extend(general_queries[:preferred_general_limit])
     for site_query in site_queries[:preferred_site_limit]:
@@ -5859,6 +5906,9 @@ def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = 
     anysearch_enabled = _env_flag("ANYSEARCH_ENABLED", default=True)
     anysearch_limit = 1 if is_fast_mode else _env_int("ANYSEARCH_MAX_CALLS_PER_CLAIM", 2, minimum=0, maximum=4)
     anysearch_calls = 0
+    ddgs_enabled = _env_flag("DDGS_ENABLED", default=True)
+    ddgs_limit = 1 if is_fast_mode else _env_int("DDGS_MAX_CALLS_PER_CLAIM", 2, minimum=0, maximum=4)
+    ddgs_calls = 0
     results_text = []
     global_source_links: list[str] = []
     seen_source_urls: set[str] = set()
@@ -5906,6 +5956,7 @@ def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = 
     # 事实核查统一收敛为可人工复核的 Google/Bing 新闻检索入口，
     # 同时附上已识别到的官网/权威媒体站点，避免模型只输出模糊机构名。
     def add_search_links(q_term: str) -> bool:
+        nonlocal anysearch_calls, ddgs_calls
         try:
             matched_sources = _find_authoritative_sources(" ".join([claim_text, q_term]))
             preferred_domains = {
@@ -6015,6 +6066,57 @@ def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = 
             if web_hits:
                 render_candidate_hits(web_hits[:3], "- 命中的候选网页：")
 
+            ddgs_had_hits = False
+            if (
+                ddgs_enabled
+                and ddgs_calls < ddgs_limit
+                and _should_use_anysearch_for_fact_check(
+                    claim_text,
+                    q_term,
+                    news_hits=news_hits,
+                    web_hits=web_hits,
+                    preferred_domains=preferred_domains,
+                )
+            ):
+                ddgs_calls += 1
+                ddgs_hits = _fetch_ddgs_news_results(q_term, proxy_url=proxy, max_items=4)
+                existing_urls = {
+                    _normalize_fact_check_source_url(str(item.get("url") or ""))
+                    for item in [*(news_hits or []), *(web_hits or [])]
+                }
+                ddgs_hits = [
+                    item
+                    for item in ddgs_hits
+                    if _normalize_fact_check_source_url(str(item.get("url") or "")) not in existing_urls
+                ]
+                ddgs_hits = _rerank_fact_check_hits(
+                    ddgs_hits,
+                    claim_text=claim_text,
+                    query_text=q_term,
+                    preferred_domains=preferred_domains or set(MAJOR_MEDIA_DOMAINS),
+                    max_items=4,
+                )
+                ddgs_hits = [
+                    item
+                    for item in ddgs_hits
+                    if _is_relevant_fact_check_hit(item, claim_text=claim_text, query_text=q_term)
+                ]
+                ddgs_hits = _recover_syndicated_fact_check_hits(
+                    ddgs_hits,
+                    claim_text=claim_text,
+                    query_text=q_term,
+                    proxy_url=proxy,
+                    recovery_limit=0 if is_fast_mode else 1,
+                )
+                ddgs_hits = _prune_fact_check_hits(
+                    ddgs_hits,
+                    preferred_domains=preferred_domains or set(MAJOR_MEDIA_DOMAINS),
+                    max_items=3,
+                )
+                if ddgs_hits:
+                    ddgs_had_hits = True
+                    render_candidate_hits(ddgs_hits[:3], "- DDGS 补强命中的候选来源：")
+
             if (
                 anysearch_enabled
                 and anysearch_calls < anysearch_limit
@@ -6060,7 +6162,7 @@ def perform_web_search(queries: list[str], proxy: str = None, claim_text: str = 
                     anysearch_had_hits = True
                     render_candidate_hits(anysearch_hits[:3], "- AnySearch 补强命中的候选来源：")
 
-            if not news_hits and not web_hits and not anysearch_had_hits:
+            if not news_hits and not web_hits and not ddgs_had_hits and not anysearch_had_hits:
                 results_text.append("- 自动检索结果：当前未抓到可直接引用的候选网页或报道。")
                 results_text.append("  - 注意：这不等于“全网不存在相关内容”，只表示本轮自动检索暂未命中，后续应继续放宽搜索词，或改用英文/原文机构名继续核对。")
 
